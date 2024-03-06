@@ -145,7 +145,7 @@ struct AstFieldAssignment : public Expression {
 };
 
 struct AstCall : public Expression {
-	Expression *function;
+	Expression *callee;
 	std::span<Expression*> arguments;
 };
 

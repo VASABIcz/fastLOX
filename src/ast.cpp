@@ -90,7 +90,7 @@ std::ostream &operator<<(std::ostream &os, Expression *expr) {
 	},
 
 	[&] (AstCall *function_call) {
-		os << "(call " << function_call->function;
+		os << "(call " << function_call->callee;
 		for (Expression *arg : function_call->arguments) {
 			os << " " << arg;
 		}
