@@ -85,8 +85,8 @@ struct AstSuper : public Expression {
 };
 
 enum class UnOp {
-	NOT,
-	NEGATE,
+	NOT,    // !
+	NEGATE, // -
 };
 
 struct AstUnaryOperation : public Expression {
