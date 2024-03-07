@@ -146,7 +146,7 @@ struct AstFieldAssignment : public Expression {
 
 struct AstCall : public Expression {
 	Expression *callee;
-	std::span<Expression*> arguments;
+	std::span<Expression*> arguments; // may be empty
 };
 
 DEFINE_VARIANT_KIND_TYPE_MAP(Expression, EXPRESSIONS)
@@ -171,17 +171,15 @@ struct Statement : public Ast {
 	StatementKind kind;
 };
 
-struct Statement;
-
 struct AstDefinition : public Statement {
 	std::string_view name;
-	Expression *value;
+	Expression *value; // may be nullptr
 };
 
 struct AstIf : public Statement {
 	Expression *condition;
 	Statement *consequent;
-	Statement *alternative;
+	Statement *alternative; // may be nullptr
 };
 
 struct AstWhile : public Statement {
@@ -198,27 +196,27 @@ struct AstExpressionStatement : public Statement {
 };
 
 struct AstBlock : public Statement {
-	std::span<Statement*> statements;
+	std::span<Statement*> statements; // may be empty
 };
 
 struct AstFunction : public Statement {
 	std::string_view name;
-	std::span<std::string_view> parameters;
+	std::span<std::string_view> parameters; // may be empty
 	AstBlock *body;
 };
 
 struct AstClass : public Statement {
 	std::string_view name;
-	AstVariableAccess *superclass;
-	std::span<AstFunction *> methods;
+	AstVariableAccess *superclass; // may be nullptr
+	std::span<AstFunction *> methods; // may be empty
 };
 
 struct AstReturn : public Statement {
-	Expression *value;
+	Expression *value; // may be nullptr
 };
 
 struct AstProgram {
-	std::span<Statement*> top_level_statements;
+	std::span<Statement*> top_level_statements; // may be empty
 };
 
 DEFINE_VARIANT_KIND_TYPE_MAP(Statement, STATEMENTS)
