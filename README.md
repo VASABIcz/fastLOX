@@ -66,6 +66,23 @@ project with meson, checks the sources with `cppcheck` and runs the test suite.
 Normally we would run with sanitizers in the CI, but there seems to be
 non-detereministic bug in the sanitizers, so it is currently disabled.
 
+You can run the CI locally with `gitlab-runner`. For the first time, you need
+to login to have access to the NI-RUN gitlab container registry:
+
+```console
+docker login gitlab.fit.cvut.cz:5050
+```
+
+Then you can run the tests with:
+
+```console
+gitlab-runner exec docker --env CI_REGISTRY=gitlab.fit.cvut.cz:5050 --docker-volumes=$PWD/output:/lox-test/output test
+```
+
+Additionally the command above mounts the `output` directory to the docker
+container, which allows to get the outputs of the failed tests.
+
+
 
 [lox]: https://craftinginterpreters.com/the-lox-language.html
 [NI-RUN]: https://courses.fit.cvut.cz/NI-RUN/
