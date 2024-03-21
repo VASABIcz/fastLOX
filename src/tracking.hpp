@@ -119,7 +119,7 @@ public:
 		const char *threshold = std::getenv("LOX_MEM_SAMPLE_THRESHOLD");
 		if (threshold && threshold[0]) {
 			size_t len = strlen(threshold);
-			long long value;
+			long long value = mem_increase_threshold;
 			std::from_chars_result res = std::from_chars(threshold, threshold + len, value);
 			if (res.ptr != threshold) {
 				mem_increase_threshold = value;
