@@ -64,6 +64,8 @@
 // or log your own events with `VMLogger::log`.
 
 #include <cstring>
+#include <cstddef>
+#include <cstdio>
 #include <chrono>
 #include <fstream>
 #include <charconv>
@@ -75,6 +77,29 @@ enum MemoryKind {
 	MemoryKind_Heap, // Heap memory
 	MemoryKind_COUNT,
 };
+
+#ifdef __GNUC__
+#define WEAK __attribute__ ((__weak__))
+#else
+#define WEAK
+#endif
+
+// man mallinfo2
+struct mallinfo2
+{
+  size_t arena;    /* non-mmapped space allocated from system */
+  size_t ordblks;  /* number of free chunks */
+  size_t smblks;   /* number of fastbin blocks */
+  size_t hblks;    /* number of mmapped regions */
+  size_t hblkhd;   /* space in mmapped regions */
+  size_t usmblks;  /* always 0, preserved for backwards compatibility */
+  size_t fsmblks;  /* space available in freed fastbin blocks */
+  size_t uordblks; /* total allocated space */
+  size_t fordblks; /* total free space */
+  size_t keepcost; /* top-most, releasable (via malloc_trim) space */
+};
+
+extern "C" struct mallinfo2 WEAK mallinfo2(void);
 
 class MemoryTracker {
 public:
@@ -129,7 +154,7 @@ public:
 		if (log_path && log_path[0]) {
 			log_file = std::ofstream(log_path);
 		}
-		log_file << "timestamp,event,static_mem,heap_mem\n";
+		log_file << "timestamp,event,static_mem,heap_mem,malloc_mem,rss_anon_mem\n";
 		log("VM START");
 	}
 
@@ -143,10 +168,33 @@ public:
 	}
 
 	void log(const char *event_name) {
+		if (!log_file) {
+			return;
+		}
+
+		struct mallinfo2 mi = {};
+		if (mallinfo2) {
+			mi = mallinfo2();
+		}
+
+		size_t rssanon = 0;
+		FILE* f = fopen("/proc/self/status", "r");
+		if (f != nullptr) {
+			char buf[256];
+			while (fgets(buf, sizeof(buf), f)) {
+				if (sscanf(buf, "RssAnon: %zu kB", &rssanon) == 1) {
+					break;
+				}
+			}
+			fclose(f);
+		}
+
 		log_file << nanos_since_epoch()
 			<< ',' << event_name
 			<< ',' << trackers[MemoryKind_Static].usage()
 			<< ',' << trackers[MemoryKind_Heap].usage()
+			<< ',' << mi.arena + mi.hblkhd
+			<< ',' << rssanon * 1024
 			<< '\n';
 	}
 
@@ -168,7 +216,7 @@ public:
 
 private:
 	std::ofstream log_file;
-	u64 mem_increase_threshold { 10240 };
+	u64 mem_increase_threshold { 1048576 };
 	long long start_nanos_since_epoch;
 	MemoryTracker trackers[MemoryKind::MemoryKind_COUNT];
 };
