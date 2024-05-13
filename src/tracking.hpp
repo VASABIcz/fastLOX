@@ -193,7 +193,7 @@ public:
 			<< ',' << event_name
 			<< ',' << trackers[MemoryKind_Static].usage()
 			<< ',' << trackers[MemoryKind_Heap].usage()
-			<< ',' << mi.arena + mi.hblkhd
+			<< ',' << mi.uordblks + mi.hblkhd
 			<< ',' << rssanon * 1024
 			<< '\n';
 	}
