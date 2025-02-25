@@ -58,6 +58,8 @@ root and is called `build`, then you can do:
 ln -s build/compile_commands.json compile_commands.json
 ```
 
+The clangd LSP should be able to find it in the `build` directory.
+
 ## CI
 
 CI is defined in `.gitlab-ci.yml`. It uses the [lox-test] image, builds the
