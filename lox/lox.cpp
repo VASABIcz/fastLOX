@@ -186,6 +186,10 @@ struct Statement: ASTNode {
 struct Expression: Statement {
 };
 
+using ASTExpr = unique_ptr<Expression>;
+using ASTStm = unique_ptr<Statement>;
+using ASTNode1 = unique_ptr<ASTNode>;
+
 struct IntLiteral;
 struct Assign;
 struct Block;
@@ -257,8 +261,8 @@ struct ASTVisitor {
 };
 
 EXPR_BASE(Call, {
-    unique_ptr<Expression> fName;
-    vector<unique_ptr<Expression>> args;
+    ASTExpr fName;
+    vector<ASTExpr> args;
 })
 };
 
@@ -272,7 +276,7 @@ struct Function: Statement {
     STRUCT_BEGIN(Function)
     string name;
     vector<string> argz;
-    vector<unique_ptr<Statement>> body;
+    vector<ASTStm> body;
     STRUCT_END(Function)
 
     vector<bool> locals;
@@ -384,22 +388,22 @@ enum class BinaryType {
 struct Binary: Expression {
     STRUCT_BEGIN(Binary)
     BinaryType type;
-    unique_ptr<Expression> lhs;
-    unique_ptr<Expression> rhs;
+    ASTExpr lhs;
+    ASTExpr rhs;
     STRUCT_END(Binary)
 };
 
 struct IF: Statement {
     STRUCT_BEGIN(IF)
-    unique_ptr<Expression> cond;
-    unique_ptr<Statement> ifBody;
-    optional<unique_ptr<Statement>> elsBody;
+    ASTExpr cond;
+    ASTStm ifBody;
+    optional<ASTStm> elsBody;
     STRUCT_END(IF)
 };
 
 struct StatmentExpr: Statement {
     STRUCT_BEGIN(StatmentExpr)
-    unique_ptr<Expression> inner;
+    ASTExpr inner;
     STRUCT_END(StatmentExpr)
 };
 
@@ -413,49 +417,49 @@ struct Identifier: Expression {
 struct VariableDeclaration: Statement {
     STRUCT_BEGIN(VariableDeclaration)
     string dst;
-    optional<unique_ptr<Expression>> value;
+    optional<ASTExpr> value;
     unique_ptr<SpecializedVariable> hookedTarget = nullptr;
     STRUCT_END(VariableDeclaration)
 };
 
 struct Return: Statement {
     STRUCT_BEGIN(Return)
-    optional<unique_ptr<Expression>> value;
+    optional<ASTExpr> value;
     STRUCT_END(Return)
 };
 
 struct Print: Statement {
     STRUCT_BEGIN(Print)
-    unique_ptr<Expression> value;
+    ASTExpr value;
     STRUCT_END(Print)
 };
 
 struct Block: Statement {
     STRUCT_BEGIN(Block)
-    vector<unique_ptr<Statement>> statements;
+    vector<ASTStm> statements;
     STRUCT_END(Block)
 };
 
 struct While: Statement {
     STRUCT_BEGIN(While)
-    optional<unique_ptr<Expression>> cond;
-    unique_ptr<Statement> body;
+    optional<ASTExpr> cond;
+    ASTStm body;
     STRUCT_END(While)
 };
 
 /*struct For: Statement {
     STRUCT_BEGIN(For)
-    unique_ptr<Statement> setup;
-    unique_ptr<Expression> cond;
-    unique_ptr<Statement> post;
+    ASTStm setup;
+    ASTExpr cond;
+    ASTStm post;
     Block statements;
     STRUCT_END(For)
 };*/
 
 struct Assign: Expression {
     STRUCT_BEGIN(Assign)
-    unique_ptr<Expression> dst;
-    unique_ptr<Expression> value;
+    ASTExpr dst;
+    ASTExpr value;
     STRUCT_END(Assign)
 };
 
@@ -479,14 +483,14 @@ struct BoolLiteral1: Expression {
 
 struct FieldAccess: Expression {
     STRUCT_BEGIN(FieldAccess)
-    unique_ptr<Expression> subject;
+    ASTExpr subject;
     string fieldName;
     STRUCT_END(FieldAccess)
 };
 
 struct Negate: Expression {
     STRUCT_BEGIN(Negate)
-        unique_ptr<Expression> inner;
+        ASTExpr inner;
     STRUCT_END(Negate)
 };
 
@@ -494,6 +498,11 @@ struct NilLiteral: Expression {
     STRUCT_BEGIN(NilLiteral)
     STRUCT_END(NilLiteral)
 };
+
+template<typename T, typename... ARGS>
+std::unique_ptr<T> makeStuff2(ARGS&&... args) {
+    return make_unique<T>(typename T::Data(std::forward<ARGS>(args)...));
+}
 
 struct MilaState {
 
@@ -552,17 +561,17 @@ struct MilaParseError: Errorable {
     }
 };
 
-typedef ParsingUnit<TokenType1, unique_ptr<ASTNode>, MilaState, MilaParseError> MilaParsingUnit;
+typedef ParsingUnit<TokenType1, ASTNode1, MilaState, MilaParseError> MilaParsingUnit;
 
 template<typename T>
 using MilaResult = std::expected<T, MilaParseError>;
 
 template<>
-class BaseParser<TokenType1, unique_ptr<ASTNode>, MilaState, MilaParseError> : public Parser<TokenType1, unique_ptr<ASTNode>, MilaState, MilaParseError> {
+class BaseParser<TokenType1, ASTNode1, MilaState, MilaParseError> : public Parser<TokenType1, ASTNode1, MilaState, MilaParseError> {
 public:
     using Parser::Parser;
 
-    MilaResult<unique_ptr<Expression>> parseExpression() {
+    MilaResult<ASTExpr> parseExpression() {
         auto stuff = TRY(parseSomethingTerminator(TokenType1::Semicolon)).release();
         auto csted = dynamic_cast<Expression*>(stuff);
         if (csted == nullptr) {
@@ -570,26 +579,26 @@ public:
             return unexpected{NotAExpr{}};
         }
 
-        return unique_ptr<Expression>(csted);
+        return ASTExpr(csted);
     }
 
-    MilaResult<unique_ptr<Statement>> parseStatement() {
+    MilaResult<ASTStm> parseStatement() {
         auto stuff = TRY(parseSomethingTerminator(TokenType1::Semicolon)).release();
         auto csted = dynamic_cast<Statement*>(stuff);
         if (csted == nullptr) {
             auto csted1 = dynamic_cast<Expression*>(stuff);
             if (csted1 != nullptr) {
-                return makeStuff<StatmentExpr>(unique_ptr<Expression>(csted1));
+                return makeStuff2<StatmentExpr>(ASTExpr(csted1));
             }
             delete stuff;
             return unexpected{NotAStatement{}};
         }
 
-        return unique_ptr<Statement>(csted);
+        return ASTStm(csted);
     }
 
-    MilaResult<vector<unique_ptr<Statement>>> parseBody() {
-        vector<unique_ptr<Statement>> body;
+    MilaResult<vector<ASTStm>> parseBody() {
+        vector<ASTStm> body;
 
         TRY(getAssert(TokenType1::OCB));
 
@@ -604,8 +613,8 @@ public:
         return string(TRY(this->getAssert(TokenType1::Idntifier)).content);
     }
 
-    MilaResult<vector<unique_ptr<Statement>>> parseStatementsUntil(initializer_list<TokenType1> toks) {
-        vector<unique_ptr<Statement>> body;
+    MilaResult<vector<ASTStm>> parseStatementsUntil(initializer_list<TokenType1> toks) {
+        vector<ASTStm> body;
 
         while (!isPeekTypeOneOf(toks)) {
             body.push_back(TRY(parseStatement()));
@@ -625,20 +634,20 @@ public:
         return isPrev<Expression>();
     }
 
-    MilaResult<unique_ptr<Expression>> popExpr() {
+    MilaResult<ASTExpr> popExpr() {
         if (not isPrevExp()) return unexpected{NotAExpr{}};
 
         auto preExpr = prevPop();
         auto* ptr = preExpr->release();
-        return unique_ptr<Expression>(dynamic_cast<Expression*>(ptr));
+        return ASTExpr(dynamic_cast<Expression*>(ptr));
     }
 
-    void pushExp(unique_ptr<Expression> exp) {
+    void pushExp(ASTExpr exp) {
         this->buffer.push_back(std::move(exp));
     }
 };
 
-typedef BaseParser<TokenType1, unique_ptr<ASTNode>, MilaState, MilaParseError> MilaParser;
+typedef BaseParser<TokenType1, ASTNode1, MilaState, MilaParseError> MilaParser;
 
 struct FunctionParsingUnit: MilaParsingUnit {
     const std::string_view className() const override {
@@ -653,7 +662,7 @@ struct FunctionParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::Function);
     }
 
-    std::expected<unique_ptr<ASTNode>, MilaParseError> parse(MilaParser& parser) const override {
+    std::expected<ASTNode1, MilaParseError> parse(MilaParser& parser) const override {
         assertToken(TokenType1::Function);
 
         auto name = TRY(parser.assertIdent());
@@ -669,7 +678,7 @@ struct FunctionParsingUnit: MilaParsingUnit {
 
         auto body = TRY(parser.parseBody());
 
-        return makeStuff<Function>(string(name), std::move(params), std::move(body));
+        return makeStuff2<Function>(string(name), std::move(params), std::move(body));
     }
 };
 
@@ -686,19 +695,19 @@ struct IFParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::If);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         assertToken(TokenType1::If);
 
         auto cond = TRY(parser.parseExpression());
 
         auto ifBody  = TRY(parser.parseStatement());
-        optional<unique_ptr<Statement>> elsBody;
+        optional<ASTStm> elsBody;
 
         if (parser.isPeekTypeConsume(TokenType1::Else)) {
             elsBody = TRY(parser.parseStatement());
         }
 
-        return makeStuff<IF>(std::move(cond), std::move(ifBody), std::move(elsBody));
+        return makeStuff2<IF>(std::move(cond), std::move(ifBody), std::move(elsBody));
     }
 };
 
@@ -715,7 +724,7 @@ struct FunctionCallParsingUnit: MilaParsingUnit {
         return parser.isPrevExp() && parser.isPeekType(TokenType1::ORB);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         auto subject = TRY(parser.popExpr());
 
         assertToken(TokenType1::ORB);
@@ -726,7 +735,7 @@ struct FunctionCallParsingUnit: MilaParsingUnit {
 
         assertToken(TokenType1::CRB);
 
-        return makeStuff<Call>(std::move(subject), std::move(argz));
+        return makeStuff2<Call>(std::move(subject), std::move(argz));
     }
 };
 
@@ -743,14 +752,14 @@ struct WhileParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::While);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         assertToken(TokenType1::While);
 
         auto cond = TRY(parser.parseExpression());
 
         auto body = TRY(parser.parseStatement());
 
-        return makeStuff<While>(std::move(cond), std::move(body));
+        return makeStuff2<While>(std::move(cond), std::move(body));
     }
 };
 
@@ -767,36 +776,36 @@ struct ForParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::For);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         assertToken(TokenType1::For);
 
         assertToken(TokenType1::ORB);
 
-        optional<unique_ptr<Statement>> start;
+        optional<ASTStm> start;
         if (not parser.isPeekTypeConsume(TokenType1::Semicolon)) {
             start = TRY(parser.parseStatement());
         }
 
-        optional<unique_ptr<Expression>> cond;
+        optional<ASTExpr> cond;
         if (not parser.isPeekTypeConsume(TokenType1::Semicolon)) {
             cond = TRY(parser.parseExpression());
         }
 
-        optional<unique_ptr<Statement>> update;
+        optional<ASTStm> update;
         if (not parser.isPeekTypeConsume(TokenType1::CRB)) {
             update = TRY(parser.parseStatement());
             assertToken(TokenType1::CRB);
         }
 
-        vector<unique_ptr<Statement>> body;
+        vector<ASTStm> body;
         body.push_back(TRY(parser.parseStatement()));
         if (update.has_value()) {
             body.push_back(std::move(*update));
         }
 
-        auto whajl = makeStuff<While>(std::move(cond), makeStuff<Block>(std::move(body)));
+        auto whajl = makeStuff2<While>(std::move(cond), makeStuff2<Block>(std::move(body)));
 
-        auto block = makeStuff<Block>();
+        auto block = makeStuff2<Block>();
         if (start.has_value()) {
             block->data.statements.push_back(std::move(*start));
         }
@@ -819,14 +828,14 @@ struct AssignParsingUnit: MilaParsingUnit {
         return parser.isPrevExp() && parser.isPeekType(TokenType1::Assign);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         auto tgt = TRY(parser.popExpr());
 
         assertToken(TokenType1::Assign);
 
         auto value = TRY(parser.parseExpression());
 
-        return makeStuff<Assign>(std::move(tgt), std::move(value));
+        return makeStuff2<Assign>(std::move(tgt), std::move(value));
     }
 };
 
@@ -843,17 +852,17 @@ struct VariableDeclarationParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::Var);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         assertToken(TokenType1::Var);
 
         auto name = TRY(parser.assertIdent());
 
-        optional<unique_ptr<Expression>> value;
+        optional<ASTExpr> value;
         if (parser.isPeekTypeConsume(TokenType1::Assign)) {
             value = TRY(parser.parseExpression());
         }
 
-        return makeStuff<VariableDeclaration>(std::move(name), std::move(value));
+        return makeStuff2<VariableDeclaration>(std::move(name), std::move(value));
     }
 };
 
@@ -890,12 +899,12 @@ struct ThisSuperParsingUnit: MilaParsingUnit {
         return parser.isPeekTypeOneOf({TokenType1::Super, TokenType1::This});
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         if (parser.isPeekTypeConsume(TokenType1::This)) {
-            return makeStuff<This>();
+            return makeStuff2<This>();
         } else {
             assertToken(TokenType1::Super);
-            return makeStuff<Super>();
+            return makeStuff2<Super>();
         }
     }
 };
@@ -913,10 +922,10 @@ struct IdentParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::Idntifier);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         auto ident = TRY(parser.assertIdent());
 
-        return makeStuff<Identifier>(std::move(ident));
+        return makeStuff2<Identifier>(std::move(ident));
     }
 };
 
@@ -933,10 +942,10 @@ struct StringLiteralParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::String);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         auto ident = string(assertToken(TokenType1::String).content);
 
-        return makeStuff<StringLiteral1>(std::move(ident));
+        return makeStuff2<StringLiteral1>(std::move(ident));
     }
 };
 
@@ -953,7 +962,7 @@ struct BoolLiteralParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::True) || parser.isPeekType(TokenType1::False);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         bool isTrue = true;
         if (parser.isPeekTypeConsume(TokenType1::True)) {
 
@@ -962,7 +971,7 @@ struct BoolLiteralParsingUnit: MilaParsingUnit {
             assertToken(TokenType1::False);
         }
 
-        return makeStuff<BoolLiteral1>(isTrue);
+        return makeStuff2<BoolLiteral1>(isTrue);
     }
 };
 
@@ -979,7 +988,7 @@ struct PrefixMinusParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::Minus);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         assertToken(TokenType1::Minus);
 
         TRY(parser.parseBinaryArm());
@@ -987,10 +996,10 @@ struct PrefixMinusParsingUnit: MilaParsingUnit {
         auto expr = TRY(parser.popExpr());
 
         if (auto v = dynamic_cast<IntLiteral*>(expr.get()); v) {
-            return makeStuff<IntLiteral>(-v->data.value);
+            return makeStuff2<IntLiteral>(-v->data.value);
         }
 
-        return makeStuff<Binary>(BinaryType::SUB, makeStuff<IntLiteral>(0.0), std::move(expr));
+        return makeStuff2<Binary>(BinaryType::SUB, makeStuff2<IntLiteral>(0.0), std::move(expr));
     }
 };
 
@@ -1007,10 +1016,10 @@ struct NilLiteralParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::Nil);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         assertToken(TokenType1::Nil);
 
-        return makeStuff<NilLiteral>();
+        return makeStuff2<NilLiteral>();
     }
 };
 
@@ -1027,13 +1036,13 @@ struct NumericParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::NumberLiteral);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         auto ident = TRY(parser.getAssert(TokenType1::NumberLiteral)).content;
 
         // FIXME mby handle error?
         double idk = std::strtod(ident.begin(), nullptr);
 
-        return makeStuff<IntLiteral>(idk);
+        return makeStuff2<IntLiteral>(idk);
     }
 };
 
@@ -1050,7 +1059,7 @@ struct ClassParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::Class);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         assertToken(TokenType1::Class);
 
         auto className = TRY(parser.assertIdent());
@@ -1076,10 +1085,10 @@ struct ClassParsingUnit: MilaParsingUnit {
 
             auto body = TRY(parser.parseBody());
 
-            methods.push_back(makeStuff<Function>(std::move(methodName), std::move(params), std::move(body)));
+            methods.push_back(makeStuff2<Function>(std::move(methodName), std::move(params), std::move(body)));
         }
 
-        return makeStuff<Class>(std::move(className), std::move(superName), std::move(methods));
+        return makeStuff2<Class>(std::move(className), std::move(superName), std::move(methods));
     }
 };
 
@@ -1096,7 +1105,7 @@ struct BracketsParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::ORB);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         assertToken(TokenType1::ORB);
 
         auto inner = TRY(parser.parseExpression());
@@ -1120,16 +1129,16 @@ struct ReturnParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::Return);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         assertToken(TokenType1::Return);
 
-        optional<unique_ptr<Expression>> inner;
+        optional<ASTExpr> inner;
         if (parser.isPeekType(TokenType1::Semicolon)) {
         } else {
             inner = TRY(parser.parseExpression());
         }
 
-        return makeStuff<Return>(std::move(inner));
+        return makeStuff2<Return>(std::move(inner));
     }
 };
 
@@ -1146,12 +1155,12 @@ struct PrintParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::Print);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         assertToken(TokenType1::Print);
 
         auto inner = TRY(parser.parseExpression());
 
-        return makeStuff<Print>(std::move(inner));
+        return makeStuff2<Print>(std::move(inner));
     }
 };
 
@@ -1168,10 +1177,10 @@ struct BlockParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::OCB);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         auto block = TRY(parser.parseBody());
 
-        return makeStuff<Block>(std::move(block));
+        return makeStuff2<Block>(std::move(block));
     }
 };
 
@@ -1188,7 +1197,7 @@ struct BinaryParsingUnit: MilaParsingUnit {
         return parser.isPrevExp() && parser.isPeek([&](auto& tok) { return toType(tok.type).has_value(); });
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         auto lhs = TRY(parser.popExpr());
 
         auto tok = toType(TRY(parser.consumeToken()).type);
@@ -1199,7 +1208,7 @@ struct BinaryParsingUnit: MilaParsingUnit {
 
         // is there any other binary?
         if (not parser.hasToken() || not toType(parser.getToken()->type).has_value()) {
-            return makeStuff<Binary>(tok->first, std::move(lhs), std::move(rhs));
+            return makeStuff2<Binary>(tok->first, std::move(lhs), std::move(rhs));
         }
         // yes
 
@@ -1210,9 +1219,9 @@ struct BinaryParsingUnit: MilaParsingUnit {
             TRY(parser.parseOne(LookDirection::Around));
             auto newRhs = TRY(parser.popExpr());
 
-            return makeStuff<Binary>(tok->first, std::move(lhs), std::move(newRhs));
+            return makeStuff2<Binary>(tok->first, std::move(lhs), std::move(newRhs));
         } else {
-            parser.pushExp(makeStuff<Binary>(tok->first, std::move(lhs), std::move(rhs)));
+            parser.pushExp(makeStuff2<Binary>(tok->first, std::move(lhs), std::move(rhs)));
             TRY(parser.parseOne(LookDirection::Around));
             return TRY(parser.popExpr());
         }
@@ -1232,14 +1241,14 @@ struct FieldParsingUnit: MilaParsingUnit {
         return parser.isPrevExp() && parser.isPeekType(TokenType1::Dot);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         auto subject = TRY(parser.popExpr());
 
         assertToken(TokenType1::Dot);
 
         auto fieldName = TRY(parser.assertIdent());
 
-        return makeStuff<FieldAccess>(std::move(subject), std::move(fieldName));
+        return makeStuff2<FieldAccess>(std::move(subject), std::move(fieldName));
     }
 };
 
@@ -1256,12 +1265,12 @@ struct NegateParsingUnit: MilaParsingUnit {
         return parser.isPeekType(TokenType1::Negate);
     }
 
-    MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
+    MilaResult<ASTNode1> parse(MilaParser& parser) const override {
         assertToken(TokenType1::Negate);
 
         auto inner = TRY(parser.parseExpression());
 
-        return makeStuff<Negate>(std::move(inner));
+        return makeStuff2<Negate>(std::move(inner));
     }
 };
 
@@ -1346,18 +1355,50 @@ enum ValueType1 {
 struct LoxValue {
     ValueType1 v;
 
-   union {
-       double flot;
-       FunctionRef* ref;
-       ClassRef* classRef;
-       ObjectRef* objectRef;
-       bool buul;
-       string* str;
-   };
+    union {
+        double flot;
+        FunctionRef* ref;
+        ClassRef* classRef;
+        ObjectRef* objectRef;
+        bool buul;
+        string* str;
+    };
 
-   bool isFloat() const {
-       return v == FLOAT;
-   }
+    ValueType1 getType() const {
+        return v;
+    }
+
+    double asNumber() const {
+        return flot;
+    }
+
+    string_view asString() const {
+        return string_view{*str};
+    }
+
+    FunctionRef* asFunction() const {
+        return ref;
+    }
+
+    bool asBool() const {
+        return buul;
+    }
+
+    ObjectRef* asObject() const {
+        return objectRef;
+    }
+
+    ClassRef* asClass() const {
+        return classRef;
+    }
+
+    bool matchesType(LoxValue other) const {
+        return this->v == other.v;
+    }
+
+    bool isNumber() const {
+        return v == FLOAT;
+    }
 
     bool isString() const {
         return v == STRING;
@@ -1367,35 +1408,42 @@ struct LoxValue {
         return v == NIL;
     }
 
+    bool isBool() const {
+        return v == BOOL;
+    }
+
+    bool isClass() const {
+        return v == CLASS;
+    }
+
+    bool isObject() const {
+        return v == INSTANCE;
+    }
+
+    bool isFunction() const {
+        return v == FUNCTION_REF;
+    }
 
     string toString() const {
-        switch (v) {
-            /*case NUMBER:
-                return to_string(number);*/
+        switch (getType()) {
             case FLOAT: {
                 char pepa[16];
-                snprintf(pepa, 16, "%G", flot);
+                snprintf(pepa, 16, "%G", asNumber());
                 return {pepa};
-          /*      double intpart;
-                if (modf(flot, &intpart) == 0.0) {
-                    return to_string((long long int)intpart);
-                } else {
-                    return to_string(flot);
-                }*/
             }
             case FUNCTION_REF:
-                return (ref->func->native) ? "<native fn>" : stringify("<fn {}>", ref->func->data.name);
+                return (asFunction()->func->native) ? "<native fn>" : stringify("<fn {}>", asFunction()->func->data.name);
             case NIL:
                 return "nil";
             case BOOL:
-                return buul ? "true" : "false";
+                return asBool() ? "true" : "false";
             case STRING:
-                return *str;
+                return string(asString());
             case CLASS:
-                return classRef->clazz->data.name;
+                return asClass()->clazz->data.name;
                 break;
             case INSTANCE:
-                return stringify("{} instance", (*((ClassRef**)objectRef))->clazz->data.name);
+                return stringify("{} instance", (*((ClassRef**)asObject()))->clazz->data.name);
                 break;
         }
         println("AAAAAAAAAAAAASDADASDASD {}", (long)v);
@@ -1423,15 +1471,35 @@ struct LoxValue {
     }
 
     static LoxValue True() {
-        return LoxValue{.v=BOOL, .buul=true};
+        return LoxValue::Bool(true);
+    }
+
+    static LoxValue Number(double v) {
+        return LoxValue{.v=FLOAT, .flot=v};
+    }
+
+    static LoxValue Function(FunctionRef* v) {
+        return LoxValue{.v=FUNCTION_REF, .ref=v};
     }
 
     static LoxValue False() {
-        return LoxValue{.v=BOOL, .buul=false};
+        return LoxValue::Bool(false);
     }
 
     static LoxValue Nil() {
         return LoxValue{.v=NIL};
+    }
+
+    static LoxValue String(string_view s) {
+        return LoxValue{.v=STRING, .str=new string(s)};
+    }
+
+    static LoxValue Class(ClassRef* ref) {
+        return LoxValue{.v=CLASS, .classRef=ref};
+    }
+
+    static LoxValue Object(ObjectRef* ref) {
+        return LoxValue{.v=INSTANCE, .objectRef=ref};
     }
 };
 
@@ -1456,7 +1524,7 @@ struct ObjectRef {
 
     LoxValue getMethod(const string& name) {
         for (auto m : methods) {
-            if (m->func->data.name == name) return LoxValue{.v=FUNCTION_REF, .ref=m};
+            if (m->func->data.name == name) return LoxValue::Function(m);
         }
         if (proto != nullptr) return proto->getMethod(name);
         PANIC();
@@ -1485,41 +1553,6 @@ struct SpecializedVariable: Expression {
 
     void visit(ASTVisitor& it) override {
         it.invoke(*this);
-    }
-};
-
-struct StackFrame {
-    Function* function = nullptr;
-    StackFrame* parent = nullptr;
-    map<string, LoxValue> values;
-
-    optional<LoxValue*> getVar(const string& s) {
-        if (values.contains(s)) {
-            return &values.at(s);
-        } else if (parent != nullptr) {
-            return parent->getVar(s);
-        } else {
-            return {};
-        }
-    }
-
-    LoxValue getVarVal(const string& s) {
-        auto v = getVar(s);
-        if (not v.has_value()) return LoxValue{NIL, 0};
-
-        return **v;
-    }
-
-    void setVar(const string& name, LoxValue value) {
-        auto tgt = getVar(name);
-        assert(tgt.has_value());
-        **tgt = value;
-    }
-
-    void putVar(const string& name, LoxValue value) {
-        assert(not values.contains(name));
-
-        values[name] = value;
     }
 };
 
@@ -1573,10 +1606,6 @@ struct Linerizer: ASTVisitor {
             return source->locals[relLocalId];
         }
     };
-
-    // map<Function*, vector<bool>> globalScope; // locals layout of every function
-    // map<ASTNode*, tuple<size_t, size_t, Function*>> toPatch; // ast nodes that need to be patched
-    // map<ASTNode*, unique_ptr<SpecializedVariable>*> resolvedSlot; // addresses of nodes to be patched
     vector<HookData> hookList;
 
     struct LexScope {
@@ -1595,9 +1624,6 @@ struct Linerizer: ASTVisitor {
         vector<bool> isUpVal;
 
         vector<LexScope> lexicals;
-
-        // map<ASTNode*, size_t> variableFixups;
-        // map<ASTNode*, unique_ptr<Expression>*> tier2fixup;
         bool isGlobal = false;
 
         optional<size_t> getLocal(const string& s) {
@@ -1710,11 +1736,6 @@ struct Linerizer: ASTVisitor {
                 *f.toPatch = make_unique<SpecializedVariable>(HookedVariableType::UPVAL, closestChild->getUpValId(someParentsId), f.relFrameId-1); // relFrameId-1, we access version stored in nodes child
             }
         }
-
-  /*      for (auto g : globalScope) {
-            g.first->locals = g.second;
-            g.first->upValCount = calcUpValCount(g.second);
-        }*/
     }
 
     void invoke(Return& it) override {
@@ -1808,7 +1829,7 @@ struct Linerizer: ASTVisitor {
         return globals.getLocal(s);
     }
 
-    map<VariableDeclaration*, unique_ptr<Statement>> declarationsToPatch;
+    map<VariableDeclaration*, ASTStm> declarationsToPatch;
 
     void hookIdent(const string& name, unique_ptr<SpecializedVariable>* hookedTarget, bool isDecl) {
         if (VERBOSE) println("VISITING identifier {}", name);
@@ -1849,17 +1870,15 @@ struct Linerizer: ASTVisitor {
         hookIdent(it.data.value, &it.data.hookedTarget, false);
     }
 
-    void hook(unique_ptr<Expression>& tgt) {
+    void hook(ASTExpr& tgt) {
         tgt->visit(*this);
     }
 
-    void hook(unique_ptr<Statement>& tgt) {
+    void hook(ASTStm& tgt) {
         tgt->visit(*this);
     }
 
     void putPatch(unique_ptr<SpecializedVariable>* toPatch1, Function* source, size_t relFrameId, size_t relLocalId, bool isDecl, Function* up) {
-        // this->resolvedSlot[nullptr] = toPatch1;
-        // this->toPatch[nullptr] = {relFrameId, relLocalId, source};
         hookList.emplace_back(toPatch1, source, relFrameId, relLocalId, isDecl, up);
     }
 
@@ -1882,27 +1901,7 @@ struct Linerizer: ASTVisitor {
         }
 
         stack.back().exitScope();
-
-/*        if (stack.empty()) {
-            globals.enterScope();
-
-            for (auto& s : it.data.statements) {
-                hook(s);
-            }
-
-            globals.exitScope();
-        } else {
-            stack.back().enterScope();
-
-            for (auto& s : it.data.statements) {
-                hook(s);
-            }
-
-            stack.back().exitScope();
-        }*/
     }
-
-
 
     void invoke(IF& it) override {
         stack.back().enterScope();
@@ -1920,39 +1919,6 @@ struct Linerizer: ASTVisitor {
         }
 
         stack.back().exitScope();
-/*        if (stack.empty()) {
-            globals.enterScope();
-
-            hook(it.data.cond);
-
-            globals.enterScope();
-            hook(it.data.ifBody);
-            globals.exitScope();
-
-            if (it.data.elsBody.has_value()) {
-                globals.enterScope();
-                hook(*it.data.elsBody);
-                globals.exitScope();
-            }
-
-            globals.exitScope();
-        } else {
-            stack.back().enterScope();
-
-            hook(it.data.cond);
-
-            stack.back().enterScope();
-            hook(it.data.ifBody);
-            stack.back().exitScope();
-
-            if (it.data.elsBody.has_value()) {
-                stack.back().enterScope();
-                hook(*it.data.elsBody);
-                stack.back().exitScope();
-            }
-
-            stack.back().exitScope();
-        }*/
     }
 
     void invoke(While& it) override {
@@ -1980,36 +1946,6 @@ struct Linerizer: ASTVisitor {
         it.locals = stack.back().isUpVal;
         stack.pop_back();
     }
-
-/*    void fixLocals() {
-        if (VERBOSE) {
-            for (auto c : this->globalScope) {
-                println("== FUNC STACK {} {}", c.first->data.name, c.second.size());
-            }
-
-            println("== GLOBALS {}", globals.isUpVal.size());
-
-            println("AAAAAAAAAAAAAA {} -- {} -- {} -- {}", this->globals.lexicals.size(), this->globalScope.size(), this->toPatch.size(), this->resolvedSlot.size());
-        }
-        assert(this->toPatch.size() == this->resolvedSlot.size());
-        for (auto [key, value] : this->toPatch) {
-            if (VERBOSE) println("PATCHING {}", key);
-            auto varId = std::get<1>(value);
-            auto frameId = std::get<0>(value);
-            auto* func = std::get<2>(value);
-            const auto& locals = this->globalScope[func];
-            assert(globalScope.contains(func));
-            assert(varId < globalScope[func].size());
-            auto isUpVal = this->globalScope[func][varId];
-            func->locals = locals;
-            func->upValCount = calcUpValCount(locals);
-            if (isUpVal) {
-                *this->resolvedSlot[key] = make_unique<SpecializedVariable>(HookedVariableType::UPVAL, toUpvalId(locals, varId), frameId);
-            } else {
-                *this->resolvedSlot[key] = make_unique<SpecializedVariable>(HookedVariableType::LOCAL, toLocalId(locals, varId), 0);
-            }
-        }
-    }*/
 
     void invoke(Assign& it) override {
         hook(it.data.value);
@@ -2043,19 +1979,8 @@ struct ASTExecutor: ASTVisitor {
     LoxValue callStack[4096];
     LoxValue* stackBase = callStack+4096;
 
-    /*
-    struct Assigner: ASTVisitor {
-        LoxValue value;
-        ASTExecutor* executor;
-
-        void invoke(Identifier& it) override {
-            executor->getFrame()->setVar(it.data.value, value);
-            executor->push(value);
-        }
-    };*/
-
     LoxValue pop() {
-        // assert(not valueStack.empty());
+        assert(not valueStack.empty());
 
         auto v = valueStack.back(); valueStack.pop_back();
 
@@ -2067,15 +1992,9 @@ struct ASTExecutor: ASTVisitor {
         valueStack.push_back(val);
     }
 
-    /*StackFrame* getFrame() {
-        return frames.back();
-    }*/
-
     void invoke(IntLiteral& it) override {
-        push(LoxValue{ValueType1::FLOAT, it.data.value});
+        push(LoxValue::Number(it.data.value));
     }
-
-    size_t funcId = 0;
 
     FunctionRef* currentFrame;
 
@@ -2108,7 +2027,7 @@ struct ASTExecutor: ASTVisitor {
         fRef->func = &it;
         fRef->parent = currentFrame;
 
-        setSpecVar(*specVar, LoxValue{.v=ValueType1::FUNCTION_REF, .ref=fRef});
+        setSpecVar(*specVar, LoxValue::Function(fRef));
 
         for (auto i = 0UL; i < it.captures.size(); i++) {
             fRef->captures[it.upValCount()+i] = getUpVal(it.captures[i]);
@@ -2119,11 +2038,11 @@ struct ASTExecutor: ASTVisitor {
         ClassRef* super = nullptr;
         if (it.data.superClass.has_value()) {
             auto v = getSpecVar(*it.hookedTarget);
-            assert(v.v == CLASS);
-            super = v.classRef;
+            assert(v.isClass());
+            super = v.asClass();
         }
         auto clazz = new ClassRef{&it, super, currentFrame};
-        auto loxClass = LoxValue{.v=CLASS, .classRef=clazz};
+        auto loxClass = LoxValue::Class(clazz);
 
         setSpecVar(*it.hookedDst, loxClass);
     }
@@ -2178,7 +2097,7 @@ struct ASTExecutor: ASTVisitor {
                 return v;
             }
             case HookedVariableType::ALLOC_UPVAL:
-                PANIC();
+            PANIC();
                 break;
         }
         UNREACHABLE();
@@ -2210,15 +2129,16 @@ struct ASTExecutor: ASTVisitor {
             for (auto i = 0UL; i < c->captures.size(); i++) {
                 f->captures[c->upValCount()+i] = getUpVal(c->captures[i]);
             }
-            f->captures[c->getParamUpValOffset()] = new LoxValue(LoxValue{.v=INSTANCE, .objectRef=me});
-            f->captures[c->getParamUpValOffset()+1] = new LoxValue(proto == nullptr ? LoxValue::Nil() : LoxValue{.v=INSTANCE, .objectRef=proto});
+            f->captures[c->getParamUpValOffset()] = new LoxValue(LoxValue::Object(me));
+            f->captures[c->getParamUpValOffset() + 1] = new LoxValue(
+                    proto == nullptr ? LoxValue::Nil() : LoxValue::Object(proto));
             me->methods.push_back(f);
         }
 
         return me;
     }
 
-    void instantiate(ClassRef* clazz, span<unique_ptr<Expression>> argz) {
+    void instantiate(ClassRef* clazz, span<ASTExpr> argz) {
         auto constructor = clazz->getConstructor();
         if (constructor == nullptr && not argz.empty()) PANIC();
         if (constructor != nullptr && constructor->data.argz.size() != argz.size()) PANIC();
@@ -2227,14 +2147,14 @@ struct ASTExecutor: ASTVisitor {
 
         if (constructor != nullptr) {
             auto f = res->getMethod("init");
-            call(*f.ref, argz);
+            call(*f.asFunction(), argz);
             pop();
         }
 
-        push(LoxValue{.v=INSTANCE, .objectRef=res});
+        push(LoxValue::Object(res));
     }
 
-    void call(FunctionRef& f, span<std::unique_ptr<Expression>> argz) {
+    void call(FunctionRef& f, span<ASTExpr> argz) {
         auto& idk = f;
 
         if (idk.func->data.argz.size() != argz.size()) PANIC("invalid number of args");
@@ -2279,9 +2199,9 @@ struct ASTExecutor: ASTVisitor {
         if (shouldReturn) {
             shouldReturn = false;
         } else {
-            push(LoxValue{.v=NIL});
+            push(LoxValue::Nil());
         }
- /*       if (f.func->data.name ==  "init")  {
+        /*       if (f.func->data.name ==  "init")  {
             pop();
             push(currentFrame->read(currentFrame->func->upValCount()));
         }*/
@@ -2294,25 +2214,25 @@ struct ASTExecutor: ASTVisitor {
 
         auto value = pop();
 
-        if (value.v == ValueType1::CLASS) {
-            instantiate(value.classRef, it.args);
+        if (value.isClass()) {
+            instantiate(value.asClass(), it.args);
             return;
         }
 
-        if (value.v != ValueType1::FUNCTION_REF) println("AAAAAAAAAAAAAAAAAA {}", value.toString());
-        assert(value.v == ValueType1::FUNCTION_REF);
-        call(*value.ref, it.args);
+        if (not value.isFunction()) println("AAAAAAAAAAAAAAAAAA {}", value.toString());
+        assert(value.isFunction());
+        call(*value.asFunction(), it.args);
     }
 
     void invoke(NilLiteral& it) override {
-        push(LoxValue{.v = NIL});
+        push(LoxValue::Nil());
     }
 
     void invoke(FieldAccess &it) override {
         it.data.subject->visit(*this);
         auto subj = pop();
-        assert(subj.v == INSTANCE);
-        push(subj.objectRef->read(it.data.fieldName));
+        assert(subj.isObject());
+        push(subj.asObject()->read(it.data.fieldName));
     }
 
     void invoke(Identifier& it) override {
@@ -2331,7 +2251,7 @@ struct ASTExecutor: ASTVisitor {
     }
 
     void invoke(VariableDeclaration& it) override {
-        auto value = LoxValue{NIL, 0};
+        auto value = LoxValue::Nil();
         if (it.data.value.has_value()) {
             (*it.data.value)->visit(*this);
             value = pop();
@@ -2345,7 +2265,7 @@ struct ASTExecutor: ASTVisitor {
         if (it.data.value.has_value()) {
             (*it.data.value)->visit(*this);
         } else {
-            push(LoxValue{.v=NIL});
+            push(LoxValue::Nil());
         }
         shouldReturn = true;
     }
@@ -2382,86 +2302,86 @@ struct ASTExecutor: ASTVisitor {
             case BinaryType::ADD:
                 if (rhs.isString()) {
                     assert(lhs.isString());
-                    auto* idk = new string{};
-                    *idk += *lhs.str;
-                    *idk += *rhs.str;
-                    res = LoxValue{.v=ValueType1::STRING, .str=idk};
+                    auto idk = string{};
+                    idk += lhs.asString();
+                    idk += rhs.asString();
+                    res = LoxValue::String(std::move(idk));
                 } else {
-                    assert(rhs.v == ValueType1::FLOAT);
-                    assert(lhs.v == ValueType1::FLOAT);
-                    res = LoxValue{ValueType1::FLOAT, lhs.flot+rhs.flot};
+                    assert(rhs.isNumber());
+                    assert(lhs.isNumber());
+                    res = LoxValue::Number(lhs.asNumber() + rhs.asNumber());
                 }
                 break;
             case BinaryType::SUB:
-                assert(rhs.v == ValueType1::FLOAT);
-            assert(lhs.v == ValueType1::FLOAT);
-                res = LoxValue{ValueType1::FLOAT, lhs.flot-rhs.flot};
-            break;
+                assert(rhs.isNumber());
+                assert(lhs.isNumber());
+                res = LoxValue::Number(lhs.asNumber() - rhs.asNumber());
+                break;
             case BinaryType::DIV:
-                assert(rhs.v == ValueType1::FLOAT);
-            assert(lhs.v == ValueType1::FLOAT);
-                res = LoxValue{ValueType1::FLOAT, lhs.flot/rhs.flot};
-            break;
+                assert(rhs.isNumber());
+                assert(lhs.isNumber());
+                res = LoxValue::Number(lhs.asNumber() / rhs.asNumber());
+                break;
             case BinaryType::MOD:
-                assert(rhs.v == ValueType1::FLOAT);
-            assert(lhs.v == ValueType1::FLOAT);
+                assert(rhs.isNumber());
+                assert(lhs.isNumber());
                 // FIXME
-                res = LoxValue{ValueType1::FLOAT, (double)((long)lhs.flot%(long)rhs.flot)};
-            break;
+                res = LoxValue::Number((double) ((long) lhs.asNumber() % (long) rhs.asNumber()));
+                break;
             case BinaryType::REM:
-                TODO();
+            TODO();
                 break;
             case BinaryType::MUL:
-                assert(rhs.v == ValueType1::FLOAT);
-            assert(lhs.v == ValueType1::FLOAT);
-                res = LoxValue{ValueType1::FLOAT, lhs.flot*rhs.flot};
+                assert(rhs.isNumber());
+                assert(lhs.isNumber());
+                res = LoxValue::Number(lhs.asNumber() * rhs.asNumber());
                 break;
             case BinaryType::GT:
-                assert(rhs.v == ValueType1::FLOAT);
-            assert(lhs.v == ValueType1::FLOAT);
-                res = LoxValue{.v=ValueType1::BOOL, .buul=lhs.flot>rhs.flot};
-            break;
+                assert(rhs.isNumber());
+                assert(lhs.isNumber());
+                res = LoxValue::Bool(lhs.asNumber() > rhs.asNumber());
+                break;
             case BinaryType::LESS:
-                assert(rhs.v == ValueType1::FLOAT);
-            assert(lhs.v == ValueType1::FLOAT);
-                res = LoxValue{.v=ValueType1::BOOL, .buul=lhs.flot<rhs.flot};
-            break;
+                assert(rhs.isNumber());
+                assert(lhs.isNumber());
+                res = LoxValue::Bool(lhs.asNumber() < rhs.asNumber());
+                break;
             case BinaryType::EQ:
             case BinaryType::NEQ: {
-                if (rhs.v != lhs.v) {
+                if (rhs.matchesType(lhs)) {
                     res = LoxValue::False();
-                } else if (rhs.v == ValueType1::FLOAT) {
-                    assert(lhs.v == ValueType1::FLOAT);
-                    res = LoxValue{.v = BOOL, .buul = rhs.flot == lhs.flot};
-                } else if (rhs.v == ValueType1::FUNCTION_REF) {
-                    res = LoxValue{.v=BOOL, .buul = rhs.ref == lhs.ref};
-                } else if (rhs.v == ValueType1::STRING) {
-                    res = LoxValue::Bool(*lhs.str == *rhs.str);
-                } else if (rhs.v == ValueType1::BOOL) {
-                    res = LoxValue::Bool(lhs.buul == rhs.buul);
-                } else if (rhs.v == ValueType1::NIL) {
+                } else if (rhs.isNumber()) {
+                    assert(lhs.isNumber());
+                    res = LoxValue::Bool(rhs.asNumber() == lhs.asNumber());
+                } else if (rhs.isFunction()) {
+                    res = LoxValue::Bool(rhs.asFunction() == lhs.asFunction());
+                } else if (rhs.isString()) {
+                    res = LoxValue::Bool(lhs.asString() == rhs.asString());
+                } else if (rhs.isBool()) {
+                    res = LoxValue::Bool(lhs.asBool() == rhs.asBool());
+                } else if (rhs.isNil()) {
                     res = LoxValue::True();
-                } else if (rhs.v == ValueType1::CLASS) {
-                    res = LoxValue::Bool(lhs.classRef == rhs.classRef);
+                } else if (rhs.isClass()) {
+                    res = LoxValue::Bool(lhs.asClass() == rhs.asClass());
                 } else {
                     TODO();
                 }
 
                 if (it.data.type == BinaryType::NEQ) {
-                    res = LoxValue::Bool(!res.buul);
+                    res = LoxValue::Bool(!res.asBool());
                 }
                 break;
             }
-            break;
+                break;
             case BinaryType::GEQ:
-                assert(rhs.v == ValueType1::FLOAT);
-                assert(lhs.v == ValueType1::FLOAT);
-                res = LoxValue{.v=ValueType1::BOOL, .buul=lhs.flot>=rhs.flot};
+                assert(rhs.isNumber());
+                assert(lhs.isNumber());
+                res = LoxValue::Bool(lhs.asNumber() >= rhs.asNumber());
                 break;
             case BinaryType::LEQ:
-                assert(rhs.v == ValueType1::FLOAT);
-                assert(lhs.v == ValueType1::FLOAT);
-                res = LoxValue{.v=ValueType1::BOOL, .buul=lhs.flot<=rhs.flot};
+                assert(rhs.isNumber());
+                assert(lhs.isNumber());
+                res = LoxValue::Bool(lhs.asNumber() <= rhs.asNumber());
                 break;
             case BinaryType::AND:
                 break;
@@ -2494,9 +2414,9 @@ struct ASTExecutor: ASTVisitor {
         } else if (dynamic_cast<FieldAccess*>(dst) != nullptr) {
             dynamic_cast<FieldAccess*>(dst)->data.subject->visit(*this);
             auto obj = pop();
-            assert(obj.v == ValueType1::INSTANCE);
+            assert(obj.isObject());
             auto v = pop();
-            (*obj.objectRef->fields)[dynamic_cast<FieldAccess*>(dst)->data.fieldName] = v;
+            (*obj.asObject()->fields)[dynamic_cast<FieldAccess*>(dst)->data.fieldName] = v;
             push(v); // FIXME this is retarded
         } else {
             TODO();
@@ -2505,7 +2425,7 @@ struct ASTExecutor: ASTVisitor {
 
     void invoke(StringLiteral1& it) override {
         string_view v(it.data.value.data()+1, it.data.value.size()-2);
-        push(LoxValue{.v=ValueType1::STRING, .str=new string(v)});
+        push(LoxValue::String(v));
     }
 
     void invoke(IF& it) override {
@@ -2520,7 +2440,7 @@ struct ASTExecutor: ASTVisitor {
     }
 
     void invoke(BoolLiteral1& it) override {
-        push(LoxValue{.v=ValueType1::BOOL, .buul=it.data.value});
+        push(LoxValue::Bool(it.data.value));
     }
 
     void invoke(SpecializedVariable& it) override {
@@ -2530,7 +2450,7 @@ struct ASTExecutor: ASTVisitor {
     void invoke(Negate& it) override {
         it.data.inner->visit(*this);
         auto v = pop();
-        push(LoxValue{.v=BOOL, .buul=!v.toBool()});
+        push(LoxValue::Bool(!v.toBool()));
     }
 };
 
@@ -2571,7 +2491,7 @@ int main(int argc, const char** argv) {
     }
 
 
-    auto globalFunc = makeStuff<Function>("_global");
+    auto globalFunc = makeStuff2<Function>("_global");
 
     Linerizer linerizer;
     linerizer.stack.emplace_back();
@@ -2588,6 +2508,8 @@ int main(int argc, const char** argv) {
 
     globalFunc->locals = linerizer.stack.back().isUpVal;
 
+    auto start1 = std::chrono::high_resolution_clock::now();
+
     linerizer.realFix();
     // return 3;
 
@@ -2596,11 +2518,11 @@ int main(int argc, const char** argv) {
     executor.currentFrame = executor.allocateFunctionRef(*globalFunc);
     executor.stackBase -= globalFunc->locals.size()-globalFunc->totalUpValCount();
 
-    auto clock = makeStuff<Function>(clk, vector<string>{}, vector<unique_ptr<Statement>>{});
+    auto clock = makeStuff2<Function>(clk, vector<string>{}, vector<ASTStm>{});
     clock->native = [&](ASTExecutor& ctx) {
-        ctx.push(LoxValue{.v=FLOAT, .flot=0.0});
+        ctx.push(LoxValue::Number(duration_cast<std::chrono::microseconds>((std::chrono::high_resolution_clock::now()-start1)).count()/1'000'000.0));
     };
-    executor.globals[clockId] = LoxValue{.v=FUNCTION_REF, .ref=new FunctionRef{nullptr, clock.get()}};
+    executor.globals[clockId] = LoxValue::Function(new FunctionRef{nullptr, clock.get()});
     // executor.frames.push_back(new StackFrame());
 
     size_t ip = 0;
