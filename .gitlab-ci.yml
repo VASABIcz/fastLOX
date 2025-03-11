@@ -2,8 +2,9 @@ image: $CI_REGISTRY/ni-run/lox-test:latest
 
 test:
   script:
-    - meson setup build # -D b_sanitize=address,undefined
-    - meson compile -C build
+    - cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=/bin/g++ -G Ninja -B cmake-build-debug && cmake -DCMAKE_BUILD_TYPE=Release -G Ninja -B cmake-build-release
+    - cmake --build ./cmake-build-debug --target lox
+    - cmake --build ./cmake-build-release --target lox
     - cppcheck --error-exitcode=1 src/*.cpp src/*.hpp
     - export ASAN_OPTIONS=symbolize=1:debug=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1
     - export LOX="$(readlink -f ./build/lox)"
