@@ -13,6 +13,7 @@
 #include "../utils/pdo_utils.h"
 #include <filesystem>
 #include <cstring>
+#include <cstdlib>
 
 #define VERBOSE 0
 
@@ -1029,8 +1030,8 @@ struct NumericParsingUnit: MilaParsingUnit {
     MilaResult<unique_ptr<ASTNode>> parse(MilaParser& parser) const override {
         auto ident = TRY(parser.getAssert(TokenType1::NumberLiteral)).content;
 
-        double idk;
-        std::from_chars(ident.begin(), ident.end(), idk);
+        // FIXME mby handle error?
+        double idk = std::strtod(ident.begin(), nullptr);
 
         return makeStuff<IntLiteral>(idk);
     }
