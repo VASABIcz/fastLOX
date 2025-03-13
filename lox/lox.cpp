@@ -17,6 +17,88 @@
 
 #define VERBOSE 0
 
+struct SimpleArena {
+    struct Chunk {
+        Chunk* next = nullptr;
+        size_t size = 0;
+        size_t capacity;
+        char data[];
+
+        void free() {
+            if (next != nullptr) next->free();
+            ::free(this);
+        }
+    };
+    Chunk* root = nullptr;
+    Chunk* current = nullptr;
+
+    static constexpr size_t START_SIZE = 128;
+
+    void* allocate(size_t size, size_t align1) {
+        if (current == nullptr) {
+            root = static_cast<Chunk*>(malloc(sizeof(Chunk) + START_SIZE));
+            root->capacity = START_SIZE;
+            root->size = 0;
+            root->next = nullptr;
+            current = root;
+        }
+
+        auto availableSize = current->capacity - current->size;
+        auto possibleAdr = current->data + current->size;
+        auto alignedAdr = align((size_t)possibleAdr, align1);
+
+        auto realSize = (alignedAdr-(size_t)possibleAdr)+size;
+
+        if (availableSize >= realSize) {
+            current->size += realSize;
+            return (void*)alignedAdr;
+        }
+
+        // println("REQUESTING ALLOC! {}", sizeof(Chunk) + current->capacity*2);
+        auto* newChunk = static_cast<Chunk*>(malloc(sizeof(Chunk) + current->capacity*2));
+        newChunk->capacity = current->capacity*2;
+        newChunk->next = nullptr;
+        newChunk->size = 0;
+        current->next = newChunk;
+        current = newChunk;
+
+        return allocate(size, align1);
+    }
+
+    template<typename T>
+    span<T> allocSpan(size_t size) {
+        auto* data = allocate(size*sizeof(T), alignof(T));
+
+        return {data, size};
+    }
+
+    string_view allocString(string_view s, bool nullTerminated = true) {
+        auto* data = (char*)allocate(s.size()+(nullTerminated ? 1 : 0), 1);
+        std::memcpy(data, s.data(), s.size());
+        if (nullTerminated) (data)[s.size()] = 0;
+
+        return string_view{data, s.size()};
+    }
+
+    template<typename T, typename... Args>
+    T* allocateElement(Args&&... arg) {
+        auto* data = allocate(sizeof(T), alignof(T));
+        return new (data)T(std::forward<Args>(arg)...);
+    }
+
+    void free() {
+        if (root != nullptr) root->free();
+        root = nullptr;
+        current = nullptr;
+    }
+
+    void reset() {
+
+    }
+};
+
+SimpleArena AST_ARENA;
+
 enum class TokenType1 {
     Var,
     For,
@@ -186,9 +268,9 @@ struct Statement: ASTNode {
 struct Expression: Statement {
 };
 
-using ASTExpr = unique_ptr<Expression>;
-using ASTStm = unique_ptr<Statement>;
-using ASTNode1 = unique_ptr<ASTNode>;
+using ASTExpr = Expression*; // unique_ptr<Expression>;
+using ASTStm = Statement*; // unique_ptr<Statement>;
+using ASTNode1 = ASTNode*; //unique_ptr<ASTNode>;
 
 struct IntLiteral;
 struct Assign;
@@ -211,6 +293,21 @@ struct Class;
 struct This;
 struct Super;
 struct FieldAccess;
+
+enum class HookedVariableType {
+    LOCAL,
+    UPVAL,
+    GLOBAL,
+    ALLOC_UPVAL
+};
+
+struct SpecializedVariable {
+    HookedVariableType type;
+    size_t id;
+    size_t frameId;
+};
+
+using SpecTarget = SpecializedVariable;
 
 struct ASTVisitor {
     virtual void invoke(IntLiteral& it) {}
@@ -236,8 +333,6 @@ struct ASTVisitor {
     virtual void invoke(StringLiteral1& it) {}
 
     virtual void invoke(VariableDeclaration& it) {}
-
-    virtual void invoke(SpecializedVariable& it) {}
 
     virtual void invoke(BoolLiteral1& it) {}
 
@@ -282,7 +377,7 @@ struct Function: Statement {
     vector<bool> locals;
     vector<size_t> captures; // list of parent function up-local-ids that we capture
     // size_t upValCount = 0;
-    unique_ptr<SpecializedVariable> hookedTarget = nullptr;
+    SpecTarget hookedTarget;
     std::function<void(ASTExecutor&)> native;
 
     size_t getParamUpValOffset() {
@@ -341,15 +436,15 @@ struct Class: Statement {
     STRUCT_BEGIN(Class)
     string name;
     optional<string> superClass;
-    vector<unique_ptr<Function>> methods;
+    vector</*unique_ptr<*/Function*/*>*/> methods;
     STRUCT_END(Class)
 
-    unique_ptr<SpecializedVariable> hookedTarget = nullptr;
-    unique_ptr<SpecializedVariable> hookedDst = nullptr;
+    SpecTarget hookedTarget;
+    SpecTarget hookedDst;
 
     Function* getMethod(string_view name) {
         for (auto& f : data.methods) {
-            if (f->data.name == name) return f.get();
+            if (f->data.name == name) return f/*.get()*/;
         }
         return nullptr;
     }
@@ -358,13 +453,13 @@ struct Class: Statement {
 struct This: Expression {
     STRUCT_BEGIN(This)
     STRUCT_END(This)
-    unique_ptr<SpecializedVariable> hookedTarget;
+    SpecTarget hookedTarget{};
 };
 
 struct Super: Expression {
     STRUCT_BEGIN(Super)
     STRUCT_END(Super)
-    unique_ptr<SpecializedVariable> hookedTarget;
+    SpecTarget hookedTarget{};
 };
 
 enum class BinaryType {
@@ -410,7 +505,7 @@ struct StatmentExpr: Statement {
 struct Identifier: Expression {
     STRUCT_BEGIN(Identifier)
     string value;
-    unique_ptr<SpecializedVariable> hookedTarget = nullptr;
+    SpecTarget hookedTarget;
     STRUCT_END(Identifier)
 };
 
@@ -418,7 +513,7 @@ struct VariableDeclaration: Statement {
     STRUCT_BEGIN(VariableDeclaration)
     string dst;
     optional<ASTExpr> value;
-    unique_ptr<SpecializedVariable> hookedTarget = nullptr;
+    SpecTarget hookedTarget;
     STRUCT_END(VariableDeclaration)
 };
 
@@ -500,8 +595,8 @@ struct NilLiteral: Expression {
 };
 
 template<typename T, typename... ARGS>
-std::unique_ptr<T> makeStuff2(ARGS&&... args) {
-    return make_unique<T>(typename T::Data(std::forward<ARGS>(args)...));
+T* makeStuff2(ARGS&&... args) {
+    return AST_ARENA.allocateElement<T>(typename T::Data(std::forward<ARGS>(args)...)); // new T(typename T::Data(std::forward<ARGS>(args)...));
 }
 
 struct MilaState {
@@ -572,10 +667,10 @@ public:
     using Parser::Parser;
 
     MilaResult<ASTExpr> parseExpression() {
-        auto stuff = TRY(parseSomethingTerminator(TokenType1::Semicolon)).release();
+        auto stuff = TRY(parseSomethingTerminator(TokenType1::Semicolon))/*.release()*/;
         auto csted = dynamic_cast<Expression*>(stuff);
         if (csted == nullptr) {
-            delete stuff;
+            // delete stuff;
             return unexpected{NotAExpr{}};
         }
 
@@ -583,7 +678,7 @@ public:
     }
 
     MilaResult<ASTStm> parseStatement() {
-        auto stuff = TRY(parseSomethingTerminator(TokenType1::Semicolon)).release();
+        auto stuff = TRY(parseSomethingTerminator(TokenType1::Semicolon))/*.release()*/;
         auto csted = dynamic_cast<Statement*>(stuff);
         if (csted == nullptr) {
             auto csted1 = dynamic_cast<Expression*>(stuff);
@@ -627,7 +722,7 @@ public:
 
     template<typename T>
     bool isPrev() const {
-        return isPeekStack([&](auto& it) { return dynamic_cast<const T*>(it.get()); });
+        return isPeekStack([&](auto& it) { return dynamic_cast<const T*>(it/*.get()*/); });
     }
 
     bool isPrevExp() const {
@@ -637,8 +732,8 @@ public:
     MilaResult<ASTExpr> popExpr() {
         if (not isPrevExp()) return unexpected{NotAExpr{}};
 
-        auto preExpr = prevPop();
-        auto* ptr = preExpr->release();
+        auto preExpr = TRY(prevPop());
+        auto* ptr = preExpr;/*.release()*/;
         return ASTExpr(dynamic_cast<Expression*>(ptr));
     }
 
@@ -995,7 +1090,7 @@ struct PrefixMinusParsingUnit: MilaParsingUnit {
 
         auto expr = TRY(parser.popExpr());
 
-        if (auto v = dynamic_cast<IntLiteral*>(expr.get()); v) {
+        if (auto v = dynamic_cast<IntLiteral*>(expr/*.get()*/); v) {
             return makeStuff2<IntLiteral>(-v->data.value);
         }
 
@@ -1071,7 +1166,7 @@ struct ClassParsingUnit: MilaParsingUnit {
 
         assertToken(TokenType1::OCB);
 
-        vector<unique_ptr<Function>> methods;
+        vector</*unique_ptr<*/Function*/*>*/> methods;
 
         while (!parser.isPeekTypeConsume(TokenType1::CCB)) {
             auto methodName = TRY(parser.assertIdent());
@@ -1342,19 +1437,133 @@ struct ClassRef {
 
 struct ObjectRef;
 
-enum ValueType1 {
+struct LoxValue {
+    static constexpr u_int64_t NAN_MASK  = 0x7FFC000000000000; // 13 bits
+    static constexpr u_int64_t TAG_MASK  = 0x8003000000000000; // 3 bits
+    static constexpr u_int64_t DATA_MASK = 0x0000ffffffffffff; // 48 bits
+    static constexpr u_int64_t INV_DATA_MASK = ~0x0000ffffffffffff;
+
+#if 1
+    enum ValueType2: uint64_t {
+        FLOAT =        0x0000000000000000, // 0
+        FUNCTION_REF = 0x0001000000000000, // 1
+        NIL =          0x0002000000000000, // 2
+        BOOL =         0x0003000000000000, // 3
+        STRING =       0x8000000000000000, // 4
+        CLASS =        0x8001000000000000, // 5
+        INSTANCE =     0x8002000000000000, // 6
+        BOOL_FALSE =   0x8003000000000000  // 7
+    };
+
+    static bool isNan(u_int64_t value) {
+        return (value & NAN_MASK) == NAN_MASK;
+    }
+
+    static ValueType2 toType(u_int64_t v) {
+        if (!isNan(v)) { // not nan must be number i guess?
+            return ValueType2::FLOAT;
+        }
+        auto tagBits = (v & TAG_MASK);
+
+        return bit_cast<ValueType2>(tagBits);
+    }
+
+    static bool decodeBool(u_int64_t v) {
+        return toType(v) == ValueType2::BOOL;
+    }
+
+    static u_int64_t encodeBool(bool v) {
+        return NAN_MASK | (v ? bit_cast<uint64_t>(ValueType2::BOOL) : bit_cast<uint64_t>(ValueType2::BOOL_FALSE));
+    }
+
+    static void* decodePointer(u_int64_t v) {
+        return bit_cast<void*>((v & DATA_MASK) << 2);
+    }
+
+    static u_int64_t encodePointer(u_int64_t tag, void* ptr1) {
+        auto ptr = bit_cast<u_int64_t>(ptr1);
+        assert((ptr & 3) == 0);
+        assert(((ptr >> 2) & INV_DATA_MASK) == 0);
+        assert(((ptr >> 2) & DATA_MASK) == (ptr >> 2));
+        assert((DATA_MASK & NAN_MASK & tag) == 0);
+        return tag | NAN_MASK | (ptr >> 2);
+    }
+
+    static u_int64_t encodeNil() {
+        return NAN_MASK | bit_cast<uint64_t>(ValueType2::NIL);
+    }
+
+    u_int64_t internal;
+
+    ValueType2 getType() const {
+        return toType(internal);
+    }
+
+    double asNumber() const {
+        return std::bit_cast<double>(internal);
+    }
+
+    string_view asString() const {
+        return string_view{*(string*)decodePointer(internal)};
+    }
+
+    FunctionRef* asFunction() const {
+        return (FunctionRef*)decodePointer(internal);
+    }
+
+    bool asBool() const {
+        return decodeBool(internal);
+    }
+
+    ObjectRef* asObject() const {
+        return (ObjectRef*)decodePointer(internal);
+    }
+
+    ClassRef* asClass() const {
+        return (ClassRef*)decodePointer(internal);
+    }
+
+    static LoxValue Bool(bool v) {
+        return {encodeBool(v)};
+    }
+
+    static LoxValue Number(double v) {
+        return {bit_cast<uint64_t>(v)};
+    }
+
+    static LoxValue Function(FunctionRef* v) {
+        return {encodePointer((uint64_t)ValueType2::FUNCTION_REF, v)};
+    }
+
+    static LoxValue Nil() {
+        return {encodeNil()};
+    }
+
+    static LoxValue String(string_view s) {
+        return{encodePointer((uint64_t)ValueType2::STRING, new string(s))}; // LoxValue{.v=STRING, .str=new string(s)};
+    }
+
+    static LoxValue Class(ClassRef* ref) {
+        return {encodePointer((uint64_t)ValueType2::CLASS, ref)};
+    }
+
+    static LoxValue Object(ObjectRef* ref) {
+        return {encodePointer((uint64_t)ValueType2::INSTANCE, ref)};
+    }
+
+#else
+    enum ValueType1 {
     FLOAT,
     FUNCTION_REF,
     NIL,
     BOOL,
     STRING,
     CLASS,
-    INSTANCE
+    INSTANCE,
+    BOOL_FALSE // unused
 };
 
-struct LoxValue {
     ValueType1 v;
-
     union {
         double flot;
         FunctionRef* ref;
@@ -1392,86 +1601,8 @@ struct LoxValue {
         return classRef;
     }
 
-    bool matchesType(LoxValue other) const {
-        return this->v == other.v;
-    }
-
-    bool isNumber() const {
-        return v == FLOAT;
-    }
-
-    bool isString() const {
-        return v == STRING;
-    }
-
-    bool isNil() const {
-        return v == NIL;
-    }
-
-    bool isBool() const {
-        return v == BOOL;
-    }
-
-    bool isClass() const {
-        return v == CLASS;
-    }
-
-    bool isObject() const {
-        return v == INSTANCE;
-    }
-
-    bool isFunction() const {
-        return v == FUNCTION_REF;
-    }
-
-    string toString() const {
-        switch (getType()) {
-            case FLOAT: {
-                char pepa[16];
-                snprintf(pepa, 16, "%G", asNumber());
-                return {pepa};
-            }
-            case FUNCTION_REF:
-                return (asFunction()->func->native) ? "<native fn>" : stringify("<fn {}>", asFunction()->func->data.name);
-            case NIL:
-                return "nil";
-            case BOOL:
-                return asBool() ? "true" : "false";
-            case STRING:
-                return string(asString());
-            case CLASS:
-                return asClass()->clazz->data.name;
-                break;
-            case INSTANCE:
-                return stringify("{} instance", (*((ClassRef**)asObject()))->clazz->data.name);
-                break;
-        }
-        println("AAAAAAAAAAAAASDADASDASD {}", (long)v);
-        UNREACHABLE();
-    }
-
-    bool toBool() const {
-        switch (v) {
-            case FLOAT:
-            case CLASS:
-            case INSTANCE:
-            case FUNCTION_REF:
-            case STRING:
-                return true;
-            case NIL:
-                return false;
-            case BOOL:
-                return buul;
-        }
-        PANIC()
-    }
-
     static LoxValue Bool(bool v) {
         return LoxValue{.v=BOOL, .buul=v};
-    }
-
-    static LoxValue True() {
-        return LoxValue::Bool(true);
     }
 
     static LoxValue Number(double v) {
@@ -1480,10 +1611,6 @@ struct LoxValue {
 
     static LoxValue Function(FunctionRef* v) {
         return LoxValue{.v=FUNCTION_REF, .ref=v};
-    }
-
-    static LoxValue False() {
-        return LoxValue::Bool(false);
     }
 
     static LoxValue Nil() {
@@ -1500,6 +1627,91 @@ struct LoxValue {
 
     static LoxValue Object(ObjectRef* ref) {
         return LoxValue{.v=INSTANCE, .objectRef=ref};
+    }
+#endif
+
+    static LoxValue True() {
+        return LoxValue::Bool(true);
+    }
+
+    static LoxValue False() {
+        return LoxValue::Bool(false);
+    }
+
+    bool matchesType(LoxValue other) const {
+        return this->getType() == other.getType();
+    }
+
+    bool isNumber() const {
+        return getType() == FLOAT;
+    }
+
+    bool isString() const {
+        return getType() == STRING;
+    }
+
+    bool isNil() const {
+        return getType() == NIL;
+    }
+
+    bool isBool() const {
+        return getType() == BOOL || getType() == BOOL_FALSE;
+    }
+
+    bool isClass() const {
+        return getType() == CLASS;
+    }
+
+    bool isObject() const {
+        return getType() == INSTANCE;
+    }
+
+    bool isFunction() const {
+        return getType() == FUNCTION_REF;
+    }
+
+    string toString() const {
+        switch (getType()) {
+            case FLOAT: {
+                char pepa[16];
+                snprintf(pepa, 16, "%G", asNumber());
+                return {pepa};
+            }
+            case FUNCTION_REF:
+                return (asFunction()->func->native) ? "<native fn>" : stringify("<fn {}>", asFunction()->func->data.name);
+            case NIL:
+                return "nil";
+            case BOOL:
+            case BOOL_FALSE:
+                return asBool() ? "true" : "false";
+            case STRING:
+                return string(asString());
+            case CLASS:
+                return asClass()->clazz->data.name;
+                break;
+            case INSTANCE:
+                return stringify("{} instance", (*((ClassRef**)asObject()))->clazz->data.name);
+                break;
+        }
+        // println("AAAAAAAAAAAAASDADASDASD {}", (long)v);
+        UNREACHABLE();
+    }
+
+    bool toBool() const {
+        switch (getType()) {
+            case FLOAT:
+            case CLASS:
+            case INSTANCE:
+            case FUNCTION_REF:
+            case STRING:
+                return true;
+            case NIL:
+                return false;
+            case BOOL:
+            case BOOL_FALSE:
+                return asBool();
+        }
+        PANIC()
     }
 };
 
@@ -1533,26 +1745,6 @@ struct ObjectRef {
     LoxValue read(const string& name) {
         if (fields->contains(name)) return fields->at(name);
         return getMethod(name);
-    }
-};
-
-enum class HookedVariableType {
-    LOCAL,
-    UPVAL,
-    GLOBAL,
-    ALLOC_UPVAL
-};
-
-struct SpecializedVariable: Expression {
-    HookedVariableType type;
-    size_t id;
-    size_t frameId;
-
-    SpecializedVariable(HookedVariableType type, size_t id, size_t frameId): type(type), id(id), frameId(frameId) {
-    }
-
-    void visit(ASTVisitor& it) override {
-        it.invoke(*this);
     }
 };
 
@@ -1595,7 +1787,7 @@ size_t toLocalId(const vector<bool>& locals, size_t id) {
 // - determine if local is captured
 struct Linerizer: ASTVisitor {
     struct HookData {
-        unique_ptr<SpecializedVariable>* toPatch;
+        SpecTarget* toPatch;
         Function* source;
         size_t relFrameId;
         size_t relLocalId;
@@ -1716,24 +1908,24 @@ struct Linerizer: ASTVisitor {
                 auto self = f.source;
                 auto isEscaped = f.isEscaped();
                 if (isEscaped && f.isDecl) { // declaration of escaping upVal (redeclare it/alocate new one)
-                    *f.toPatch = make_unique<SpecializedVariable>(HookedVariableType::ALLOC_UPVAL, f.source->getUpValId(f.relLocalId), 0);
+                    *f.toPatch = SpecializedVariable(HookedVariableType::ALLOC_UPVAL, f.source->getUpValId(f.relLocalId), 0);
                 } else if (isEscaped) { // access to localy defined upval
-                    *f.toPatch = make_unique<SpecializedVariable>(HookedVariableType::UPVAL, self->getUpValId(f.relLocalId), 0);
+                    *f.toPatch = SpecializedVariable(HookedVariableType::UPVAL, self->getUpValId(f.relLocalId), 0);
                 } else { // access to ordinary local
-                    *f.toPatch = make_unique<SpecializedVariable>(HookedVariableType::LOCAL, self->getLocalId(f.relLocalId), 0);
+                    *f.toPatch = SpecializedVariable(HookedVariableType::LOCAL, self->getLocalId(f.relLocalId), 0);
                 }
             } else if (f.relFrameId == 1) { // capturing parents local
                 auto self = f.sourceUpFunction;
                 auto localId = self->putCapture(f.relLocalId);
 
                 assert(not f.isDecl);
-                *f.toPatch = make_unique<SpecializedVariable>(HookedVariableType::UPVAL, self->getUpValId(localId), 0); // offset 0, we copied upval to our frame
+                *f.toPatch = SpecializedVariable(HookedVariableType::UPVAL, self->getUpValId(localId), 0); // offset 0, we copied upval to our frame
             } else { // capturing nested local
                 auto closestChild = f.sourceUpFunction;
                 auto someParentsId = closestChild->putCapture(f.relLocalId);
 
                 assert(not f.isDecl);
-                *f.toPatch = make_unique<SpecializedVariable>(HookedVariableType::UPVAL, closestChild->getUpValId(someParentsId), f.relFrameId-1); // relFrameId-1, we access version stored in nodes child
+                *f.toPatch = SpecializedVariable(HookedVariableType::UPVAL, closestChild->getUpValId(someParentsId), f.relFrameId-1); // relFrameId-1, we access version stored in nodes child
             }
         }
     }
@@ -1800,7 +1992,7 @@ struct Linerizer: ASTVisitor {
         for (auto& method : it.data.methods) {
             stack.emplace_back();
             stack.back().lexicals.emplace_back();
-            stack.back().function = method.get();
+            stack.back().function = method/*.get()*/;
 
             for (auto a : method->data.argz) {
                 stack.back().putLocal(a);
@@ -1831,7 +2023,7 @@ struct Linerizer: ASTVisitor {
 
     map<VariableDeclaration*, ASTStm> declarationsToPatch;
 
-    void hookIdent(const string& name, unique_ptr<SpecializedVariable>* hookedTarget, bool isDecl) {
+    void hookIdent(const string& name, SpecTarget* hookedTarget, bool isDecl) {
         if (VERBOSE) println("VISITING identifier {}", name);
         if (isInRealGlobal()) {
             auto g = getGlobal(name);
@@ -1839,7 +2031,7 @@ struct Linerizer: ASTVisitor {
                 g = globals.putRootLocal(name);
             }
 
-            *hookedTarget = make_unique<SpecializedVariable>(HookedVariableType::GLOBAL, *g, 0);
+            *hookedTarget = SpecializedVariable(HookedVariableType::GLOBAL, *g, 0);
 
             return;
         }
@@ -1857,12 +2049,12 @@ struct Linerizer: ASTVisitor {
         auto g = globals.getLocal(name);
         if (g.has_value()) {
             // generate global assign wrapper
-            *hookedTarget = make_unique<SpecializedVariable>(HookedVariableType::GLOBAL, *g, 0);
+            *hookedTarget = SpecializedVariable(HookedVariableType::GLOBAL, *g, 0);
             return;
         }
 
         // global var hasent been declared yet i guess
-        *hookedTarget = make_unique<SpecializedVariable>(HookedVariableType::GLOBAL, globals.putRootLocal(name), 0);
+        *hookedTarget = SpecializedVariable(HookedVariableType::GLOBAL, globals.putRootLocal(name), 0);
         // PANIC("variable {} never defined", it.data.value);
     }
 
@@ -1878,7 +2070,7 @@ struct Linerizer: ASTVisitor {
         tgt->visit(*this);
     }
 
-    void putPatch(unique_ptr<SpecializedVariable>* toPatch1, Function* source, size_t relFrameId, size_t relLocalId, bool isDecl, Function* up) {
+    void putPatch(SpecTarget* toPatch1, Function* source, size_t relFrameId, size_t relLocalId, bool isDecl, Function* up) {
         hookList.emplace_back(toPatch1, source, relFrameId, relLocalId, isDecl, up);
     }
 
@@ -1949,7 +2141,7 @@ struct Linerizer: ASTVisitor {
 
     void invoke(Assign& it) override {
         hook(it.data.value);
-        auto dst = it.data.dst.get();
+        auto dst = it.data.dst/*.get()*/;
 
         if (dynamic_cast<Identifier*>(dst) != nullptr) {
             auto& ident = dynamic_cast<Identifier*>(dst)->data;
@@ -2013,21 +2205,21 @@ struct ASTExecutor: ASTVisitor {
     }
 
     void invoke(This &it) override {
-        push(getSpecVar(*it.hookedTarget));
+        push(getSpecVar(it.hookedTarget));
     }
 
     void invoke(Super &it) override {
-        push(getSpecVar(*it.hookedTarget));
+        push(getSpecVar(it.hookedTarget));
     }
 
     void invoke(Function& it) override {
         assert(it.hookedTarget.get() != nullptr);
-        auto specVar = it.hookedTarget.get();
+        auto specVar = it.hookedTarget;
         auto* fRef = allocateFunctionRef(it);
         fRef->func = &it;
         fRef->parent = currentFrame;
 
-        setSpecVar(*specVar, LoxValue::Function(fRef));
+        setSpecVar(specVar, LoxValue::Function(fRef));
 
         for (auto i = 0UL; i < it.captures.size(); i++) {
             fRef->captures[it.upValCount()+i] = getUpVal(it.captures[i]);
@@ -2037,14 +2229,14 @@ struct ASTExecutor: ASTVisitor {
     void invoke(Class& it) override {
         ClassRef* super = nullptr;
         if (it.data.superClass.has_value()) {
-            auto v = getSpecVar(*it.hookedTarget);
+            auto v = getSpecVar(it.hookedTarget);
             assert(v.isClass());
             super = v.asClass();
         }
         auto clazz = new ClassRef{&it, super, currentFrame};
         auto loxClass = LoxValue::Class(clazz);
 
-        setSpecVar(*it.hookedDst, loxClass);
+        setSpecVar(it.hookedDst, loxClass);
     }
 
     void setSpecVar(SpecializedVariable var, LoxValue value) {
@@ -2124,7 +2316,7 @@ struct ASTExecutor: ASTVisitor {
         auto me = new ObjectRef{clazz, proto, data};
         for (auto& c : clazz->clazz->data.methods) {
             auto f = allocateFunctionRef(*c);
-            f->func = c.get();
+            f->func = c/*.get()*/;
             f->parent = clazz->parent;
             for (auto i = 0UL; i < c->captures.size(); i++) {
                 f->captures[c->upValCount()+i] = getUpVal(c->captures[i]);
@@ -2174,7 +2366,7 @@ struct ASTExecutor: ASTVisitor {
         for (auto i = 0u; i < argz.size(); i++) {
             argz[i]->visit(*this);
             auto poop = pop();
-            if(VERBOSE)println("CALLING WITH: {}", poop.toString());
+            if(VERBOSE) println("CALLING WITH: {}", poop.toString());
             if (idk.func->locals[i]) {
                 newFrame->captures[upValId] = new LoxValue(poop);
                 upValId += 1;
@@ -2191,20 +2383,19 @@ struct ASTExecutor: ASTVisitor {
             idk.func->native(*this);
             return;
         }
+
         auto ip = 0UL;
         while (!shouldReturn && ip < idk.func->data.body.size()) {
             idk.func->data.body[ip]->visit(*this);
             ip += 1;
         }
+
         if (shouldReturn) {
             shouldReturn = false;
         } else {
             push(LoxValue::Nil());
         }
-        /*       if (f.func->data.name ==  "init")  {
-            pop();
-            push(currentFrame->read(currentFrame->func->upValCount()));
-        }*/
+
         currentFrame = oldFrame;
         stackBase = oldStackBase;
     }
@@ -2238,7 +2429,7 @@ struct ASTExecutor: ASTVisitor {
     void invoke(Identifier& it) override {
         // TODO();
         assert(it.data.hookedTarget != nullptr);
-        push(getSpecVar(*it.data.hookedTarget));
+        push(getSpecVar(it.data.hookedTarget));
         // push(getFrame()->getVarVal(it.data.value));
     }
 
@@ -2257,7 +2448,7 @@ struct ASTExecutor: ASTVisitor {
             value = pop();
         }
         assert(it.data.hookedTarget.get() != nullptr);
-        setSpecVar(*it.data.hookedTarget.get(), value);
+        setSpecVar(it.data.hookedTarget, value);
         // getFrame()->putVar(it.data.dst, value);
     }
 
@@ -2348,10 +2539,9 @@ struct ASTExecutor: ASTVisitor {
                 break;
             case BinaryType::EQ:
             case BinaryType::NEQ: {
-                if (rhs.matchesType(lhs)) {
+                if (not rhs.matchesType(lhs)) {
                     res = LoxValue::False();
                 } else if (rhs.isNumber()) {
-                    assert(lhs.isNumber());
                     res = LoxValue::Bool(rhs.asNumber() == lhs.asNumber());
                 } else if (rhs.isFunction()) {
                     res = LoxValue::Bool(rhs.asFunction() == lhs.asFunction());
@@ -2405,11 +2595,11 @@ struct ASTExecutor: ASTVisitor {
     void invoke(Assign& it) override {
         it.data.value->visit(*this);
 
-        auto* dst = it.data.dst.get();
+        auto* dst = it.data.dst/*.get()*/;
 
         if (dynamic_cast<Identifier*>(dst) != nullptr) {
             auto v = pop();
-            setSpecVar(*dynamic_cast<Identifier*>(dst)->data.hookedTarget, v);
+            setSpecVar(dynamic_cast<Identifier*>(dst)->data.hookedTarget, v);
             push(v); // FIXME this is retarded
         } else if (dynamic_cast<FieldAccess*>(dst) != nullptr) {
             dynamic_cast<FieldAccess*>(dst)->data.subject->visit(*this);
@@ -2441,10 +2631,6 @@ struct ASTExecutor: ASTVisitor {
 
     void invoke(BoolLiteral1& it) override {
         push(LoxValue::Bool(it.data.value));
-    }
-
-    void invoke(SpecializedVariable& it) override {
-        TODO();
     }
 
     void invoke(Negate& it) override {
@@ -2495,7 +2681,7 @@ int main(int argc, const char** argv) {
 
     Linerizer linerizer;
     linerizer.stack.emplace_back();
-    linerizer.stack.back().function = globalFunc.get();
+    linerizer.stack.back().function = globalFunc/*.get()*/;
     linerizer.stack.back().lexicals.emplace_back();
     linerizer.globals.isGlobal = true;
     auto clk = "clock"s;
@@ -2522,7 +2708,7 @@ int main(int argc, const char** argv) {
     clock->native = [&](ASTExecutor& ctx) {
         ctx.push(LoxValue::Number(duration_cast<std::chrono::microseconds>((std::chrono::high_resolution_clock::now()-start1)).count()/1'000'000.0));
     };
-    executor.globals[clockId] = LoxValue::Function(new FunctionRef{nullptr, clock.get()});
+    executor.globals[clockId] = LoxValue::Function(new FunctionRef{nullptr, clock/*.get()*/});
     // executor.frames.push_back(new StackFrame());
 
     size_t ip = 0;
