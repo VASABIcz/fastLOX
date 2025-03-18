@@ -1449,7 +1449,7 @@ struct LoxValue {
     static constexpr u_int64_t DATA_MASK = 0x0000ffffffffffff; // 48 bits
     static constexpr u_int64_t INV_DATA_MASK = ~0x0000ffffffffffff;
 
-#if 1
+#if 0
     enum ValueType2: uint64_t {
         FLOAT =        0x0000000000000000, // 0
         FUNCTION_REF = 0x0001000000000000, // 1
