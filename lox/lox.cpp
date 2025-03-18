@@ -379,6 +379,7 @@ struct Function: Statement {
     // size_t upValCount = 0;
     SpecTarget hookedTarget;
     std::function<void(ASTExecutor&)> native;
+    bool isMethod = false;
 
     size_t getParamUpValOffset() {
         size_t acu = 0;
@@ -963,17 +964,20 @@ struct VariableDeclarationParsingUnit: MilaParsingUnit {
 
 optional<pair<BinaryType, int>> toType(TokenType1 tok) {
     switch (tok) {
-        case TokenType1::Div: return optional{pair{BinaryType::DIV, 0}};
-        case TokenType1::Mul: return optional{pair{BinaryType::MUL, 0}};
-        case TokenType1::Modulo: return optional{pair{BinaryType::MOD, 0}};
-        case TokenType1::OPB: return optional{pair{BinaryType::LESS, 0}};
-        case TokenType1::CPB: return optional{pair{BinaryType::GT, 0}};
-        case TokenType1::Plus: return optional{pair{BinaryType::ADD, 0}};
-        case TokenType1::Minus: return optional{pair{BinaryType::SUB, 0}};
-        case TokenType1::Equals: return optional{pair{BinaryType::EQ, 0}};
-        case TokenType1::NotEquals: return optional{pair{BinaryType::NEQ, 0}};
-        case TokenType1::LEQ: return optional{pair{BinaryType::LEQ, 0}};
-        case TokenType1::GEQ: return optional{pair{BinaryType::GEQ, 0}};
+        case TokenType1::Div: return optional{pair{BinaryType::DIV, 3}};
+        case TokenType1::Mul: return optional{pair{BinaryType::MUL, 3}};
+        case TokenType1::Modulo: return optional{pair{BinaryType::MOD, 3}};
+
+        case TokenType1::Plus: return optional{pair{BinaryType::ADD, 2}};
+        case TokenType1::Minus: return optional{pair{BinaryType::SUB, 3}};
+
+        case TokenType1::OPB: return optional{pair{BinaryType::LESS, 1}};
+        case TokenType1::CPB: return optional{pair{BinaryType::GT, 1}};
+        case TokenType1::Equals: return optional{pair{BinaryType::EQ, 1}};
+        case TokenType1::NotEquals: return optional{pair{BinaryType::NEQ, 1}};
+        case TokenType1::LEQ: return optional{pair{BinaryType::LEQ, 1}};
+        case TokenType1::GEQ: return optional{pair{BinaryType::GEQ, 1}};
+
         case TokenType1::And: return optional{pair{BinaryType::AND, 0}};
         case TokenType1::Or: return optional{pair{BinaryType::OR, 0}};
         default:
@@ -1180,7 +1184,9 @@ struct ClassParsingUnit: MilaParsingUnit {
 
             auto body = TRY(parser.parseBody());
 
-            methods.push_back(makeStuff2<Function>(std::move(methodName), std::move(params), std::move(body)));
+            auto func = makeStuff2<Function>(std::move(methodName), std::move(params), std::move(body));
+            func->isMethod = true;
+            methods.push_back(std::move(func));
         }
 
         return makeStuff2<Class>(std::move(className), std::move(superName), std::move(methods));
@@ -1728,24 +1734,40 @@ void FunctionRef::write(size_t id, LoxValue val) {
     *v = val;
 }
 
+struct ASTExecutor;
+
+ASTExecutor* RUNTIME = nullptr;
+
 struct ObjectRef {
     ClassRef* clazz;
     ObjectRef* proto;
     map<string, LoxValue>* fields;
-    vector<FunctionRef*> methods;
+    // vector<FunctionRef*> methods;
 
-    LoxValue getMethod(const string& name) {
+/*    LoxValue getMethod(const string& name) {
         for (auto m : methods) {
             if (m->func->data.name == name) return LoxValue::Function(m);
         }
         if (proto != nullptr) return proto->getMethod(name);
         PANIC();
-    }
+    }*/
 
     LoxValue read(const string& name) {
         if (fields->contains(name)) return fields->at(name);
-        return getMethod(name);
+        return getMethod2(name);
     }
+
+    LoxValue getMethod2(string_view name) {
+        auto m = clazz->clazz->getMethod(name);
+        if (m == nullptr && proto != nullptr) {
+            return proto->getMethod2(name);
+        }
+        if (m == nullptr) PANIC();
+
+        return LoxValue::Function(createMethod(m));
+    }
+
+    FunctionRef* createMethod(Function* f1);
 };
 
 size_t toUpvalId(const vector<bool>& locals, size_t id) {
@@ -2213,7 +2235,7 @@ struct ASTExecutor: ASTVisitor {
     }
 
     void invoke(Function& it) override {
-        assert(it.hookedTarget.get() != nullptr);
+        // assert(it.hookedTarget != nullptr);
         auto specVar = it.hookedTarget;
         auto* fRef = allocateFunctionRef(it);
         fRef->func = &it;
@@ -2314,9 +2336,9 @@ struct ASTExecutor: ASTVisitor {
             proto = rawInstant(clazz->super, data);
         }
         auto me = new ObjectRef{clazz, proto, data};
-        for (auto& c : clazz->clazz->data.methods) {
+/*        for (auto& c : clazz->clazz->data.methods) {
             auto f = allocateFunctionRef(*c);
-            f->func = c/*.get()*/;
+            f->func = c*//*.get()*//*;
             f->parent = clazz->parent;
             for (auto i = 0UL; i < c->captures.size(); i++) {
                 f->captures[c->upValCount()+i] = getUpVal(c->captures[i]);
@@ -2325,7 +2347,7 @@ struct ASTExecutor: ASTVisitor {
             f->captures[c->getParamUpValOffset() + 1] = new LoxValue(
                     proto == nullptr ? LoxValue::Nil() : LoxValue::Object(proto));
             me->methods.push_back(f);
-        }
+        }*/
 
         return me;
     }
@@ -2338,7 +2360,7 @@ struct ASTExecutor: ASTVisitor {
         auto* res = rawInstant(clazz, new map<string, LoxValue>{});
 
         if (constructor != nullptr) {
-            auto f = res->getMethod("init");
+            auto f = res->getMethod2("init");
             call(*f.asFunction(), argz);
             pop();
         }
@@ -2390,10 +2412,21 @@ struct ASTExecutor: ASTVisitor {
             ip += 1;
         }
 
-        if (shouldReturn) {
-            shouldReturn = false;
+        // constructor invocation must return `this`
+        if (f.func->isMethod && f.func->data.name == "init") {
+            if (shouldReturn) {
+                shouldReturn = false;
+                pop();
+                push(*f.captures[f.func->getParamUpValOffset()]); // this
+            } else {
+                push(*f.captures[f.func->getParamUpValOffset()]); // this
+            }
         } else {
-            push(LoxValue::Nil());
+            if (shouldReturn) {
+                shouldReturn = false;
+            } else {
+                push(LoxValue::Nil());
+            }
         }
 
         currentFrame = oldFrame;
@@ -2428,7 +2461,7 @@ struct ASTExecutor: ASTVisitor {
 
     void invoke(Identifier& it) override {
         // TODO();
-        assert(it.data.hookedTarget != nullptr);
+        // assert(it.data.hookedTarget != nullptr);
         push(getSpecVar(it.data.hookedTarget));
         // push(getFrame()->getVarVal(it.data.value));
     }
@@ -2447,7 +2480,7 @@ struct ASTExecutor: ASTVisitor {
             (*it.data.value)->visit(*this);
             value = pop();
         }
-        assert(it.data.hookedTarget.get() != nullptr);
+        // assert(it.data.hookedTarget.get() != nullptr);
         setSpecVar(it.data.hookedTarget, value);
         // getFrame()->putVar(it.data.dst, value);
     }
@@ -2640,6 +2673,20 @@ struct ASTExecutor: ASTVisitor {
     }
 };
 
+
+FunctionRef* ObjectRef::createMethod(Function* f1) {
+    auto f = RUNTIME->allocateFunctionRef(*f1);
+    f->func = f1;
+    f->parent = clazz->parent;
+    for (auto i = 0UL; i < f1->captures.size(); i++) {
+        f->captures[f1->upValCount()+i] = clazz->parent->captures[f1->captures[i]];
+    }
+    f->captures[f1->getParamUpValOffset()] = new LoxValue(LoxValue::Object(this));
+    f->captures[f1->getParamUpValOffset() + 1] = new LoxValue(proto == nullptr ? LoxValue::Nil() : LoxValue::Object(proto));
+
+    return f;
+}
+
 int main(int argc, const char** argv) {
     string filePath{argv[1]};
     auto fajl = readFile(filePath); // prog
@@ -2700,6 +2747,8 @@ int main(int argc, const char** argv) {
     // return 3;
 
     ASTExecutor executor;
+
+    RUNTIME = &executor;
 
     executor.currentFrame = executor.allocateFunctionRef(*globalFunc);
     executor.stackBase -= globalFunc->locals.size()-globalFunc->totalUpValCount();
