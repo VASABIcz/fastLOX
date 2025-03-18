@@ -2575,7 +2575,11 @@ struct ASTExecutor: ASTVisitor {
                 if (not rhs.matchesType(lhs)) {
                     res = LoxValue::False();
                 } else if (rhs.isNumber()) {
-                    res = LoxValue::Bool(rhs.asNumber() == lhs.asNumber());
+                    if (std::isnan(rhs.asNumber()) && std::isnan(lhs.asNumber())) {
+                        res = LoxValue::False();
+                    } else {
+                        res = LoxValue::Bool(rhs.asNumber() == lhs.asNumber());
+                    }
                 } else if (rhs.isFunction()) {
                     res = LoxValue::Bool(rhs.asFunction() == lhs.asFunction());
                 } else if (rhs.isString()) {
