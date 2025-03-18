@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <cstring>
 #include <cstdlib>
+#include <unordered_map>
 
 #define VERBOSE 0
 
@@ -1741,7 +1742,7 @@ ASTExecutor* RUNTIME = nullptr;
 struct ObjectRef {
     ClassRef* clazz;
     ObjectRef* proto;
-    map<string, LoxValue>* fields;
+    std::unordered_map<string, LoxValue>* fields;
     // vector<FunctionRef*> methods;
 
 /*    LoxValue getMethod(const string& name) {
@@ -2330,7 +2331,7 @@ struct ASTExecutor: ASTVisitor {
         }
     }
 
-    ObjectRef* rawInstant(ClassRef* clazz, map<string, LoxValue>* data) {
+    ObjectRef* rawInstant(ClassRef* clazz, unordered_map<string, LoxValue>* data) {
         ObjectRef* proto = nullptr;
         if (clazz->super != nullptr) {
             proto = rawInstant(clazz->super, data);
@@ -2357,7 +2358,7 @@ struct ASTExecutor: ASTVisitor {
         if (constructor == nullptr && not argz.empty()) PANIC();
         if (constructor != nullptr && constructor->data.argz.size() != argz.size()) PANIC();
 
-        auto* res = rawInstant(clazz, new map<string, LoxValue>{});
+        auto* res = rawInstant(clazz, new unordered_map<string, LoxValue>{});
 
         if (constructor != nullptr) {
             auto f = res->getMethod2("init");
