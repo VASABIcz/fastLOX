@@ -1449,7 +1449,7 @@ struct LoxValue {
     static constexpr u_int64_t DATA_MASK = 0x0000ffffffffffff; // 48 bits
     static constexpr u_int64_t INV_DATA_MASK = ~0x0000ffffffffffff;
 
-#if 0
+#if 1
     enum ValueType2: uint64_t {
         FLOAT =        0x0000000000000000, // 0
         FUNCTION_REF = 0x0001000000000000, // 1
@@ -2575,11 +2575,7 @@ struct ASTExecutor: ASTVisitor {
                 if (not rhs.matchesType(lhs)) {
                     res = LoxValue::False();
                 } else if (rhs.isNumber()) {
-                    if (std::isnan(rhs.asNumber()) && std::isnan(lhs.asNumber())) {
-                        res = LoxValue::False();
-                    } else {
-                        res = LoxValue::Bool(rhs.asNumber() == lhs.asNumber());
-                    }
+                    res = LoxValue::Bool(rhs.asNumber() == lhs.asNumber());
                 } else if (rhs.isFunction()) {
                     res = LoxValue::Bool(rhs.asFunction() == lhs.asFunction());
                 } else if (rhs.isString()) {
