@@ -11,6 +11,11 @@
 // #include "../codegen/IRGenCtx.h"
 // #include "../codegen/x86/X86Assembler.h"
 #include "../utils/pdo_utils.h"
+#include "../codegen/SSARegister.h"
+#include "../codegen/IRGen.h"
+#include "../codegen/CodeGen.h"
+#include "../codegen/IRGenCtx.h"
+#include "../codegen/x86/X86Assembler.h"
 #include <filesystem>
 #include <cstring>
 #include <cstdlib>
@@ -252,7 +257,6 @@ print a; // expect: assigned
 )";
 
 struct ASTVisitor;
-struct MilaGenRet {};
 
 struct ASTNode {
     virtual ~ASTNode() = default;
@@ -306,6 +310,14 @@ struct SpecializedVariable {
     HookedVariableType type;
     size_t id;
     size_t frameId;
+
+    static SpecializedVariable Local(size_t id) {
+        return SpecializedVariable{HookedVariableType::LOCAL, id, 0};
+    }
+
+    static SpecializedVariable AllocateCaptured(size_t id) {
+        return SpecializedVariable{HookedVariableType::ALLOC_UPVAL, id, 0};
+    }
 };
 
 using SpecTarget = SpecializedVariable;
@@ -469,7 +481,6 @@ enum class BinaryType {
     SUB,
     DIV,
     MOD,
-    REM,
     MUL,
     GT,
     GEQ,
@@ -480,6 +491,26 @@ enum class BinaryType {
     AND,
     OR
 };
+
+string binarToString(BinaryType t) {
+    switch (t) {
+        case BinaryType::ADD: return "+";
+        case BinaryType::SUB: return "-";
+        case BinaryType::DIV: return "/";
+        case BinaryType::MOD: return "%";
+        case BinaryType::REM: return "%";
+        case BinaryType::MUL: return "*";
+        case BinaryType::GT: return ">";
+        case BinaryType::GEQ: return ">=";
+        case BinaryType::LEQ: return "<=";
+        case BinaryType::LESS: return "<";
+        case BinaryType::EQ: return "==";
+        case BinaryType::NEQ: return "!=";
+        case BinaryType::AND: return "&&";
+        case BinaryType::OR: return "||";
+    }
+    PANIC();
+}
 
 
 struct Binary: Expression {
@@ -2178,7 +2209,902 @@ struct Linerizer: ASTVisitor {
         }
     }
 
-    void invoke(BoolLiteral1& it) override {}
+    void invoke(BoolLiteral1& it) override {
+
+    }
+
+
+    void invoke(ASTNode& it) override {
+        TODO();
+    }
+};
+
+struct MilaAssembler: virtual Assembler {
+    vector<string> stuff;
+
+    size_t getId(string lol) {
+        for (auto i = 0u; i < stuff.size(); i++) {
+            if (stuff[i] == lol) return i;
+        }
+
+        stuff.push_back(lol);
+        return stuff.size()-1;
+    }
+
+    virtual void call(size_t label, span<size_t> args, optional<size_t> ret) = 0;
+
+    virtual void doBin(BinaryType type, size_t dst, size_t lhs, size_t rhs) {
+
+    }
+
+    virtual void negate(size_t dst, size_t src) {
+
+    }
+
+    virtual void readField(size_t tgt, size_t self, string_view name) {
+
+    }
+
+    virtual void writeField(size_t self, string_view name, size_t vakue) {
+
+    }
+
+    virtual void readClosed(size_t dst, size_t ref, size_t frameId, size_t localId) {
+
+    }
+
+    virtual void writeClosed(size_t ref, size_t frameId, size_t localId, size_t value) {
+
+    }
+
+    virtual void allocateClosed(size_t ref, size_t frameId, size_t localId, size_t value) {
+
+    }
+
+    virtual void allocateClosure(size_t tgt, Function* f) {
+
+    }
+
+    virtual void dynamicCall(size_t tgt, size_t subj, span<size_t> argz) {
+
+    }
+
+    virtual void print1(size_t arg) {
+
+    }
+
+    virtual void toBool(size_t tgt, size_t src) {
+
+    }
+
+    virtual void readGlobal(size_t tgt, size_t id) {
+
+    }
+
+    virtual void writeGlobal(size_t id, size_t value) {
+
+    }
+};
+
+struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
+    using X86Assembler::X86Assembler;
+
+    void call(size_t label, span<size_t> args, optional<size_t> ret) override {
+        this->callC(Arg::Rel32Adr(label, 0), args, ret);
+    }
+};
+
+struct MilaReg;
+struct MilaIrGen;
+struct MilaCodeGen;
+
+struct MilaDataType {};
+
+struct MilaGenCtx {
+    using REG = MilaReg;
+    using IRGEN = MilaIrGen;
+    using GEN = MilaCodeGen;
+    using ASSEMBLER = MilaAssembler;
+};
+
+struct MilaCodeGen: CodeGen<MilaGenCtx> {
+    using CodeGen::CodeGen;
+};
+
+struct LoxBool: public NamedIrInstruction<"lox_bool", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxBool)
+    bool v;
+
+    LoxBool(SSARegisterHandle target, bool v) : NamedIrInstruction(target), v(v) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
+
+    void print(MilaIrGen&) override {
+        basePrint("{}", v);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.movInt(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::Bool(v)));
+    }
+};
+
+struct LoxNil: public NamedIrInstruction<"lox_nil", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxNil)
+
+    LoxNil(SSARegisterHandle target) : NamedIrInstruction(target) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
+
+    void print(MilaIrGen&) override {
+        basePrint("a");
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.movInt(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::Nil()));
+    }
+};
+
+struct LoxNumber: public NamedIrInstruction<"lox_number", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxNumber)
+    double v;
+
+    LoxNumber(SSARegisterHandle target, double v) : NamedIrInstruction(target), v(v) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
+
+    void print(MilaIrGen&) override {
+        basePrint("{}", v);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.movInt(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::Number(v)));
+    }
+};
+
+struct LoxString: public NamedIrInstruction<"lox_string", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxString)
+    string v;
+
+    LoxString(SSARegisterHandle target, string v) : NamedIrInstruction(target) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
+
+    void print(MilaIrGen&) override {
+        basePrint("{}", v);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        // TODO();
+        gen.assembler.movInt(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::String(v)));
+    }
+};
+
+struct LoxNeg: public NamedIrInstruction<"lox_neg", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxNeg)
+    SSARegisterHandle v;
+
+    LoxNeg(SSARegisterHandle target, SSARegisterHandle v) : NamedIrInstruction(target), v(v) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
+
+    void print(MilaIrGen&) override {
+        basePrint("{}", v);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.negate(gen.getReg(target), gen.getReg(v));
+    }
+};
+
+
+struct LoxBin: public NamedIrInstruction<"bin", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxBin)
+    BinaryType type;
+    SSARegisterHandle lhs;
+    SSARegisterHandle rhs;
+
+    LoxBin(SSARegisterHandle target, BinaryType type, SSARegisterHandle lhs, SSARegisterHandle rhs) : NamedIrInstruction(target), type(type), lhs(lhs), rhs(rhs) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(rhs);
+        fn(lhs);
+    }
+
+    void print(MilaIrGen&) override {
+        basePrint("{} {} {}", lhs, binarToString(type), rhs);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.doBin(type, gen.getReg(target), gen.getReg(lhs), gen.getReg(rhs));
+    }
+};
+
+struct LoxReadField: public NamedIrInstruction<"read_field", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxReadField)
+    SSARegisterHandle subj;
+    string fieldName;
+
+    LoxReadField(SSARegisterHandle target, SSARegisterHandle subj, string fieldName) : NamedIrInstruction(target), subj(subj), fieldName(fieldName) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(subj);
+    }
+
+    void print(MilaIrGen&) override {
+        basePrint("{}#{}", subj, fieldName);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.readField(gen.getReg(target), gen.getReg(subj), fieldName);
+    }
+};
+
+struct LoxWriteField: public NamedIrInstruction<"write_field", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxWriteField)
+    SSARegisterHandle subj;
+    string fieldName;
+    SSARegisterHandle v;
+
+    LoxWriteField(SSARegisterHandle subj, string fieldName, SSARegisterHandle v) : NamedIrInstruction(SSARegisterHandle::invalid()), subj(subj), fieldName(fieldName), v(v) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(subj);
+        fn(v);
+    }
+
+    void print(MilaIrGen&) override {
+        basePrint("{}#{} <- {}", subj, fieldName, v);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.writeField(gen.getReg(subj),fieldName, gen.getReg(v));
+    }
+};
+
+
+struct DynamicCall: public NamedIrInstruction<"dynamic_call", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(DynamicCall)
+    SSARegisterHandle self;
+    vector<SSARegisterHandle> argz;
+
+    DynamicCall(SSARegisterHandle target, SSARegisterHandle self, vector<SSARegisterHandle> argz) : NamedIrInstruction(target), self(self), argz(argz) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(self);
+        for (auto arg : argz) fn(arg);
+    }
+
+    void print(MilaIrGen&) override {
+        basePrint("{} {}", self, argz);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        auto args = gen.getRegs(argz);
+        gen.assembler.dynamicCall(gen.getReg(target), gen.getReg(self), args);
+    }
+};
+
+struct BuiltinPrint: public NamedIrInstruction<"print", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(BuiltinPrint)
+    SSARegisterHandle arg;
+
+    BuiltinPrint(SSARegisterHandle arg) : NamedIrInstruction(target), arg(arg) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(arg);
+    }
+
+    void print(MilaIrGen&) override {
+        basePrint("print {}", arg);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.print1(gen.getReg(arg));
+    }
+};
+
+struct LoxBooling: public NamedIrInstruction<"to_bool", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxBooling)
+    SSARegisterHandle v;
+
+    LoxBooling(SSARegisterHandle target, SSARegisterHandle v) : NamedIrInstruction(target), v(v) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(v);
+    }
+
+    void print(MilaIrGen&) override {
+        basePrint("{}", v);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.toBool(gen.getReg(target), gen.getReg(v));
+    }
+};
+
+struct LoxReadGlobal: public NamedIrInstruction<"read_global", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxReadGlobal)
+    size_t id;
+
+    LoxReadGlobal(SSARegisterHandle target, size_t id) : NamedIrInstruction(target), id(id) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
+
+    void print(MilaIrGen&) override {
+        basePrint("{}", id);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.readGlobal(gen.getReg(target), id);
+    }
+};
+
+struct LoxWriteGlobal: public NamedIrInstruction<"write_global", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxWriteGlobal)
+    size_t id;
+    SSARegisterHandle v;
+
+    LoxWriteGlobal(size_t id, SSARegisterHandle v) : NamedIrInstruction(SSARegisterHandle::invalid()), id(id), v(v) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(v);
+    }
+
+    void print(MilaIrGen&) override {
+        basePrint("{} <- {}", id, v);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.writeGlobal(id, gen.getReg(v));
+    }
+};
+
+struct LoxReadCaptured: public NamedIrInstruction<"read_captured", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxReadCaptured)
+    SSARegisterHandle closure;
+    size_t fId;
+    size_t locId;
+
+    LoxReadCaptured(SSARegisterHandle target, SSARegisterHandle closure, size_t fId, size_t locId) : NamedIrInstruction(target), closure(closure), fId(fId), locId(locId) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(closure);
+    }
+
+    void print(MilaIrGen&) override {
+        basePrint("{}#{}", fId, locId);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.readClosed(gen.getReg(target), gen.getReg(closure), fId, locId);
+    }
+};
+
+struct LoxWriteCaptured: public NamedIrInstruction<"write_captured", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxWriteCaptured)
+    SSARegisterHandle closure;
+    size_t fId;
+    size_t locId;
+    SSARegisterHandle v;
+
+    LoxWriteCaptured(SSARegisterHandle closure, size_t fId, size_t locId, SSARegisterHandle v) : NamedIrInstruction(SSARegisterHandle::invalid()), closure(closure), fId(fId), locId(locId), v(v) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(closure);
+        fn(v);
+    }
+
+    void print(MilaIrGen&) override {
+        basePrint("{}#{} <- {}", fId, locId, v);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.writeClosed(gen.getReg(closure), fId, locId, gen.getReg(v));
+    }
+};
+
+struct LoxAllocCaptured: public NamedIrInstruction<"alloc_captured", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxAllocCaptured)
+    SSARegisterHandle closure;
+    size_t fId;
+    size_t locId;
+    SSARegisterHandle v;
+
+    LoxAllocCaptured(SSARegisterHandle closure, size_t fId, size_t locId, SSARegisterHandle v) : NamedIrInstruction(SSARegisterHandle::invalid()), closure(closure), fId(fId), locId(locId), v(v) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(v);
+        fn(closure);
+    }
+
+    void print(MilaIrGen&) override {
+        basePrint("{}#{} <- {}", fId, locId, v);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.allocateClosed(gen.getReg(closure), fId, locId, gen.getReg(v));
+    }
+};
+
+struct LoxReadLocal: public NamedIrInstruction<"read_local", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxReadLocal)
+    size_t localId;
+    string name;
+    SSARegisterHandle frame;
+
+    LoxReadLocal(SSARegisterHandle target, size_t localId, string name, SSARegisterHandle frame) : NamedIrInstruction(target), localId(localId), name(name), frame(frame) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(frame);
+    }
+
+    void print(MilaIrGen&) override {
+        basePrint("{} - {}@{}", frame, name, localId);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.movReg(gen.getReg(target), gen.getReg(frame), 0, localId*sizeof(LoxValue), sizeof(LoxValue));
+    }
+};
+
+struct LoxWriteLocal: public NamedIrInstruction<"write_local", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxWriteLocal)
+    size_t localId;
+    string name;
+    SSARegisterHandle v;
+    SSARegisterHandle frame;
+
+    LoxWriteLocal(size_t localId, string name, SSARegisterHandle v, SSARegisterHandle frame) : NamedIrInstruction(SSARegisterHandle::invalid()), localId(localId), name(name), v(v), frame(frame) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(v);
+        fn(frame);
+    }
+
+    void print(MilaIrGen&) override {
+        basePrint("{} - {}@{} <- {}", frame, name, localId, v);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.movReg(gen.getReg(frame), gen.getReg(v), localId*sizeof(LoxValue), 0, sizeof(LoxValue));
+    }
+};
+
+struct LoxAllocateClosure: public NamedIrInstruction<"allocate_closure", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxAllocateClosure)
+    Function* func;
+
+    LoxAllocateClosure(SSARegisterHandle target, Function* func) : NamedIrInstruction(target), func(func) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
+
+    void print(MilaIrGen&) override {
+        basePrint("{}", func->data.name);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.allocateClosure(gen.getReg(target), func);
+    }
+};
+
+struct RuntimeClossure {
+    RuntimeClossure* c;
+    Function* f;
+    void* data;
+    LoxValue* ups[];
+};
+
+struct LoxCopyCapture: public NamedIrInstruction<"copy_capture", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxCopyCapture)
+    SSARegisterHandle tgt;
+    size_t tgtId;
+    SSARegisterHandle src;
+    size_t srcId;
+
+    LoxCopyCapture(SSARegisterHandle tgt, size_t tgtId, SSARegisterHandle src, size_t srcId) : NamedIrInstruction(SSARegisterHandle::invalid()), tgt(tgt), tgtId(tgtId), src(src), srcId(srcId) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
+
+    void print(MilaIrGen&) override {
+        basePrint("{}#{} <- {}#{}", tgt, tgtId, src, srcId);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.movReg(gen.getReg(tgt), gen.getReg(src), offsetof(RuntimeClossure, ups)+(sizeof(LoxValue*)*tgtId), offsetof(RuntimeClossure, ups)+(sizeof(LoxValue*)*srcId), sizeof(LoxValue*));
+    }
+};
+
+struct MilaReg: SSARegister {
+    MilaReg(size_t blockId, string name, MilaDataType type1, Type type): SSARegister(blockId, name, type), dataType(type1) {
+
+    }
+
+    MilaDataType dataType;
+
+    size_t sizeBytes() const {
+        return 8; // dataType.getHandle().sizeBytes();
+    }
+
+    MilaReg copy() const {
+        return *this;
+    }
+};
+
+struct MilaIrGen: IRGen<MilaGenCtx> {
+    using IRGen::IRGen;
+};
+
+using MilaBB = CodeBlock<MilaGenCtx>*;
+using MilaGenRet = Result<pair<SSARegisterHandle, MilaBB>>;
+
+struct MilaIrGenCtx: IRGenCtx<MilaIrGenCtx, MilaGenCtx> {
+    string functionName;
+
+    using IRGenCtx::IRGenCtx;
+
+    SSARegisterHandle makeTmp(MilaDataType type) {
+        return pushRegister("_tmp", type, {}, SSARegister::Type::TMP);
+    }
+
+    template<template<typename> typename T, typename... Args>
+    SSARegisterHandle push(MilaDataType type, Args&&... argz) {
+        auto tmp = makeTmp(type);
+        pushInstruction<T<MilaGenCtx>>(tmp, std::forward<Args>(argz)...);
+
+        return tmp;
+    }
+
+    template<typename T, typename... Args>
+    SSARegisterHandle push(MilaDataType type, Args&&... argz) {
+        auto tmp = makeTmp(type);
+        pushInstruction<T>(tmp, std::forward<Args>(argz)...);
+
+        return tmp;
+    }
+
+    SSARegisterHandle pushRegister(string name, MilaDataType type, optional<SSARegisterHandle> prev, SSARegister::Type type1) {
+        return current().pushRegister(make_unique<MilaReg>(0, std::move(name), type, type1));
+    }
+
+    SSARegisterHandle generateNewVersion(SSARegisterHandle previousHandle) {
+        assert(previousHandle.isValid());
+
+        auto& previous = gen.getRecord(previousHandle);
+
+        return pushRegister(previous.name, previous.dataType, previousHandle, SSARegister::Type::VAR);
+    }
+};
+
+struct Compiler: ASTVisitor {
+    vector<unique_ptr<MilaIrGen>> irGens;
+    vector<Function*> funks;
+    vector<unique_ptr<ControlFlowGraph<MilaGenCtx>>> graphs;
+
+    std::vector<MilaIrGenCtx> stuff;
+    std::optional<SSARegisterHandle> curRet;
+
+    MilaIrGenCtx& getCtx() {
+        return stuff.back();
+    }
+
+    SSARegisterHandle genExp(ASTExpr expr) {
+        assert(not curRet.has_value());
+        expr->visit(*this);
+        assert(curRet.has_value());
+        auto v = *curRet;
+        curRet = {};
+
+        return v;
+    }
+
+    void genStm(ASTStm stm) {
+        assert(not curRet.has_value());
+        stm->visit(*this);
+        assert(not curRet.has_value());
+    }
+
+    SSARegisterHandle genRead(SpecTarget s, string name) {
+        switch (s.type) {
+            case HookedVariableType::LOCAL:
+                return getCtx().push<LoxReadLocal>(MilaDataType{}, s.id, name, *getCtx().lookupLocal("__frame"));
+                break;
+            case HookedVariableType::UPVAL:
+                return getCtx().push<LoxReadCaptured>(MilaDataType{}, *getCtx().lookupLocal("__self"), s.frameId, s.id);
+                break;
+            case HookedVariableType::GLOBAL:
+                return getCtx().push<LoxReadGlobal>(MilaDataType{}, s.id);
+                break;
+            case HookedVariableType::ALLOC_UPVAL:
+                PANIC();
+        }
+        PANIC();
+    }
+
+    void genWrite(SpecTarget s, SSARegisterHandle v, string name) {
+        switch (s.type) {
+            case HookedVariableType::LOCAL:
+                getCtx().pushInstruction<LoxWriteLocal>(s.id, name, v, *getCtx().lookupLocal("__frame"));
+                break;
+            case HookedVariableType::UPVAL:
+                getCtx().pushInstruction<LoxWriteCaptured>(*getCtx().lookupLocal("__self"), s.frameId, s.id, v);
+                break;
+            case HookedVariableType::GLOBAL:
+                getCtx().pushInstruction<LoxWriteGlobal>(s.id, v);
+                break;
+            case HookedVariableType::ALLOC_UPVAL:
+                getCtx().pushInstruction<LoxAllocCaptured>(*getCtx().lookupLocal("__self"), s.frameId, s.id, v);
+                break;
+            default:
+                PANIC();
+        }
+    }
+
+    void begin(span<ASTNode1> ast, Function* gf) {
+        auto& CFG = graphs.emplace_back(make_unique<ControlFlowGraph<MilaGenCtx>>());
+        auto& IRGEN = irGens.emplace_back(make_unique<MilaIrGen>(*CFG.get()));
+        funks.push_back(nullptr);
+
+        auto& bb = IRGEN->createBlock("main");
+        MilaIrGenCtx IR_GEN_CTX(*IRGEN, &bb, nullptr, {}, {});
+        IR_GEN_CTX.functionName = "__EEEEEEEEEEEE__";
+        IR_GEN_CTX.pushRegister("__self", MilaDataType{}, {}, SSARegister::Type::ARG);
+        auto frameReg = IR_GEN_CTX.pushRegister("__frame", MilaDataType{}, {}, SSARegister::Type::VAR);
+
+        pushCtx(IR_GEN_CTX);
+
+        auto localsCount = gf->locals.size()-gf->upValCount();
+        IR_GEN_CTX.pushInstruction<instructions::Alloca>(frameReg, localsCount*sizeof(LoxValue));
+
+        for (auto& node : ast) {
+            genStm(dynamic_cast<ASTStm>(node));
+        }
+
+        popCtx();
+    }
+
+    void invoke(Return& it) override {
+        if (it.data.value.has_value()) {
+            auto idk = genExp(*it.data.value);
+            // FIXME
+            getCtx().pushInstruction<instructions::Return>(SSARegisterHandle::invalid(), idk);
+        } else {
+            getCtx().pushInstruction<instructions::VoidReturn>();
+        }
+    }
+
+    void invoke(Print& it) override {
+        auto v = genExp(it.data.value);
+        getCtx().pushInstruction<BuiltinPrint>(v);
+    }
+
+    void invoke(Call& it) override {
+        vector<SSARegisterHandle> argz;
+        for (auto arg : it.args) {
+            argz.push_back(genExp(arg));
+        }
+        auto v = genExp(it.fName);
+        curRet = getCtx().push<DynamicCall>(MilaDataType{}, v, argz);
+    }
+
+    void invoke(NilLiteral& it) override {
+        curRet = getCtx().push<LoxNil>(MilaDataType{});
+    }
+
+    void invoke(IntLiteral& it) override {
+        curRet = getCtx().push<LoxNumber>(MilaDataType{}, it.data.value);
+    }
+
+    void invoke(Binary& it) override {
+        auto lhs = genExp(it.data.lhs);
+        auto rhs = genExp(it.data.rhs);
+
+        curRet = getCtx().push<LoxBin>(MilaDataType{}, it.data.type, lhs, rhs);
+    }
+
+    void invoke(Super& it) override {
+        curRet = genRead(it.hookedTarget, "_super");
+    }
+
+    void invoke(This& it) override {
+        curRet = genRead(it.hookedTarget, "_this");
+    }
+
+    void invoke(FieldAccess &it) override {
+        auto v = genExp(it.data.subject);
+        curRet = getCtx().push<LoxReadField>(MilaDataType{}, v, it.data.fieldName);
+    }
+
+    void invoke(Class& it) override {
+        TODO();
+    }
+
+    void invoke(StringLiteral1& it) override {
+        curRet = getCtx().push<LoxString>(MilaDataType{}, it.data.value);
+    }
+
+    void invoke(Negate& it) override {
+        auto v = genExp(it.data.inner);
+        curRet = getCtx().push<LoxNeg>(MilaDataType{}, v);
+    }
+
+    void invoke(Identifier& it) override {
+        curRet = genRead(it.data.hookedTarget, it.data.value);
+    }
+
+    void hook(ASTExpr& tgt) {
+        tgt->visit(*this);
+    }
+
+    void hook(ASTStm& tgt) {
+        tgt->visit(*this);
+    }
+
+    void invoke(VariableDeclaration& it) override {
+        auto rex = it.data.value.has_value() ? genExp(*it.data.value) : getCtx().push<LoxNil>(MilaDataType{});
+        genWrite(it.data.hookedTarget, rex, it.data.dst);
+    }
+
+    void invoke(Block& it) override {
+        for (auto& s : it.data.statements) {
+            genStm(s);
+        }
+    }
+
+    void pushCtx(MilaIrGenCtx ctx) {
+        stuff.push_back(ctx);
+    }
+
+    MilaIrGenCtx popCtx() {
+        auto v = stuff.back();
+
+        stuff.pop_back();
+
+        return v;
+    }
+
+    void invoke(IF& it) override {
+        if (not it.data.elsBody.has_value()) {
+            auto nextBlock = *getCtx().makeIf([&](MilaIrGenCtx ctx1) -> Result<pair<SSARegisterHandle, MilaBB>> {
+                pushCtx(ctx1);
+
+                auto fakeBool = genExp(it.data.cond);
+
+                auto actualBool = getCtx().template push<LoxBooling>(MilaDataType{}, fakeBool);
+
+                auto v = popCtx();
+
+                return pair{actualBool, v.currentBlock};
+            }, [&](MilaIrGenCtx ctx1) -> Result<MilaBB> {
+                pushCtx(ctx1);
+
+                genStm(it.data.ifBody);
+
+                return popCtx().currentBlock;
+            });
+            pushCtx(popCtx().withBlock(nextBlock));
+        } else {
+            auto nextBlock = *getCtx().makeIf([&](MilaIrGenCtx ctx1) -> Result<pair<SSARegisterHandle, MilaBB>> {
+                pushCtx(ctx1);
+
+                auto fakeBool = genExp(it.data.cond);
+
+                auto actualBool = getCtx().template push<LoxBooling>(MilaDataType{}, fakeBool);
+
+                auto v = popCtx();
+
+                return pair{actualBool, v.currentBlock};
+            }, [&](MilaIrGenCtx ctx1) -> Result<MilaBB> {
+                pushCtx(ctx1);
+
+                genStm(it.data.ifBody);
+
+                return popCtx().currentBlock;
+            }, [&](MilaIrGenCtx ctx1) -> Result<MilaBB> {
+                pushCtx(ctx1);
+
+                genStm(*it.data.elsBody);
+
+                return popCtx().currentBlock;
+            });
+            pushCtx(popCtx().withBlock(nextBlock));
+        }
+    }
+
+    void invoke(While& it) override {
+        auto nextBlock = *getCtx().makeWhile(
+            "asdad"sv,
+            [&](MilaIrGenCtx ctx1) -> Result<pair<SSARegisterHandle, MilaBB>> {
+                pushCtx(ctx1);
+
+                assert(it.data.cond);
+                auto ss = genExp(*it.data.cond);
+                auto v3 = getCtx().push<LoxBooling>(MilaDataType{}, ss);
+
+                auto c1 = popCtx();
+
+                return pair{v3, c1.currentBlock};
+            },
+            [&](MilaIrGenCtx ctx1) -> Result<MilaBB> {
+                pushCtx(ctx1);
+
+                assert(it.data.cond);
+                genStm(it.data.body);
+
+                auto c1 = popCtx();
+
+                return c1.currentBlock;
+            }
+        );
+
+        pushCtx(popCtx().withBlock(nextBlock));
+    }
+
+    void invoke(Function& it) override {
+        auto& CFG = graphs.emplace_back(make_unique<ControlFlowGraph<MilaGenCtx>>());
+        auto& IRGEN = irGens.emplace_back(make_unique<MilaIrGen>(*CFG.get()));
+        funks.push_back(&it);
+
+        auto& bb = IRGEN->createBlock("main");
+        MilaIrGenCtx IR_GEN_CTX(*IRGEN, &bb, nullptr, {}, {});
+        IR_GEN_CTX.functionName = it.data.name;
+        IR_GEN_CTX.pushRegister("__self", MilaDataType{}, {}, SSARegister::Type::ARG);
+        auto frameReg = IR_GEN_CTX.pushRegister("__frame", MilaDataType{}, {}, SSARegister::Type::VAR);
+
+        pushCtx(IR_GEN_CTX);
+
+        auto localsCount = it.locals.size()-it.upValCount();
+        IR_GEN_CTX.pushInstruction<instructions::Alloca>(frameReg, localsCount*sizeof(LoxValue));
+
+        for (auto arg : it.data.argz) {
+            auto poop = IR_GEN_CTX.pushRegister(arg, MilaDataType{}, {}, SSARegister::Type::ARG);
+
+            size_t upValId = 0;
+            size_t localId = 0;
+            for (auto i = 0u; i < it.data.argz.size(); i++) {
+                if (it.locals[i]) {
+                    genWrite(SpecializedVariable::AllocateCaptured(upValId), poop, it.data.argz[i]);
+                    upValId += 1;
+                } else {
+                    genWrite(SpecializedVariable::Local(localId), poop, it.data.argz[i]);
+                    localId += 1;
+                }
+            }
+        }
+
+        for (auto& node : it.data.body) {
+            genStm(node);
+        }
+
+        popCtx();
+
+        auto v = getCtx().push<LoxAllocateClosure>(MilaDataType{}, &it);
+        genWrite(it.hookedTarget, v, it.data.name);
+
+        for (auto i = 0UL; i < it.captures.size(); i++) {
+            getCtx().pushInstruction<LoxCopyCapture>(v, it.upValCount()+i, *getCtx().lookupLocal("__self"), it.captures[i]);
+        }
+    }
+
+    void invoke(Assign& it) override {
+        auto v = genExp(it.data.value);
+
+        if (auto v1 = dynamic_cast<Identifier*>(it.data.value); v1) {
+            genWrite(v1->data.hookedTarget, v, v1->data.value);
+            curRet = v;
+        } else if (auto v2 = dynamic_cast<FieldAccess*>(it.data.value); v1) {
+            auto subj = genExp(v2->data.subject);
+            getCtx().pushInstruction<LoxWriteField>(subj, v2->data.fieldName, v);
+
+            // do we need this????
+            curRet = v;
+        } else {
+            TODO();
+        }
+    }
+
+    void invoke(BoolLiteral1& it) override {
+        curRet = getCtx().push<LoxBool>(MilaDataType{}, it.data.value);
+    }
 
 
     void invoke(ASTNode& it) override {
@@ -2312,7 +3238,7 @@ struct ASTExecutor: ASTVisitor {
                 return v;
             }
             case HookedVariableType::ALLOC_UPVAL:
-            PANIC();
+                PANIC();
                 break;
         }
         UNREACHABLE();
@@ -2550,11 +3476,7 @@ struct ASTExecutor: ASTVisitor {
             case BinaryType::MOD:
                 assert(rhs.isNumber());
                 assert(lhs.isNumber());
-                // FIXME
                 res = LoxValue::Number((double) ((long) lhs.asNumber() % (long) rhs.asNumber()));
-                break;
-            case BinaryType::REM:
-            TODO();
                 break;
             case BinaryType::MUL:
                 assert(rhs.isNumber());
@@ -2747,6 +3669,15 @@ int main(int argc, const char** argv) {
     linerizer.realFix();
     // return 3;
 
+    Compiler comp;
+    comp.begin(pepa.buffer, globalFunc);
+
+    for (auto& gen : comp.irGens) {
+        gen->print();
+    }
+
+    return 3;
+
     ASTExecutor executor;
 
     RUNTIME = &executor;
@@ -2786,3 +3717,5 @@ int main(int argc, const char** argv) {
 // Dockerfile to build interpreter
 // FUCKING JIT IT
 // merge requests for checking stuff...
+
+// TODO kindra vrajcka

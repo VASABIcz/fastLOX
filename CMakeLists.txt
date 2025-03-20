@@ -25,11 +25,16 @@ add_subdirectory(utils)
 
 add_subdirectory(parsing)
 add_subdirectory(lexing)
+add_subdirectory(codegen)
 
 add_executable(lox
         $<TARGET_OBJECTS:lexer>
         $<TARGET_OBJECTS:parser>
         $<TARGET_OBJECTS:utils>
+        $<TARGET_OBJECTS:gen64>
+        $<TARGET_OBJECTS:vi_codegen_x86>
+        $<TARGET_OBJECTS:vi_codegen>
+
         lox/lox.cpp
 )
 
