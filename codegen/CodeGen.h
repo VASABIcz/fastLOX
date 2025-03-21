@@ -322,6 +322,9 @@ private:
                 if (range.empty()) continue; // aka. if register is never used
                 if (regs.contains(reg) || !range[currentInstructionCounter]) continue;
 
+                if (dynamic_cast<instructions::Alloca<CTX>*>(instruction.get()) != nullptr) {
+                    break;
+                }
                 allocateRegister(reg);
             }
 

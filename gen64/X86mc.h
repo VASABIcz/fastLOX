@@ -66,6 +66,16 @@ struct Arg {
         return idk;
     }
 
+    static Arg RegOffset(X64Register reg, int32_t offset, size_t size) {
+        Arg idk;
+        idk.type = Type::REG_OFFSET_VALUE;
+        idk.reg = reg;
+        idk.offset = offset;
+        idk.size = size;
+
+        return idk;
+    }
+
     static Arg Symbol(size_t symbol) {
         Arg idk;
         idk.type = Type::SYMBOL;
@@ -106,6 +116,14 @@ struct Arg {
         Arg idk;
         idk.type = Type::IMMEDIATE;
         idk.immValue = value;
+
+        return idk;
+    }
+
+    static Arg ImmPtr(const void* value) {
+        Arg idk;
+        idk.type = Type::IMMEDIATE;
+        idk.immValue = std::bit_cast<size_t>(value);
 
         return idk;
     }

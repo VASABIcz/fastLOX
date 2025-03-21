@@ -60,6 +60,12 @@ public:
 
     void freeReg(const X64Register& reg);
 
+    size_t toHandleStupid(const X64Register& reg) {
+        assert(isAcquired(reg));
+
+        return acquireSpecific(reg);
+    }
+
     size_t acquireSpecific(const X64Register& reg);
 
     size_t allocateStack(size_t amountBytes) {

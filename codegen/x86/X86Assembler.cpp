@@ -1149,6 +1149,15 @@ Arg X86Assembler::handleToArg(size_t handle) {
     }
 }
 
+Arg X86Assembler::handleToArgAssume8(size_t handle) {
+    if (RegAlloc::isStack(handle)) {
+        assert(allocator.sizeOf(handle) >= 8);
+        return Arg::StackValue(allocator.getStackOffset(handle), 8);
+    } else {
+        return Arg::Reg(allocator.getReg(handle));
+    }
+}
+
 size_t X86Assembler::calculateStackSizeFastCall(span<const RegisterHandle> args) {
     size_t stackSize = 0;
     size_t regsUsed = 0;

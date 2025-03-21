@@ -256,7 +256,13 @@ public:
 
     size_t getLabelId(size_t name);
 
+    size_t toHandleStupid(const X64Register& reg) {
+        return allocator.toHandleStupid(reg);
+    }
+
     Arg handleToArg(size_t handle);
+
+    Arg handleToArgAssume8(size_t handle);
 
     size_t calculateStackSizeFastCall(span<const RegisterHandle> args);
 

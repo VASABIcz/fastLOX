@@ -20,6 +20,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <unordered_map>
+#include "../utils/code_gen.h"
 
 #define VERBOSE 0
 
@@ -393,6 +394,7 @@ struct Function: Statement {
     SpecTarget hookedTarget;
     std::function<void(ASTExecutor&)> native;
     bool isMethod = false;
+    void* runtimeData = nullptr;
 
     size_t getParamUpValOffset() {
         size_t acu = 0;
@@ -498,7 +500,6 @@ string binarToString(BinaryType t) {
         case BinaryType::SUB: return "-";
         case BinaryType::DIV: return "/";
         case BinaryType::MOD: return "%";
-        case BinaryType::REM: return "%";
         case BinaryType::MUL: return "*";
         case BinaryType::GT: return ">";
         case BinaryType::GEQ: return ">=";
@@ -1773,7 +1774,7 @@ ASTExecutor* RUNTIME = nullptr;
 struct ObjectRef {
     ClassRef* clazz;
     ObjectRef* proto;
-    std::unordered_map<string, LoxValue>* fields;
+    std::unordered_map<string_view, LoxValue, string_hash>* fields;
     // vector<FunctionRef*> methods;
 
 /*    LoxValue getMethod(const string& name) {
@@ -1784,9 +1785,13 @@ struct ObjectRef {
         PANIC();
     }*/
 
-    LoxValue read(const string& name) {
+    LoxValue read(string_view name) {
         if (fields->contains(name)) return fields->at(name);
         return getMethod2(name);
+    }
+
+    void write(string_view name, LoxValue v) {
+        fields->insert({name, v});
     }
 
     LoxValue getMethod2(string_view name) {
@@ -2219,6 +2224,165 @@ struct Linerizer: ASTVisitor {
     }
 };
 
+LoxValue GLOBALS_TABLE[512];
+
+LoxValue doSimpleBin(BinaryType type, LoxValue lhs, LoxValue rhs) {
+    // if (lhs.asNumber() < 0.0) PANIC();
+    // if (lhs.asNumber() > 1'000'000.0) PANIC();
+    // std::cout << lhs.toString() << " " << binarToString(type) << " " << rhs.toString() << std::endl;
+    LoxValue res;
+    switch (type) {
+        case BinaryType::ADD:
+            if (rhs.isString()) {
+                assert(lhs.isString());
+                auto idk = string{};
+                idk += lhs.asString();
+                idk += rhs.asString();
+                res = LoxValue::String(std::move(idk));
+            } else {
+                assert(rhs.isNumber());
+                assert(lhs.isNumber());
+                res = LoxValue::Number(lhs.asNumber() + rhs.asNumber());
+            }
+            break;
+        case BinaryType::SUB:
+            assert(rhs.isNumber());
+            assert(lhs.isNumber());
+            res = LoxValue::Number(lhs.asNumber() - rhs.asNumber());
+            break;
+        case BinaryType::DIV:
+            assert(rhs.isNumber());
+            assert(lhs.isNumber());
+            res = LoxValue::Number(lhs.asNumber() / rhs.asNumber());
+            break;
+        case BinaryType::MOD:
+            assert(rhs.isNumber());
+            assert(lhs.isNumber());
+            res = LoxValue::Number((double) ((long) lhs.asNumber() % (long) rhs.asNumber()));
+            break;
+        case BinaryType::MUL:
+            assert(rhs.isNumber());
+            assert(lhs.isNumber());
+            res = LoxValue::Number(lhs.asNumber() * rhs.asNumber());
+            break;
+        case BinaryType::GT:
+            assert(rhs.isNumber());
+            assert(lhs.isNumber());
+            res = LoxValue::Bool(lhs.asNumber() > rhs.asNumber());
+            break;
+        case BinaryType::LESS:
+            assert(rhs.isNumber());
+            assert(lhs.isNumber());
+            res = LoxValue::Bool(lhs.asNumber() < rhs.asNumber());
+            break;
+        case BinaryType::EQ:
+        case BinaryType::NEQ: {
+            if (not rhs.matchesType(lhs)) {
+                res = LoxValue::False();
+            } else if (rhs.isNumber()) {
+                res = LoxValue::Bool(rhs.asNumber() == lhs.asNumber());
+            } else if (rhs.isFunction()) {
+                res = LoxValue::Bool(rhs.asFunction() == lhs.asFunction());
+            } else if (rhs.isString()) {
+                res = LoxValue::Bool(lhs.asString() == rhs.asString());
+            } else if (rhs.isBool()) {
+                res = LoxValue::Bool(lhs.asBool() == rhs.asBool());
+            } else if (rhs.isNil()) {
+                res = LoxValue::True();
+            } else if (rhs.isClass()) {
+                res = LoxValue::Bool(lhs.asClass() == rhs.asClass());
+            } else {
+                TODO();
+            }
+
+            if (type == BinaryType::NEQ) {
+                res = LoxValue::Bool(!res.asBool());
+            }
+            break;
+        }
+            break;
+        case BinaryType::GEQ:
+            assert(rhs.isNumber());
+            assert(lhs.isNumber());
+            res = LoxValue::Bool(lhs.asNumber() >= rhs.asNumber());
+            break;
+        case BinaryType::LEQ:
+            assert(rhs.isNumber());
+            assert(lhs.isNumber());
+            res = LoxValue::Bool(lhs.asNumber() <= rhs.asNumber());
+            break;
+        case BinaryType::AND:
+            break;
+        case BinaryType::OR:
+            break;
+    }
+
+    return res;
+}
+
+LoxValue readField(LoxValue subj, const char* str, size_t size) {
+    assert(subj.isObject());
+    return subj.asObject()->read(string_view{str, size});
+}
+
+void writeField(LoxValue obj, LoxValue value, const char* name, size_t size) {
+    assert(obj.isObject());
+    obj.asObject()->write(string_view{name, size}, value);
+}
+
+void loxPrint(LoxValue value) {
+    std::cout << value.toString() << std::endl;
+}
+
+size_t toBool(LoxValue value) {
+    // std::cout << value.toBool() << std::endl;
+    return value.toBool();
+}
+
+LoxValue* allocateLoxValue() {
+    return new LoxValue();
+}
+
+// FIXME in order to make this work we need to JIT constructor specialy
+// NOTE: even classes without constructor will get synthetic constructor that will do the folowing:
+// 1. it will manually allocate object
+FunctionRef* getCallPtr(LoxValue callable, size_t argsCount) {
+    // std::cout << GLOBALS_TABLE[1].toString() << std::endl;
+    // std::cout << callable.toString() << std::endl;
+    assert(callable.isFunction() or callable.isClass());
+
+    if (callable.isFunction()) {
+        assert(callable.asFunction()->func->data.argz.size() == argsCount);
+        return callable.asFunction();
+    }
+
+    if (callable.isClass()) {
+        auto cons = callable.asClass()->getConstructor();
+        if (cons == nullptr) {
+            assert(argsCount == 0);
+            return nullptr;
+        }
+        assert(cons->data.argz.size() == argsCount);
+
+        return nullptr;
+    }
+
+    PANIC();
+}
+
+ClassRef* doInstantiation() {
+    TODO();
+}
+
+LoxValue allocateClosure(Function* f, FunctionRef* closure) {
+    auto c = (FunctionRef*)malloc(sizeof(FunctionRef)+f->upValCount()*sizeof(LoxValue*));
+
+    c->parent = closure;
+    c->func = f;
+
+    return LoxValue::Function(c);
+}
+
 struct MilaAssembler: virtual Assembler {
     vector<string> stuff;
 
@@ -2231,66 +2395,170 @@ struct MilaAssembler: virtual Assembler {
         return stuff.size()-1;
     }
 
-    virtual void call(size_t label, span<size_t> args, optional<size_t> ret) = 0;
+    virtual void doBin(BinaryType type, size_t dst, size_t lhs, size_t rhs) = 0;
 
-    virtual void doBin(BinaryType type, size_t dst, size_t lhs, size_t rhs) {
+    virtual void negate(size_t dst, size_t src) = 0;
 
-    }
+    virtual void readField(size_t tgt, size_t self, string_view name) = 0;
 
-    virtual void negate(size_t dst, size_t src) {
+    virtual void writeField(size_t self, string_view name, size_t value) = 0;
 
-    }
+    virtual void readClosed(size_t dst, size_t ref, size_t frameId, size_t localId) = 0;
 
-    virtual void readField(size_t tgt, size_t self, string_view name) {
+    virtual void writeClosed(size_t ref, size_t frameId, size_t localId, size_t value) = 0;
 
-    }
+    virtual void allocateClosed(size_t ref, size_t frameId, size_t localId, size_t value) = 0;
 
-    virtual void writeField(size_t self, string_view name, size_t vakue) {
+    virtual void allocateClosure(size_t tgt, Function* f, size_t parent) = 0;
 
-    }
+    virtual void dynamicCall(size_t tgt, size_t subj, span<size_t> argz) = 0;
 
-    virtual void readClosed(size_t dst, size_t ref, size_t frameId, size_t localId) {
+    virtual void print1(size_t arg) = 0;
 
-    }
-
-    virtual void writeClosed(size_t ref, size_t frameId, size_t localId, size_t value) {
-
-    }
-
-    virtual void allocateClosed(size_t ref, size_t frameId, size_t localId, size_t value) {
-
-    }
-
-    virtual void allocateClosure(size_t tgt, Function* f) {
-
-    }
-
-    virtual void dynamicCall(size_t tgt, size_t subj, span<size_t> argz) {
-
-    }
-
-    virtual void print1(size_t arg) {
-
-    }
-
-    virtual void toBool(size_t tgt, size_t src) {
-
-    }
+    virtual void toBool(size_t tgt, size_t src) = 0;
 
     virtual void readGlobal(size_t tgt, size_t id) {
+        auto gReg = movImmValueToReg(std::bit_cast<size_t>(&GLOBALS_TABLE));
+        readMem(tgt, gReg, id*sizeof(LoxValue), sizeof(LoxValue));
 
+        freeRegister(gReg);
     }
 
     virtual void writeGlobal(size_t id, size_t value) {
+        auto gReg = movImmValueToReg(std::bit_cast<size_t>(&GLOBALS_TABLE));
+        writeMem(gReg, value, id*sizeof(LoxValue), sizeof(LoxValue));
 
+        freeRegister(gReg);
     }
 };
 
 struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     using X86Assembler::X86Assembler;
 
-    void call(size_t label, span<size_t> args, optional<size_t> ret) override {
-        this->callC(Arg::Rel32Adr(label, 0), args, ret);
+    void readField(size_t tgt, size_t self, std::string_view name) override {
+        array<Arg, 3> argz{handleToArg(self), Arg::ImmPtr(name.data()), Arg::Imm(name.size())};
+        chadCall(Arg::ImmPtr((void*)&::readField), argz, handleToArg(tgt));
+    }
+
+    void writeField(size_t self, std::string_view name, size_t value) override {
+        array<Arg, 4> argz{handleToArg(self), handleToArg(value), Arg::ImmPtr(name.data()), Arg::Imm(name.size())};
+        chadCall(Arg::ImmPtr((void*)&::writeField), argz, {});
+    }
+
+    void print1(size_t arg) override {
+        array<Arg, 1> argz{handleToArg(arg)};
+        chadCall(Arg::ImmPtr((void*)&::loxPrint), argz, {});
+    }
+
+    void doBin(BinaryType type, size_t dst, size_t lhs, size_t rhs) override {
+        array<Arg, 3> argz{Arg::Imm((size_t)type), handleToArg(lhs), handleToArg(rhs)};
+        chadCall(Arg::ImmPtr((void*)&::doSimpleBin), argz, handleToArg(dst));
+    }
+
+    void toBool(size_t tgt, size_t src) override {
+        array<Arg, 1> argz{handleToArg(src)};
+        chadCall(Arg::ImmPtr((void*)&::toBool), argz, handleToArg(tgt));
+    }
+
+    void allocateClosed(size_t ref, size_t frameId, size_t localId, size_t value) override {
+        vector<int> derefs;
+        for (size_t i = 0; i < frameId; i++) {
+            derefs.push_back(offsetof(FunctionRef, parent));
+        }
+        derefs.push_back(offsetof(FunctionRef, captures)+(sizeof(LoxValue*) * localId));
+
+        auto tmp = allocateRegister(sizeof(LoxValue*));
+        auto tmp2 = allocateRegister(sizeof(LoxValue*));
+
+        movReg(tmp, ref);
+        derefChain(tmp, derefs);
+
+        chadCall(Arg::ImmPtr((void*)&::allocateLoxValue), {}, handleToArg(tmp2));
+        writeMem(tmp2, value, 0, sizeof(LoxValue));
+
+        writeMem(tmp, tmp2, 0, sizeof(LoxValue*));
+
+        freeRegister(tmp);
+        freeRegister(tmp2);
+    }
+
+    // 0 -> reg+0
+    // 8 -> reg+8
+    // 0 0 -> [reg+0]+0
+    // 8 8 -> [reg+8]+8
+    // 8 8 8 -> [[reg+8]+8]+8
+    void derefChain(size_t reg, span<const int> offsets) {
+        if (offsets.empty()) return;
+
+        for (size_t i = 0; i < offsets.size() - 1; i++) {
+            readMem(reg, reg, offsets[i], 8);
+        }
+
+        movReg(reg, reg, 0, offsets.back());
+    }
+
+    void derefChainI(size_t reg, std::initializer_list<int> offsets) {
+        derefChain(reg, offsets);
+    }
+
+    void dynamicCall(size_t tgt, size_t subj, span<size_t> argz) override {
+        array<Arg, 2> argz1{handleToArg(subj), Arg::Imm(argz.size())};
+        chadCall(Arg::ImmPtr((void*)&::getCallPtr), argz1, handleToArgAssume8(tgt));
+
+        auto tmp = allocateRegister(8);
+        movReg(tmp, tgt);
+
+        derefChainI(tmp, {offsetof(FunctionRef, func), offsetof(Function, runtimeData), 0});
+
+        vector<size_t> argz2;
+        argz2.push_back(tgt);
+        for (auto arg : argz) {
+            argz2.push_back(arg);
+        }
+
+        callC(handleToArgAssume8(tmp), argz2, tgt);
+
+        freeRegister(tmp);
+    }
+
+    void allocateClosure(size_t tgt, Function *f, size_t parent) override {
+        array<Arg, 2> argz{Arg::ImmPtr(f), handleToArg(parent)};
+        chadCall(Arg::ImmPtr((void*)::allocateClosure), argz, handleToArg(tgt));
+    }
+
+    void readClosed(size_t dst, size_t ref, size_t frameId, size_t localId) override {
+        movReg(dst, ref);
+
+        vector<int> derefs;
+        for (size_t i = 0; i < frameId; i++) {
+            derefs.push_back(offsetof(FunctionRef, parent));
+        }
+        derefs.push_back(offsetof(FunctionRef, captures)+(sizeof(LoxValue*) * localId));
+        derefs.push_back(0);
+        derefs.push_back(0);
+
+        derefChain(dst, derefs);
+    }
+
+    void writeClosed(size_t ref, size_t frameId, size_t localId, size_t value) override {
+        vector<int> derefs;
+        for (size_t i = 0; i < frameId; i++) {
+            derefs.push_back(offsetof(FunctionRef, parent));
+        }
+        derefs.push_back(offsetof(FunctionRef, captures)+(sizeof(LoxValue*) * localId));
+        derefs.push_back(0);
+
+        auto tmp = this->allocateRegister(sizeof(LoxValue*));
+
+        movReg(tmp, ref);
+        derefChain(tmp, derefs);
+        writeMem(tmp, value, 0, sizeof(LoxValue));
+
+        freeRegister(tmp);
+    }
+
+    void negate(size_t dst, size_t src) override {
+        TODO();
     }
 };
 
@@ -2673,25 +2941,21 @@ struct LoxWriteLocal: public NamedIrInstruction<"write_local", MilaGenCtx> {
 struct LoxAllocateClosure: public NamedIrInstruction<"allocate_closure", MilaGenCtx> {
     PUB_VIRTUAL_COPY(LoxAllocateClosure)
     Function* func;
+    SSARegisterHandle parent;
 
-    LoxAllocateClosure(SSARegisterHandle target, Function* func) : NamedIrInstruction(target), func(func) {}
+    LoxAllocateClosure(SSARegisterHandle target, Function* func, SSARegisterHandle parent) : NamedIrInstruction(target), func(func), parent(parent) {}
 
-    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(parent);
+    }
 
     void print(MilaIrGen&) override {
-        basePrint("{}", func->data.name);
+        basePrint("{} {}", func->data.name, parent);
     }
 
     void generate(MilaCodeGen& gen) override {
-        gen.assembler.allocateClosure(gen.getReg(target), func);
+        gen.assembler.allocateClosure(gen.getReg(target), func, gen.getReg(parent));
     }
-};
-
-struct RuntimeClossure {
-    RuntimeClossure* c;
-    Function* f;
-    void* data;
-    LoxValue* ups[];
 };
 
 struct LoxCopyCapture: public NamedIrInstruction<"copy_capture", MilaGenCtx> {
@@ -2710,7 +2974,7 @@ struct LoxCopyCapture: public NamedIrInstruction<"copy_capture", MilaGenCtx> {
     }
 
     void generate(MilaCodeGen& gen) override {
-        gen.assembler.movReg(gen.getReg(tgt), gen.getReg(src), offsetof(RuntimeClossure, ups)+(sizeof(LoxValue*)*tgtId), offsetof(RuntimeClossure, ups)+(sizeof(LoxValue*)*srcId), sizeof(LoxValue*));
+        gen.assembler.movReg(gen.getReg(tgt), gen.getReg(src), offsetof(FunctionRef, captures)+(sizeof(LoxValue*)*tgtId), offsetof(FunctionRef, captures)+(sizeof(LoxValue*)*srcId), sizeof(LoxValue*));
     }
 };
 
@@ -2842,7 +3106,7 @@ struct Compiler: ASTVisitor {
     void begin(span<ASTNode1> ast, Function* gf) {
         auto& CFG = graphs.emplace_back(make_unique<ControlFlowGraph<MilaGenCtx>>());
         auto& IRGEN = irGens.emplace_back(make_unique<MilaIrGen>(*CFG.get()));
-        funks.push_back(nullptr);
+        funks.push_back(gf);
 
         auto& bb = IRGEN->createBlock("main");
         MilaIrGenCtx IR_GEN_CTX(*IRGEN, &bb, nullptr, {}, {});
@@ -2857,6 +3121,11 @@ struct Compiler: ASTVisitor {
 
         for (auto& node : ast) {
             genStm(dynamic_cast<ASTStm>(node));
+        }
+
+        if (!getCtx().currentBlock->isTerminated()) {
+            auto v = getCtx().push<LoxNil>(MilaDataType{});
+            getCtx().pushInstruction<instructions::Return>(SSARegisterHandle::invalid(), v);
         }
 
         popCtx();
@@ -2895,6 +3164,71 @@ struct Compiler: ASTVisitor {
     }
 
     void invoke(Binary& it) override {
+        if (it.data.type == BinaryType::AND) {
+            array<pair<SSARegisterHandle, size_t>, 2> phis;
+            auto nextBlock = getCtx().makeIf(
+                [&](MilaIrGenCtx ctx) -> Result<pair<SSARegisterHandle, MilaBB>> {
+                    pushCtx(ctx);
+
+                    auto v = genExp(it.data.lhs);
+                    phis[0] = {v, getCtx().current().id()};
+                    auto actBuul = getCtx().push<LoxBooling>(MilaDataType{}, v);
+
+                    auto ctx1 = popCtx();
+
+                    return pair{actBuul, ctx1.currentBlock};
+                },
+                [&](MilaIrGenCtx ctx) -> Result<MilaBB> {
+                    pushCtx(ctx);
+
+                    auto v = genExp(it.data.lhs);
+                    phis[1] = {v, getCtx().current().id()};
+
+                    auto ctx1 = popCtx();
+
+                    return ctx1.currentBlock;
+                }
+            );
+            pushCtx(popCtx().withBlock(*nextBlock));
+
+            curRet = getCtx().makePhi(phis).first;
+
+            return;
+        }
+
+        if (it.data.type == BinaryType::OR) {
+            array<pair<SSARegisterHandle, size_t>, 2> phis;
+            auto nextBlock = getCtx().makeIf(
+                    [&](MilaIrGenCtx ctx) -> Result<pair<SSARegisterHandle, MilaBB>> {
+                        pushCtx(ctx);
+
+                        auto v = genExp(it.data.lhs);
+                        phis[0] = {v, getCtx().current().id()};
+                        auto actBuul = getCtx().push<LoxBooling>(MilaDataType{}, v);
+                        auto notActBuul = getCtx().push<instructions::BoolNot>(MilaDataType{}, actBuul);
+
+                        auto ctx1 = popCtx();
+
+                        return pair{notActBuul, ctx1.currentBlock};
+                    },
+                    [&](MilaIrGenCtx ctx) -> Result<MilaBB> {
+                        pushCtx(ctx);
+
+                        auto v = genExp(it.data.lhs);
+                        phis[1] = {v, getCtx().current().id()};
+
+                        auto ctx1 = popCtx();
+
+                        return ctx1.currentBlock;
+                    }
+            );
+            pushCtx(popCtx().withBlock(*nextBlock));
+
+            curRet = getCtx().makePhi(phis).first;
+
+            return;
+        }
+
         auto lhs = genExp(it.data.lhs);
         auto rhs = genExp(it.data.rhs);
 
@@ -3075,9 +3409,14 @@ struct Compiler: ASTVisitor {
             genStm(node);
         }
 
+        if (!getCtx().currentBlock->isTerminated()) {
+            auto v = getCtx().push<LoxNil>(MilaDataType{});
+            getCtx().pushInstruction<instructions::Return>(SSARegisterHandle::invalid(), v);
+        }
+
         popCtx();
 
-        auto v = getCtx().push<LoxAllocateClosure>(MilaDataType{}, &it);
+        auto v = getCtx().push<LoxAllocateClosure>(MilaDataType{}, &it, *getCtx().lookupLocal("__self"));
         genWrite(it.hookedTarget, v, it.data.name);
 
         for (auto i = 0UL; i < it.captures.size(); i++) {
@@ -3257,7 +3596,7 @@ struct ASTExecutor: ASTVisitor {
         }
     }
 
-    ObjectRef* rawInstant(ClassRef* clazz, unordered_map<string, LoxValue>* data) {
+    ObjectRef* rawInstant(ClassRef* clazz, unordered_map<string_view, LoxValue, string_hash>* data) {
         ObjectRef* proto = nullptr;
         if (clazz->super != nullptr) {
             proto = rawInstant(clazz->super, data);
@@ -3284,7 +3623,7 @@ struct ASTExecutor: ASTVisitor {
         if (constructor == nullptr && not argz.empty()) PANIC();
         if (constructor != nullptr && constructor->data.argz.size() != argz.size()) PANIC();
 
-        auto* res = rawInstant(clazz, new unordered_map<string, LoxValue>{});
+        auto* res = rawInstant(clazz, new unordered_map<string_view , LoxValue, string_hash>{});
 
         if (constructor != nullptr) {
             auto f = res->getMethod2("init");
@@ -3382,8 +3721,8 @@ struct ASTExecutor: ASTVisitor {
     void invoke(FieldAccess &it) override {
         it.data.subject->visit(*this);
         auto subj = pop();
-        assert(subj.isObject());
-        push(subj.asObject()->read(it.data.fieldName));
+
+        push(readField(subj, it.data.fieldName.data(), it.data.fieldName.size()));
     }
 
     void invoke(Identifier& it) override {
@@ -3448,94 +3787,7 @@ struct ASTExecutor: ASTVisitor {
         it.data.rhs->visit(*this);
         auto rhs = pop();
 
-        LoxValue res;
-        switch (it.data.type) {
-            case BinaryType::ADD:
-                if (rhs.isString()) {
-                    assert(lhs.isString());
-                    auto idk = string{};
-                    idk += lhs.asString();
-                    idk += rhs.asString();
-                    res = LoxValue::String(std::move(idk));
-                } else {
-                    assert(rhs.isNumber());
-                    assert(lhs.isNumber());
-                    res = LoxValue::Number(lhs.asNumber() + rhs.asNumber());
-                }
-                break;
-            case BinaryType::SUB:
-                assert(rhs.isNumber());
-                assert(lhs.isNumber());
-                res = LoxValue::Number(lhs.asNumber() - rhs.asNumber());
-                break;
-            case BinaryType::DIV:
-                assert(rhs.isNumber());
-                assert(lhs.isNumber());
-                res = LoxValue::Number(lhs.asNumber() / rhs.asNumber());
-                break;
-            case BinaryType::MOD:
-                assert(rhs.isNumber());
-                assert(lhs.isNumber());
-                res = LoxValue::Number((double) ((long) lhs.asNumber() % (long) rhs.asNumber()));
-                break;
-            case BinaryType::MUL:
-                assert(rhs.isNumber());
-                assert(lhs.isNumber());
-                res = LoxValue::Number(lhs.asNumber() * rhs.asNumber());
-                break;
-            case BinaryType::GT:
-                assert(rhs.isNumber());
-                assert(lhs.isNumber());
-                res = LoxValue::Bool(lhs.asNumber() > rhs.asNumber());
-                break;
-            case BinaryType::LESS:
-                assert(rhs.isNumber());
-                assert(lhs.isNumber());
-                res = LoxValue::Bool(lhs.asNumber() < rhs.asNumber());
-                break;
-            case BinaryType::EQ:
-            case BinaryType::NEQ: {
-                if (not rhs.matchesType(lhs)) {
-                    res = LoxValue::False();
-                } else if (rhs.isNumber()) {
-                    res = LoxValue::Bool(rhs.asNumber() == lhs.asNumber());
-                } else if (rhs.isFunction()) {
-                    res = LoxValue::Bool(rhs.asFunction() == lhs.asFunction());
-                } else if (rhs.isString()) {
-                    res = LoxValue::Bool(lhs.asString() == rhs.asString());
-                } else if (rhs.isBool()) {
-                    res = LoxValue::Bool(lhs.asBool() == rhs.asBool());
-                } else if (rhs.isNil()) {
-                    res = LoxValue::True();
-                } else if (rhs.isClass()) {
-                    res = LoxValue::Bool(lhs.asClass() == rhs.asClass());
-                } else {
-                    TODO();
-                }
-
-                if (it.data.type == BinaryType::NEQ) {
-                    res = LoxValue::Bool(!res.asBool());
-                }
-                break;
-            }
-                break;
-            case BinaryType::GEQ:
-                assert(rhs.isNumber());
-                assert(lhs.isNumber());
-                res = LoxValue::Bool(lhs.asNumber() >= rhs.asNumber());
-                break;
-            case BinaryType::LEQ:
-                assert(rhs.isNumber());
-                assert(lhs.isNumber());
-                res = LoxValue::Bool(lhs.asNumber() <= rhs.asNumber());
-                break;
-            case BinaryType::AND:
-                break;
-            case BinaryType::OR:
-                break;
-        }
-
-        push(res);
+        push(doSimpleBin(it.data.type, lhs, rhs));
     }
 
     void invoke(Block& it) override {
@@ -3560,9 +3812,9 @@ struct ASTExecutor: ASTVisitor {
         } else if (dynamic_cast<FieldAccess*>(dst) != nullptr) {
             dynamic_cast<FieldAccess*>(dst)->data.subject->visit(*this);
             auto obj = pop();
-            assert(obj.isObject());
             auto v = pop();
-            (*obj.asObject()->fields)[dynamic_cast<FieldAccess*>(dst)->data.fieldName] = v;
+            auto& fName = dynamic_cast<FieldAccess*>(dst)->data.fieldName;
+            writeField(obj, v, fName.data(), fName.size());
             push(v); // FIXME this is retarded
         } else {
             TODO();
@@ -3597,6 +3849,9 @@ struct ASTExecutor: ASTVisitor {
 };
 
 
+typedef void(*GlobalFunck)(FunctionRef*);
+
+
 FunctionRef* ObjectRef::createMethod(Function* f1) {
     auto f = RUNTIME->allocateFunctionRef(*f1);
     f->func = f1;
@@ -3609,6 +3864,14 @@ FunctionRef* ObjectRef::createMethod(Function* f1) {
 
     return f;
 }
+
+
+std::chrono::time_point CLOCK_START = std::chrono::high_resolution_clock::now();
+
+LoxValue loxClock(FunctionRef* self) {
+    return LoxValue::Number(duration_cast<std::chrono::microseconds>((std::chrono::high_resolution_clock::now()-CLOCK_START)).count()/1'000'000.0);
+}
+
 
 int main(int argc, const char** argv) {
     string filePath{argv[1]};
@@ -3664,7 +3927,7 @@ int main(int argc, const char** argv) {
 
     globalFunc->locals = linerizer.stack.back().isUpVal;
 
-    auto start1 = std::chrono::high_resolution_clock::now();
+    std::chrono::time_point start1 = std::chrono::high_resolution_clock::now();
 
     linerizer.realFix();
     // return 3;
@@ -3676,7 +3939,53 @@ int main(int argc, const char** argv) {
         gen->print();
     }
 
-    return 3;
+    for (size_t i = 0; i < comp.funks.size(); i++) {
+        std::vector<size_t> argSizes;
+        argSizes.push_back(sizeof(FunctionRef*));
+        for (size_t j = 0; j < comp.funks[i]->data.argz.size(); j++) {
+            argSizes.push_back(sizeof(LoxValue));
+        }
+
+        X86MilaAssembler assm(argSizes, sizeof(LoxValue));
+        MilaCodeGen ggs(assm, *comp.irGens[i], comp.funks[i]->data.name);
+        *ggs.gen();
+
+        auto stackSize = assm.preserveCalleeRegs();
+
+        assm.patchStackSize(align(stackSize, X86MilaAssembler::STACK_ALIGNMENT));
+
+        UNWRAPV(linkRelative(assm.bytes.data(), assm.spaces, assm.labels));
+
+        auto codeSize = assm.bytes.size();
+        auto code = cg::allocateJIT(codeSize);
+
+        std::memcpy(code, assm.bytes.data(), codeSize);
+
+        cg::makeRX(code, codeSize);
+
+        comp.funks[i]->runtimeData = code;
+
+        writeBytesToFile(stringify("bins/{}", comp.funks[i]->data.name), assm.bytes);
+    }
+
+    auto clock = makeStuff2<Function>(clk, vector<string>{}, vector<ASTStm>{});
+    clock->native = [&](ASTExecutor& ctx) {
+        ctx.push(LoxValue::Number(duration_cast<std::chrono::microseconds>((std::chrono::high_resolution_clock::now()-start1)).count()/1'000'000.0));
+    };
+    clock->runtimeData = (void*)&loxClock;
+    GLOBALS_TABLE[0] = allocateClosure(clock, nullptr);
+
+    auto funk = reinterpret_cast<GlobalFunck>(comp.funks[0]->runtimeData);
+
+    auto ex1 = std::chrono::high_resolution_clock::now();
+
+    funk(allocateClosure(globalFunc, nullptr).asFunction());
+
+    auto ex2 = std::chrono::high_resolution_clock::now();
+
+    std::cout << "execution took: " << std::chrono::duration_cast<std::chrono::milliseconds>(ex2-ex1).count() << std::endl;
+
+    return 33;
 
     ASTExecutor executor;
 
@@ -3685,11 +3994,11 @@ int main(int argc, const char** argv) {
     executor.currentFrame = executor.allocateFunctionRef(*globalFunc);
     executor.stackBase -= globalFunc->locals.size()-globalFunc->totalUpValCount();
 
-    auto clock = makeStuff2<Function>(clk, vector<string>{}, vector<ASTStm>{});
+    auto clock1 = makeStuff2<Function>(clk, vector<string>{}, vector<ASTStm>{});
     clock->native = [&](ASTExecutor& ctx) {
         ctx.push(LoxValue::Number(duration_cast<std::chrono::microseconds>((std::chrono::high_resolution_clock::now()-start1)).count()/1'000'000.0));
     };
-    executor.globals[clockId] = LoxValue::Function(new FunctionRef{nullptr, clock/*.get()*/});
+    executor.globals[clockId] = LoxValue::Function(new FunctionRef{nullptr, clock1/*.get()*/});
     // executor.frames.push_back(new StackFrame());
 
     size_t ip = 0;
@@ -3714,8 +4023,4 @@ int main(int argc, const char** argv) {
 // raylib binding for lox??????????????
 // ARRAY, BREAK, CONTINUE, CONST keyword, IF isType..., REPL, DEBUGER?
 // only repo requirement, RUN TESTS
-// Dockerfile to build interpreter
-// FUCKING JIT IT
 // merge requests for checking stuff...
-
-// TODO kindra vrajcka
