@@ -14,6 +14,15 @@
   - parent - pointer to enclosing closure
 - "up values" - are accesed by dereferencing parent N times + offset in up value table
 
+### WIP
+- simple JIT
+  - can run fib benchmark 3x speedup
+  - add support for class instantiation
+  - mby better code gen? try to inline native procedures?
+  - make it pass 100% tests
+  - mby function specialization optimization?
+  - some IR optimization data type propagation, constant folding, convert locals table to regs, coalessce/remove type checks?
+
 ### TODO
 - ability to check types? `if v is Number { ... }`
 - continue + break statements with support for labeled return `while@a (true) { while@b (true) { break@a } }`
