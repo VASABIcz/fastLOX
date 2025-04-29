@@ -42,7 +42,7 @@ public:
         assert(!regs.contains(tgt));
         regs.emplace(tgt, registerHandle);
         alreadyAllocated.insert({tgt, registerHandle});
-        // println("[GEN] allocating {} {} {}", handle, rec.useCount, registerHandle);
+        // println("[GEN] allocating {} -> {}", tgt, assembler.toString(registerHandle));
 
         return registerHandle;
     }
@@ -114,6 +114,10 @@ public:
                         start = nullopt;
                     }
                 }
+                if (start.has_value() && not range.second.empty()) {
+                    subranges.push_back(stringify("{}..{}", *start, range.second.size() - 1));
+                    start = nullopt;
+                }
 
                 println("{} {} {}", stringify(range.second, {StringifyCtx{"", "", ""}}), range.first, subranges);
             }
@@ -124,7 +128,7 @@ public:
                 auto max_value = (*currentLiveRanges.begin()).second.size()-1;
                 auto max_value_len = to_string(max_value).size();
 
-                println("== BINARY LAYOUT ==");
+                println("== BINARY LAYOUT == {}", name);
                 auto id = 0u;
                 for (auto blockId : blocks) {
                     cout << string(max_value_len, ' ') << " # " << blockId << " (" << getBlock(blockId).tag << ")" << endl;
@@ -172,6 +176,7 @@ public:
     void freeRegister(SSARegisterHandle reg) {
         if (!regs.contains(reg)) std::terminate();
         auto r = regs.at(reg);
+        // println("[GEN] freeing {} -> {}", reg, assembler.toString(r));
         regs.erase(reg);
         assembler.freeRegister(r);
     }
@@ -194,8 +199,14 @@ public:
         return allocateRegister(reg);
     }
 
+    std::optional<RegisterHandle> getReg(std::optional<SSARegisterHandle> reg) {
+        if (reg.has_value()) return getReg(*reg);
+
+        return {};
+    }
+
     CodeGen::RegisterHandle doAlloca(const SSARegisterHandle& reg, size_t size) {
-        return internalAllocateRegister(reg, assembler.allocateStack(size));
+        return internalAllocateRegister(reg, assembler.allocateRegister(size));
     }
 
     optional<CodeGen::RegisterHandle> getRegOrNull(const SSARegisterHandle& reg) {
@@ -240,7 +251,7 @@ public:
         const auto& block = irGen.getBlock(targetBlock);
         auto pis = block.getPhis(currentBlock);
 
-        vector<pair<size_t, size_t>> idks;
+        vector<pair<size_t, pair<size_t, size_t>>> idks;
 
         // move register to temps before actual write
         // this allows us stuff like:
@@ -249,14 +260,15 @@ public:
         // FIXME this could be optimized to use only single temp register
         // TODO we would need to find dependency cicles
         for (auto pi : pis) {
+            // std::cout << "ALLOCATING TMP FOR " << sizeBytes(pi.first) << " - " << pi.first.toString() << std::endl;
             auto reg = allocateTemp(sizeBytes(pi.first));
-            assembler.movReg(reg, getReg(pi.first));
-            idks.emplace_back(getRegTotallyUnsafeDontUseThis(pi.second), reg);
+            assembler.movReg(reg, getReg(pi.first), 0, 0, sizeBytes(pi.first));
+            idks.emplace_back(getRegTotallyUnsafeDontUseThis(pi.second), make_pair(reg, sizeBytes(pi.first)));
         }
 
         for (auto idk : idks) {
-            assembler.movReg(idk.first, idk.second);
-            freeTemp(idk.second);
+            assembler.movReg(idk.first, idk.second.first, 0, 0, idk.second.second);
+            freeTemp(idk.second.first);
         }
     }
 
@@ -322,8 +334,9 @@ private:
                 if (range.empty()) continue; // aka. if register is never used
                 if (regs.contains(reg) || !range[currentInstructionCounter]) continue;
 
+                // if its alloca dont allocate it
                 if (dynamic_cast<instructions::Alloca<CTX>*>(instruction.get()) != nullptr) {
-                    break;
+                    continue;
                 }
                 allocateRegister(reg);
             }

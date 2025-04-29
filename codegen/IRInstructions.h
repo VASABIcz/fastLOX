@@ -484,6 +484,8 @@ namespace instructions {
     PUB_VIRTUAL_COPY(Return)
         using IR1Instruction<"return", CTX>::IR1Instruction;
 
+        explicit Return(SSARegisterHandle ret): IR1Instruction<"return", CTX>(SSARegisterHandle::invalid(), ret) {}
+
         void generate(CTX::GEN& gen) override {
             if (!this->value.isValid()) return gen.assembler.generateRet();
 
@@ -554,6 +556,8 @@ namespace instructions {
     struct VoidReturn: public IR0Instruction<"void_return", CTX> {
     PUB_VIRTUAL_COPY(VoidReturn)
         using IR0Instruction<"void_return", CTX>::IR0Instruction;
+
+        explicit VoidReturn(): IR0Instruction<"void_return", CTX>(SSARegisterHandle::invalid()) {}
 
         void generate(CTX::GEN& gen) override {
             gen.assembler.generateRet();

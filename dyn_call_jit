@@ -1,0 +1,32 @@
+r1 - subject (LoxValue)
+rr - result reg
+argz - list of regs/stack slots
+
+MAGIC_FUNCTION_MASK
+
+check_function:
+  mov r2, MAGIC_FUNCTION_MASK
+  and r2, r1
+  cmp r2, MAGIC_FUNCTION_MASK
+  jnz check_class
+do_function:
+  mov r2, r1
+  and r2, DATA_MASK
+  mov r3, [r2+function_offset]
+  add r3, user_data_offset
+
+  call r3, ...
+  mov rr, rax
+
+  jmp good_end
+check_class:
+  mov r2, MAGIC_CLASS_MASK
+  and r2, r1
+  cmp r2, MAGIC_CLASS_MASK
+do_class:
+  ...
+  jmp good_end
+bad_end:
+  halt
+good_end:
+  ...

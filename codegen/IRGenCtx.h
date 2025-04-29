@@ -197,6 +197,13 @@ struct IRGenCtx {
         return *static_cast<const SELF*>(this);
     }
 
+    static bool isNullOrTerminated(BaseBlock* bb) {
+        if (bb == nullptr) return true;
+        if (bb->isTerminated()) return true;
+
+        return false;
+    }
+
     Result<BaseBlock*> makeIf(
             std::function<Result<pair<SSARegisterHandle, BaseBlock*>>(SELF)> cond,
             std::function<Result<BaseBlock*>(SELF)> body,
@@ -215,13 +222,13 @@ struct IRGenCtx {
         ctx1.template pushInstruction<instructions::Branch<CTX>>(reg, ifBlock->id(), elsBlock->id());
 
         BaseBlock* nextBlock1 = nullptr;
-        if (ifBlockEnd != nullptr || elsBlockEnd != nullptr) {
+        if (not isNullOrTerminated(ifBlockEnd) || not isNullOrTerminated(elsBlockEnd)) {
             nextBlock1 = this->createBlock("if-next");
         }
-        if (ifBlockEnd != nullptr) {
+        if (not isNullOrTerminated(ifBlockEnd)) {
             ifBlockEnd->template pushInstruction<instructions::Jump<CTX>>(nextBlock1->id());
         }
-        if (elsBlockEnd != nullptr) {
+        if (not isNullOrTerminated(elsBlockEnd)) {
             elsBlockEnd->template pushInstruction<instructions::Jump<CTX>>(nextBlock1->id());
         }
         array pepa{ifBlockEnd, elsBlockEnd};
@@ -268,6 +275,9 @@ struct IRGenCtx {
         auto idk = withBlock(startBlock).withLoop(startBlock->id(), nextBlock1->id());
         BaseBlock* bodyEndBlock = TRY(body1(idk));
         if (bodyEndBlock != nullptr) {
+            /*for (auto [a, b] : phis) {
+                println("ASDASD {} - {}", a.toString(), b->target);
+            }*/
             withBlock(bodyEndBlock).commitReachableDefs(phis);
             bodyEndBlock->template pushInstruction<instructions::Jump<CTX>>(startBlock->id());
         }
@@ -285,6 +295,8 @@ struct IRGenCtx {
                 return cond(ctx2);
             }, [&](SELF ctx3) -> Result<BaseBlock*> {
                 return body(ctx3);
+            }, [&](SELF ctx3) -> Result<BaseBlock*> {
+                return ctx3.makeBreak();
             });
         });
 
@@ -301,12 +313,16 @@ struct IRGenCtx {
         return nullptr;
     }
 
+    BaseBlock& getBlock(size_t id) {
+        return gen.getBlock(id);
+    }
+
     Result<BaseBlock*> makeBreak() {
         assert(loopEnd.has_value());
         auto& block = this->getBlock(*loopEnd);
         auto phis = block.getPhiFunctions();
         this->commitReachableDefs(phis);
-        this->pushInstruction<instructions::Jump<CTX>>(*loopEnd);
+        this->pushInstruction<instructions::Jump>(*loopEnd);
 
         return nullptr;
     }

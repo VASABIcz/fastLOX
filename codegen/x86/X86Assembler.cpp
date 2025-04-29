@@ -274,6 +274,14 @@ size_t X86Assembler::preserveCalleeRegs(const std::function<X64Register::SaveTyp
     return acumulatedStackSize;
 }
 
+size_t X86Assembler::preserveCalleeRegs() {
+#ifdef LINUX
+    return  preserveCalleeRegs(sysVSave);
+#else
+    return  preserveCalleeRegs(fastCallSave);
+#endif
+}
+
 void X86Assembler::movInt(Assembler::RegisterHandle dest, u64 value, size_t offsetBytes) {
     if (RegAlloc::isStack(dest)) {
         withTempReg([&](X64Register reg) -> void {
@@ -593,7 +601,7 @@ void X86Assembler::twoWayWrapper(size_t tgt, size_t lhs, size_t rhs, auto fun) {
 }
 
 
-void X86Assembler::withSavedCallRegs(span<const X64Register> exclude, const std::function<X64Register::SaveType(const X64Register&)>& convention, const std::function<void(const map<X64Register, size_t>&)>& callback) {
+void X86Assembler::withSavedCallRegs(span<const X64Register> exclude, span<const X64Register> excluceRestore, const std::function<X64Register::SaveType(const X64Register&)>& convention, const std::function<void(const map<X64Register, size_t>&)>& callback) {
     auto saved = allocator.saveCallRegs(exclude, convention);
 
     for (const auto& [reg, stackHandle]: saved) {
@@ -603,6 +611,7 @@ void X86Assembler::withSavedCallRegs(span<const X64Register> exclude, const std:
     callback(saved);
 
     for (const auto& [reg, stackHandle]: saved) {
+        if (std::ranges::find(excluceRestore, reg) != excluceRestore.end()) continue;
         mc.readStack(allocator.getStackOffset(stackHandle), reg);
     }
 
@@ -625,16 +634,6 @@ void X86Assembler::f64ToInt(RegisterHandle dest, RegisterHandle value) {
         // flush result to original destination
         movRegToHandle(dest, dst);
     }, dest, value);
-}
-
-void X86Assembler::moveToArgRegs(span<const X64Register> args) {
-    auto argRegs = X64Register::argRegs();
-    assert(args.size() <= argRegs.size());
-
-    for (const auto& [srcReg, callReg] : views::zip(args, argRegs)) {
-        if (srcReg == callReg) continue;
-        mc.movReg(callReg, srcReg);
-    }
 }
 
 void X86Assembler::writeJmp(string_view label) {
@@ -717,22 +716,6 @@ void X86Assembler::callC(size_t label, span<const RegisterHandle> args, optional
     }
 
     chadCall(Arg::Symbol(label), argz, idk);
-}
-
-vector<X64Register> X86Assembler::moveRegsToArgs(span<const RegisterHandle> handles, size_t argsOffset, const map<X64Register, size_t>& preserved, bool isFirstPtr) {
-    auto argRegs = X64Register::argRegs();
-    vector<X64Register> clobbered;
-
-    bool isFirst = true;
-    for (auto handle : handles) {
-        auto reg = argRegs[argsOffset++];
-        clobbered.push_back(reg);
-
-        movToArgRegVIPLCallingConvention(reg, handle, preserved, isFirst && isFirstPtr);
-        isFirst = false;
-    }
-
-    return clobbered;
 }
 
 void X86Assembler::movSymbol(Assembler::RegisterHandle handle, size_t name) {
@@ -961,7 +944,7 @@ void X86Assembler::movStackToReg(const X64Register& dst, size_t adrHandle, int s
         mc.readStack(offset, dst);
     }
     else {
-        println("[WARN] trying to move {} from stack to reg -- moving only REG_SIZE", size);
+        // println("[WARN] trying to move {} from stack to reg -- moving only REG_SIZE", size);
         mc.readStack(offset, dst);
     }
 }
@@ -1175,12 +1158,26 @@ size_t X86Assembler::calculateStackSizeFastCall(span<const RegisterHandle> args)
 
 void X86Assembler::invokeScuffedSYSV(Arg func, span<Arg> args, optional<Arg> ret) {
     vector<X64Register> exclude;
+    vector<X64Register> excludeRestore;
+
     if (ret.has_value() && ret->type == Arg::REGISTER) {
-        exclude.push_back(ret->reg);
+        bool contains = false;
+        for (auto arg : args) {
+            // if ret reg is the same as any arg reg, preserve it but dont restore it
+            if (arg.type == Arg::REGISTER && arg.reg == ret->reg) {
+                contains = true;
+                break;
+            }
+        }
+        if (contains) {
+            excludeRestore.push_back(ret->reg);
+        } else {
+            exclude.push_back(ret->reg);
+        }
     }
 
-    withSavedCallRegs(exclude, sysVSave, [&](const auto& saved){
-        mc.invokeScuffedSYSV(func, args, ret, saved, [&](auto dst, auto sym) {
+    withSavedCallRegs(exclude, excludeRestore, sysVSave, [&](const auto& saved){
+        mc.invokeScuffedSYSV2(func, args, ret, saved, [&](auto dst, auto sym) {
             generateArgMove(dst, sym);
         });
     });
@@ -1188,11 +1185,25 @@ void X86Assembler::invokeScuffedSYSV(Arg func, span<Arg> args, optional<Arg> ret
 
 void X86Assembler::invokeScuffedFastCall(Arg func, span<Arg> args, optional<Arg> ret) {
     vector<X64Register> exclude;
+    vector<X64Register> excludeRestore;
+
     if (ret.has_value() && ret->type == Arg::REGISTER) {
-        exclude.push_back(ret->reg);
+        bool contains = false;
+        for (auto arg : args) {
+            // if ret reg is the same as any arg reg, preserve it but dont restore it
+            if (arg.type == Arg::REGISTER && arg.reg == ret->reg) {
+                contains = true;
+                break;
+            }
+        }
+        if (contains) {
+            excludeRestore.push_back(ret->reg);
+        } else {
+            exclude.push_back(ret->reg);
+        }
     }
 
-    withSavedCallRegs(exclude, fastCallSave, [&](const auto& saved){
+    withSavedCallRegs(exclude, excludeRestore, fastCallSave, [&](const auto& saved){
         mc.invokeScuffedFastCall(func, args, ret, saved, [&](auto dst, auto sym) {
                                      generateArgMove(dst, sym);
                                  }, [&](auto amount){ return allocator.getStackOffset(allocator.allocateStack(amount)); });
@@ -1207,7 +1218,7 @@ void X86Assembler::chadCall(Arg fun, span<Arg> args, optional<Arg> ret) {
 #endif
 }
 
-CmpType toCmpType(JumpCondType it) {
+CmpType X86Assembler::toCmpType(JumpCondType it) {
     switch (it) {
         case JumpCondType::EQUALS: return CmpType::Equal;
         case JumpCondType::NOT_EQUALS: return CmpType::NotEqual;
@@ -1215,6 +1226,18 @@ CmpType toCmpType(JumpCondType it) {
         case JumpCondType::GREATER_OR_EQUAL: return CmpType::GreaterOrEqual;
         case JumpCondType::LESS: return CmpType::Less;
         case JumpCondType::LESS_OR_EQUAL: return CmpType::LessOrEqual;
+    }
+    PANIC()
+}
+
+CmpType X86Assembler::toCmpType2(JumpCondType it) {
+    switch (it) {
+        case JumpCondType::EQUALS: return CmpType::Equal;
+        case JumpCondType::NOT_EQUALS: return CmpType::NotEqual;
+        case JumpCondType::GREATER: return CmpType::Above;
+        case JumpCondType::GREATER_OR_EQUAL: return CmpType::AboveEqual;
+        case JumpCondType::LESS: return CmpType::Bellow;
+        case JumpCondType::LESS_OR_EQUAL: return CmpType::BellowOrEqual;
     }
     PANIC()
 }

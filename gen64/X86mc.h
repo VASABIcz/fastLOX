@@ -128,6 +128,14 @@ struct Arg {
         return idk;
     }
 
+    static Arg ImmPtrC(const void* value) {
+        Arg idk;
+        idk.type = Type::IMMEDIATE;
+        idk.immValue = std::bit_cast<size_t>(value);
+
+        return idk;
+    }
+
     static Arg Rel32Adr(size_t symbol, int32_t adent) {
         Arg idk;
         idk.symbol = symbol;
@@ -184,6 +192,12 @@ public:
         return current;
     }
 
+    void doNot(X64Register reg) {
+        writeRex(true, false, reg.isExt());
+        pushBack(0xF7);
+        writeModRM(X64Register::Two, reg);
+    }
+
     void writeRex(bool immediate64 = false, bool extDest = false, bool extSrc = false, bool extIndex = false);
 
     void writeModRM(const X64Register& dest, const X64Register& src, bool isRegDirect = true, bool isNoOffset = false, u8 orFlag = 0x5);
@@ -230,7 +244,7 @@ public:
         } else if (amount == 4) {
             write4(X64Register::Rsp, src, offset);
         } else {
-            println("[WARN] THIS ALSO DOESNT SEEM GUD, INVESTIGATE ONE DAY WHY CANT WE ASSERT 8 BYTES");
+            // println("[WARN] THIS ALSO DOESNT SEEM GUD, INVESTIGATE ONE DAY WHY CANT WE ASSERT 8 BYTES");
             // assert(amount == 8);
             writePtr(X64Register::Rsp, src, offset);
         }
@@ -350,6 +364,25 @@ public:
     void ret();
 
     void cmpI(CmpType type, const X64Register& dest, const X64Register& left, const X64Register& right);
+
+    ImmSpace cmpImm(const X64Register& subj, i32 imm) {
+        writeRex(true, false, subj.isExt());
+        pushBack(0x81);
+        writeModMR(subj, X64Register::Seven);
+        return this->writeImmValue(imm);
+    }
+
+    bool canFitToI8(i32 v) {
+        return v <= 127 && v >= -128;
+    }
+
+    ImmSpace cmpImm(const X64Register& subj, i32 offset, i32 imm) {
+        writeRex(true, false, subj.isExt());
+        auto canFit = canFitToI8(imm);
+        pushBack(canFit ? 0x83 : 0x81);
+        someOffsetStuffForMov(X64Register::Seven, subj, offset);
+        return (canFit ? this->writeImmValue((i8)imm) : this->writeImmValue(imm));
+    }
 
     void shiftLeftByCl(const X64Register& dest);
 
@@ -606,11 +639,14 @@ public:
         size_t allocatedStack = 0;
         size_t allocatedArgs = 0;
 
-        /// if user wants the return value insde reg dont preserve it
-        vector<X64Register> dontPreserve;
-        if (ret.has_value() && ret->type == Arg::REGISTER) {
-            dontPreserve.push_back(ret->reg);
-        }
+        auto movArgToReg = [&](const X64Register& dst, const X64Register& reg) {
+            if (CLOBBER_SET.contains(reg)) {
+                assert(saved.contains(reg));
+                readStack(saved.at(reg)+allocatedStack, dst);
+            } else {
+                movReg(dst, reg);
+            }
+        };
 
         /// LAMBDA THAT returins register or if its clobbered reads it from stack and returns temporary one
         auto movToReg = [&](const X64Register& reg) {
@@ -633,14 +669,20 @@ public:
         /// values that are passed over stack
         vector<Arg> toBeStackPassed;
 
-        /// try to populate arg regs
+        const auto getAllocatedReg = [&](size_t idex) {
+          assert(idex < SYSV_REGS.size());
+
+            return SYSV_REGS[idex];
+        };
+
+        // try to populate arg regs
         for (const auto& arg : args) {
-            /// value can fit into single arg reg
+            // value can fit into single arg reg
             if (arg.sizeBytes() <= 8 && allocatedArgs < SYSV_REGS.size()) {
-                auto argReg = SYSV_REGS[allocatedArgs];
+                auto argReg = getAllocatedReg(allocatedArgs);
                 switch (arg.type) {
                     case Arg::REGISTER:
-                        movReg(argReg, movToReg(arg.reg));
+                        movArgToReg(argReg, arg.reg);
                         break;
                     case Arg::IMMEDIATE:
                         mov(argReg, arg.immValue);
@@ -659,10 +701,9 @@ public:
                 }
                 allocatedArgs += 1;
             }
-                /// value can fit into 2 arg regs
-            else if (arg.sizeBytes() <= 16 && allocatedArgs <= SYSV_REGS.size()-2) {
-                auto argRegA = SYSV_REGS[allocatedArgs];
-                auto argRegB = SYSV_REGS[allocatedArgs+1];
+            else if (arg.sizeBytes() <= 16 && allocatedArgs <= SYSV_REGS.size()-2) { // value can fit into 2 arg regs
+                auto argRegA = getAllocatedReg(allocatedArgs);
+                auto argRegB = getAllocatedReg(allocatedArgs+1);
                 switch (arg.type) {
                     case Arg::REGISTER:
                     case Arg::IMMEDIATE:
@@ -680,8 +721,7 @@ public:
                 }
                 allocatedArgs += 2;
             }
-                /// value cant fit into arg regs
-            else {
+            else { // value cant fit into arg regs
                 toBeStackPassed.push_back(arg);
             }
         }
@@ -739,10 +779,11 @@ public:
             }
         }
 
-        /// move function ptr to TMP_REG
+        /// move function ptr to CALL_REG
+        X64Register CALL_REG = TMP_REG;
         switch (func.type) {
             case Arg::REGISTER:
-                movReg(TMP_REG, movToReg(func.reg));
+                CALL_REG = movToReg(func.reg);
                 break;
             case Arg::IMMEDIATE:
                 mov(TMP_REG, func.immValue);
@@ -767,7 +808,7 @@ public:
         }
 
         /// invoke function
-        call(TMP_REG);
+        call(CALL_REG);
 
         /// restore stack if any
         if (allocatedStack != 0) {
@@ -787,7 +828,246 @@ public:
                 case Arg::SYMBOL_RIP_VALUE_32:
                     PANIC("invalid ret type");
                 case Arg::REGISTER:
-                    movReg(ret->reg, X64Register::Rax);
+                    movReg(ret->reg, RET_REG);
+                    break;
+                case Arg::REG_OFFSET_VALUE:
+                    if (ret->size <= 8) {
+                        writeMem(movToReg(ret->reg), RET_REG, ret->offset, ret->size);
+                    }
+                    else if (ret->size <= 16) {
+                        writeMem(movToReg(ret->reg), RET_REG, ret->offset, 8);
+                        writeMem(movToReg(ret->reg), RET_REG2, ret->offset+8, ret->size-8);
+                    }
+                    else {
+                        // do nothing, we passed ptr in Rdi that will be filled with return value
+                    }
+                    break;
+            }
+        }
+    }
+
+    void invokeScuffedSYSV2(Arg func, span<Arg> args, optional<Arg> ret, const map<X64Register, size_t>& saved, std::function<void(X64Register, Arg)> movLabel) {
+        /// 6GP registers used for passing arguments
+        const std::array<X64Register, 6> SYSV_REGS{X64Register::Rdi, X64Register::Rsi, X64Register::Rdx, X64Register::Rcx, X64Register::R8, X64Register::R9};
+        /// temporaries for local use
+        const auto TMP_REG = X64Register::R10;
+        const auto TMP_REG2 = X64Register::Rax;
+        /// 2GP registers that are used to return values
+        const auto RET_REG = X64Register::Rax;
+        const auto RET_REG2 = X64Register::Rdx;
+
+        /// list of registers that cant be accesed, bcs they are regs or temporaries for local use
+        /// the stack preserved version should be used
+        set<X64Register> CLOBBER_SET;
+
+        size_t allocatedStack = 0;
+        size_t allocatedArgs = 0;
+
+        auto markClobbered = [&](const X64Register& reg) {
+            CLOBBER_SET.insert(reg);
+        };
+
+        auto movArgToReg = [&](const X64Register& dst, const X64Register& reg) {
+            if (CLOBBER_SET.contains(reg)) {
+                assert(saved.contains(reg));
+                readStack(saved.at(reg)+allocatedStack, dst);
+            } else {
+                movReg(dst, reg);
+            }
+
+            markClobbered(dst);
+        };
+
+        /// LAMBDA THAT returins register or if its clobbered reads it from stack and returns temporary one
+        auto movToReg = [&](const X64Register& reg) {
+            if (CLOBBER_SET.contains(reg)) {
+                assert(saved.contains(reg));
+                readStack(saved.at(reg)+allocatedStack, TMP_REG);
+                markClobbered(TMP_REG);
+                return TMP_REG;
+            }
+            return reg;
+        };
+
+        /// if return type is larger than 16, caller passes buffer in rdi
+        if (ret.has_value() && ret->sizeBytes() > 16) {
+            /// I can just take the address of th reg + offset size change and pass it
+            assert(ret->type == Arg::Type::REG_OFFSET_VALUE);
+            lea(X64Register::Rdi, ret->reg, ret->offset);
+            markClobbered(X64Register::Rdi);
+            allocatedArgs += 1;
+        }
+
+        /// values that are passed over stack
+        vector<Arg> toBeStackPassed;
+
+        const auto getAllocatedReg = [&](size_t idex) {
+          assert(idex < SYSV_REGS.size());
+
+            return SYSV_REGS[idex];
+        };
+
+        // try to populate arg regs
+        for (const auto& arg : args) {
+            // value can fit into single arg reg
+            if (arg.sizeBytes() <= 8 && allocatedArgs < SYSV_REGS.size()) {
+                auto argReg = getAllocatedReg(allocatedArgs);
+                switch (arg.type) {
+                    case Arg::REGISTER:
+                        movArgToReg(argReg, arg.reg);
+                        break;
+                    case Arg::IMMEDIATE:
+                        mov(argReg, arg.immValue);
+                        break;
+                    case Arg::SYMBOL:
+                    case Arg::SYMBOL_RIP_OFF_32: // FIXME this could be gened here
+                    case Arg::SYMBOL_RIP_VALUE_32: // FIXME this could be gened here
+                        movLabel(argReg, arg);
+                        break;
+                    case Arg::REG_OFFSET:
+                        lea(argReg, movToReg(arg.reg), arg.offset);
+                        break;
+                    case Arg::REG_OFFSET_VALUE:
+                        readMem(argReg, movToReg(arg.reg), arg.offset, arg.sizeBytes());
+                        break;
+                }
+                markClobbered(argReg);
+                allocatedArgs += 1;
+            }
+            else if (arg.sizeBytes() <= 16 && allocatedArgs <= SYSV_REGS.size()-2) { // value can fit into 2 arg regs
+                auto argRegA = getAllocatedReg(allocatedArgs);
+                auto argRegB = getAllocatedReg(allocatedArgs+1);
+                switch (arg.type) {
+                    case Arg::REGISTER:
+                    case Arg::IMMEDIATE:
+                    case Arg::SYMBOL:
+                    case Arg::REG_OFFSET:
+                    case Arg::SYMBOL_RIP_OFF_32:
+                    case Arg::SYMBOL_RIP_VALUE_32:
+                        PANIC("these values are only 8B");
+                    case Arg::REG_OFFSET_VALUE: {
+                        auto srcReg = movToReg(arg.reg);
+                        readMem(argRegA, srcReg, arg.offset, 8);
+                        markClobbered(argRegA);
+                        readMem(argRegB, srcReg, arg.offset+8, arg.sizeBytes()-8);
+                        markClobbered(argRegB);
+                        break;
+                    }
+                }
+                allocatedArgs += 2;
+            }
+            else { // value cant fit into arg regs
+                toBeStackPassed.push_back(arg);
+            }
+        }
+
+        /// DO WE NEED TO PASS ANYTHING BY STACK?
+        if (not toBeStackPassed.empty()) {
+            /// calculate required stack size
+            allocatedStack = 0;
+            for (auto arg : toBeStackPassed) {
+                allocatedStack += align(arg.sizeBytes(), 8);
+            }
+
+            /// ALIGN STACK TO 16B
+            allocatedStack = align(allocatedStack, 16);
+
+            /// allocate stack for args
+            subImm32(X64Register::Rsp, allocatedStack);
+
+            size_t currentOffset = 0;
+            // NOTE: arguments are pushed reversed, but we are iterating normaly bcs we are population stack from lower to upper addresses
+            /// move values to stack slots
+            for (auto arg : toBeStackPassed) {
+                switch (arg.type) {
+                    case Arg::REGISTER:
+                        // NOTE: we can move the whole 8B register onto stack bcs all args should be extended to 8B
+                        // so if we have 4B reg and the othe 4B has junk we can freely move it bcs user shouldnt access them
+                        writeStack(currentOffset, movToReg(arg.reg));
+                        break;
+                    case Arg::IMMEDIATE:
+                        mov(TMP_REG, arg.immValue);
+                        writeStack(currentOffset, TMP_REG);
+                        markClobbered(TMP_REG);
+                        break;
+                    case Arg::SYMBOL:
+                    case Arg::SYMBOL_RIP_OFF_32: // FIXME these could be gened here
+                    case Arg::SYMBOL_RIP_VALUE_32:
+                        movLabel(TMP_REG, arg);
+                        writeStack(currentOffset, TMP_REG);
+                        markClobbered(TMP_REG);
+                        break;
+                    case Arg::REG_OFFSET: {
+                        auto srcReg = movToReg(arg.reg);
+                        // NOTE: we need to callculate the original Rsp offset bcs we FUCKED IT UP with the sub Rsp
+                        auto srcOffset = (srcReg == X64Register::Rsp) ? arg.offset + allocatedStack : arg.offset;
+                        lea(TMP_REG, srcReg, srcOffset); // FIXME do i need TMP_REG2 instead TMP_REG here????? i dont right
+                        writeStack(currentOffset, TMP_REG);
+                        markClobbered(TMP_REG);
+                        break;
+                    }
+                    case Arg::REG_OFFSET_VALUE: {
+                        auto srcReg = movToReg(arg.reg);
+                        auto srcOffset = (srcReg == X64Register::Rsp) ? arg.offset + allocatedStack : arg.offset;
+                        garbageMemCpy(X64Register::Rsp, srcReg, arg.sizeBytes(), TMP_REG2, srcOffset, currentOffset);
+                        markClobbered(TMP_REG2);
+                        break;
+                    }
+                }
+                currentOffset += align(arg.sizeBytes(), 8);
+            }
+        }
+
+        /// move function ptr to CALL_REG
+        X64Register CALL_REG = TMP_REG;
+        switch (func.type) {
+            case Arg::REGISTER:
+                CALL_REG = movToReg(func.reg);
+                break;
+            case Arg::IMMEDIATE:
+                mov(TMP_REG, func.immValue);
+                break;
+            case Arg::SYMBOL:
+            case Arg::SYMBOL_RIP_OFF_32: // FIXME these could be gened here
+            case Arg::SYMBOL_RIP_VALUE_32:
+                movLabel(TMP_REG, func);
+                break;
+            case Arg::REG_OFFSET: {
+                auto srcReg = movToReg(func.reg);
+                auto srcOffset = (srcReg == X64Register::Rsp) ? func.offset + allocatedStack : func.offset;
+                lea(TMP_REG, srcReg, srcOffset);
+                break;
+            }
+            case Arg::REG_OFFSET_VALUE: {
+                auto srcReg = movToReg(func.reg);
+                auto srcOffset = (srcReg == X64Register::Rsp) ? func.offset + allocatedStack : func.offset;
+                readPtr(TMP_REG, srcReg, srcOffset);
+                break;
+            }
+        }
+
+        /// invoke function
+        call(CALL_REG);
+
+        /// restore stack if any
+        if (allocatedStack != 0) {
+            addImm32(X64Register::Rsp, allocatedStack);
+        }
+
+        /// DONT! compensate for any allocated stack its freed now
+        allocatedStack = 0;
+
+        /// move return value if any to desired place
+        if (ret.has_value()) {
+            switch (ret->type) {
+                case Arg::IMMEDIATE:
+                case Arg::SYMBOL:
+                case Arg::REG_OFFSET:
+                case Arg::SYMBOL_RIP_OFF_32:
+                case Arg::SYMBOL_RIP_VALUE_32:
+                    PANIC("invalid ret type");
+                case Arg::REGISTER:
+                    movReg(ret->reg, RET_REG);
                     break;
                 case Arg::REG_OFFSET_VALUE:
                     if (ret->size <= 8) {

@@ -63,7 +63,11 @@ public:
     size_t toHandleStupid(const X64Register& reg) {
         assert(isAcquired(reg));
 
-        return acquireSpecific(reg);
+        for (auto i = 0UL; i < regs64.size(); i++) {
+            if (regs64[i] == reg) return i;
+        }
+
+        PANIC();
     }
 
     size_t acquireSpecific(const X64Register& reg);

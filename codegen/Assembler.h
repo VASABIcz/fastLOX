@@ -71,6 +71,33 @@ public:
         Double
     };
 
+    virtual std::string toString(size_t hand) {
+        return "NO-STUFF";
+    }
+
+    // 0 -> reg+0
+    // 8 -> reg+8
+    // 0 0 -> [reg+0]+0
+    // 8 8 -> [reg+8]+8
+    // 8 8 8 -> [[reg+8]+8]+8
+    void derefChain(size_t reg, span<const int> offsets) {
+        if (offsets.empty()) return;
+
+        for (size_t i = 0; i < offsets.size() - 1; i++) {
+            readMem(reg, reg, offsets[i], 8);
+        }
+
+        if (offsets.back() != 0) {
+            auto v = movImmValueToReg(offsets.back());
+            addInt(reg, reg, v);
+            freeRegister(v);
+        }
+    }
+
+    void derefChainI(size_t reg, std::initializer_list<int> offsets) {
+        derefChain(reg, offsets);
+    }
+
     virtual ~Assembler() = default;
 
     typedef size_t RegisterHandle;
@@ -108,6 +135,10 @@ public:
     virtual void modInt(RegisterHandle dest, RegisterHandle left, RegisterHandle right) WRAPPED(MOD);
     virtual void geInt(RegisterHandle dest, RegisterHandle left, RegisterHandle right) WRAPPED(GE);
     virtual void leInt(RegisterHandle dest, RegisterHandle left, RegisterHandle right) WRAPPED(LE);
+
+    void notBits(RegisterHandle dst, RegisterHandle src) {
+
+    }
 
     // float ops
     virtual void arithmeticFloat(ArithmeticOp op, FloatingPointType type, RegisterHandle tgt, RegisterHandle lhs, RegisterHandle rhs) {};
@@ -164,6 +195,10 @@ public:
         return reg;
     }
 
+    size_t movImmPtrToReg(void* value) {
+        return movImmValueToReg(bit_cast<i64>(value));
+    }
+
     virtual RegisterHandle allocateRegister(size_t size) = 0;
     virtual RegisterHandle allocateStack(size_t size) = 0;
     virtual void freeRegister(RegisterHandle handle) = 0;
@@ -171,4 +206,7 @@ public:
     virtual void print() const = 0;
     virtual void instructionNumberHint(size_t id) {}
     virtual void nop() = 0;
+    virtual void trap() {
+
+    }
 };

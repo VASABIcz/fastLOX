@@ -17,7 +17,7 @@ namespace cg {
         auto* ptr = VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE);
 #endif
 
-        println("ALLOCATED EXECTUABLE PAGE {}", ptr);
+        // println("ALLOCATED EXECTUABLE PAGE {}", ptr);
         assert(ptr != nullptr);
         return ptr;
     }

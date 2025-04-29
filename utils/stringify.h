@@ -205,6 +205,7 @@ struct StringChecker {
 
     consteval auto validate() const {
         if (inner.empty() && argCount() != 0) invalidArgumentCount();
+        if (inner.empty() && argCount() == 0) return;
 
         char a, b = '\0';
         size_t counter = 0u;

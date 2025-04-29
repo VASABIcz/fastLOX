@@ -45,10 +45,19 @@ public:
 
     void initializeFastCall();
 
+    std::string toString(size_t handle) override {
+        if (allocator.isStack(handle)) {
+            return stringify("rsp+{}", allocator.getStackOffset(handle));
+        }
+        return allocator.getReg(handle).toString();
+    }
+
     static unique_ptr<Assembler> create(span<size_t> argSizes, size_t retSize);
 
     vector<RegisterHandle> getArgHandles() override;
     void print() const override;
+
+    void allocRegSpilling();
 
     // int operations
     void divInt(RegisterHandle dest, RegisterHandle left, RegisterHandle right) override;
@@ -99,6 +108,9 @@ public:
     void readMem(RegisterHandle tgt, RegisterHandle obj, size_t offset, size_t amount) override;
     void writeMem(RegisterHandle obj, RegisterHandle value, size_t offset, size_t amount) override;
     void addressOf(Assembler::RegisterHandle tgt, Assembler::RegisterHandle obj) override;
+
+    CmpType toCmpType(JumpCondType it);
+    CmpType toCmpType2(JumpCondType it);
 
     // register primitives
     void movInt(Assembler::RegisterHandle dest, u64 value, size_t offsetBytes = 0) override;
@@ -162,7 +174,7 @@ public:
         spaces["GOT-GOT"].push_back(Label{static_cast<long>(space.offset), static_cast<int>(space.size), Label::Type::GOT, index});
     }
 
-    void withSavedCallRegs(span<const X64Register> exclude, const std::function<X64Register::SaveType(const X64Register&)>& convention, const std::function<void(const map<X64Register, size_t>&)>& callback);
+    void withSavedCallRegs(span<const X64Register> exclude, span<const X64Register> excluceRestore, const std::function<X64Register::SaveType(const X64Register&)>& convention, const std::function<void(const map<X64Register, size_t>&)>& callback);
 
     void callC(size_t label, span<const RegisterHandle> args, optional<RegisterHandle> ret);
 
@@ -180,10 +192,6 @@ public:
         chadCall(label, argz, idk);
     }
 
-    vector<X64Register> moveRegsToArgs(span<const RegisterHandle> handles, size_t argsOffset, const map<X64Register, size_t>& preserved, bool isFirstPtr = false);
-
-    void moveToArgRegs(span<const X64Register> args);
-
     void writeJmp(CmpType jmp, string_view label);
 
     void writeJmp(string_view label);
@@ -192,13 +200,7 @@ public:
 
     size_t preserveCalleeRegs(const std::function<X64Register::SaveType(X64Register)>& save);
 
-    size_t preserveCalleeRegs() {
-#ifdef LINUX
-        return  preserveCalleeRegs(sysVSave);
-#else
-        return  preserveCalleeRegs(fastCallSave);
-#endif
-    }
+    size_t preserveCalleeRegs();
 
     void patchStackSize(size_t stackSize);
 
@@ -218,6 +220,109 @@ public:
 
     template<typename T>
     void withTempReg(T callback, span<const X64Register> a);
+
+    struct RegAllocCtx {
+        X86Assembler* self;
+        std::set<X64Register> used;
+        std::map<X64Register, size_t> toRestore;
+        std::map<size_t, size_t> toWriteback;
+        std::set<size_t> toFree;
+
+        RegAllocCtx(X86Assembler* self): self(self) {}
+
+        RegAllocCtx(const RegAllocCtx&) = delete;
+
+        /// allocate register ensure its not stack
+        size_t allocReg() {
+            auto [reg, didSpill] = self->allocator.allocateEvenClobered(used);
+            assert(not used.contains(reg));
+            used.insert(reg);
+            if (didSpill) {
+                // println("[reg-ctx] did spill {}", reg);
+                auto hand = self->dumpToStack(reg);
+                toRestore.insert({reg, hand});
+            } else {
+                toFree.emplace(self->allocator.toHandleStupid(reg));
+            }
+
+            return self->allocator.toHandleStupid(reg);
+        }
+
+        // will return proper reg handle to slot where its stored, eg if we saved this reg to stack so we can use it as tmp, we will return stack hancle
+        size_t originalTransform(size_t idk) {
+            if (self->allocator.isStack(idk)) return idk;
+
+            if (this->toRestore.contains(self->allocator.getReg(idk))) {
+                return this->toRestore[self->allocator.getReg(idk)];
+            } else {
+                return idk;
+            }
+        }
+
+        std::vector<size_t> originalTransform(span<size_t> idk) {
+            std::vector<size_t> res;
+            res.reserve(idk.size());
+            for (auto p : idk) {
+                res.push_back(originalTransform(p));
+            }
+
+            return res;
+        }
+
+        /// get the backing register
+        X64Register REG(size_t handle) {
+            return self->allocator.getReg(handle);
+        }
+
+        /// if handle is register do nothing, else move value to reg
+        RegisterHandle ensureReg(RegisterHandle handle) {
+            if (not self->allocator.isStack(handle)) {
+                assert(not used.contains(self->allocator.getReg(handle)));
+                used.insert(self->allocator.getReg(handle));
+                return handle;
+            }
+
+            auto reg = allocReg();
+
+            self->movReg(reg, handle);
+
+            return reg;
+        }
+
+        RegisterHandle ensureRegWriteback(RegisterHandle handle) {
+            if (not self->allocator.isStack(handle)) {
+                assert(not used.contains(self->allocator.getReg(handle)));
+                used.insert(self->allocator.getReg(handle));
+                return handle;
+            }
+
+            auto reg = allocReg();
+
+            self->movReg(reg, handle);
+            toWriteback.insert({reg, handle});
+
+            return reg;
+        }
+
+        /// if we had to spill any registers restore them
+        void restore() {
+            for (auto [reg, stack] : toWriteback) {
+                self->movReg(stack, reg);
+                self->freeRegister(reg);
+            }
+            for (auto [reg, hand] : toRestore) {
+                self->movHandleToReg(reg, hand);
+                self->freeRegister(hand);
+            }
+            for (auto f : toFree) {
+                self->allocator.freeHandle(f);
+            }
+        }
+    };
+
+    RegAllocCtx getAllocCtx() {
+        return {this};
+    }
 
     // function that will either get reg or
     // allocate temp reg
@@ -356,5 +461,11 @@ public:
     template<typename T>
     void patchLabel(Label l, T value) {
         std::memcpy(bytes.data()+l.index, &value, sizeof value);
+    }
+
+    void trap() override {
+        // mc.pushBack(0xCD);
+        mc.pushBack(0xCC);
+        // mc.hlt();
     }
 };

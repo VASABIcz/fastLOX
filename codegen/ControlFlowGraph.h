@@ -638,7 +638,7 @@ struct ControlFlowGraph {
         for (const auto& [fst, snd]: end) {
             if (phis.contains(fst)) {
                 auto* phiRef = phis[fst];
-                if (phiRef->target == snd) continue;
+                // if (phiRef->target == snd) continue;
                 // if (gen.getRecord(phiRef->getVersions()[0]).version > gen.getRecord(fst).version) return;
 
                 phiRef->pushVersion(snd, endBlock.blockId);
