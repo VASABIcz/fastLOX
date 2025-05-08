@@ -307,7 +307,10 @@ enum class HookedVariableType {
     LOCAL,
     UPVAL,
     GLOBAL,
-    ALLOC_UPVAL
+    ALLOC_UPVAL,
+    // values that don't need to be allocated bcs they are imutable
+    ALLOC_CONST_UPVAL,
+    CONST_UPVAL
 };
 
 struct SpecializedVariable {
@@ -323,6 +326,10 @@ struct SpecializedVariable {
         return SpecializedVariable{HookedVariableType::ALLOC_UPVAL, id, 0};
     }
 
+    static SpecializedVariable AllocateConstCaptured(size_t id) {
+        return SpecializedVariable{HookedVariableType::ALLOC_CONST_UPVAL, id, 0};
+    }
+
     string toString() const {
         using enum HookedVariableType;
         switch (type) {
@@ -334,6 +341,11 @@ struct SpecializedVariable {
                 return stringify("GLOBAL {}", id);
             case ALLOC_UPVAL:
                 return stringify("ALLOC_UPVAL {}:{}", id, frameId);
+            case ALLOC_CONST_UPVAL:
+                return stringify("ALLOC_CONST_UPVAL {}:{}", id, frameId);
+            case CONST_UPVAL:
+                return stringify("CONST_UPVAL {}:{}", id, frameId);
+
         }
         PANIC();
     }
@@ -406,7 +418,8 @@ struct Function: Statement {
     vector<ASTStm> body;
     STRUCT_END(Function)
 
-    vector<bool> locals;
+    vector<bool> locals; // index is local id, value indicates if local escapes
+    vector<bool> isModified; // index is local id, value indicates if local is modified
     vector<size_t> captures; // list of parent function up-local-ids that we capture
     // size_t upValCount = 0;
     SpecTarget hookedTarget;
@@ -1487,6 +1500,7 @@ struct ClassRef {
     Class* clazz;
     ClassRef* super;
     FunctionRef* parent;
+    std::unordered_map<u32, FunctionRef*> methods;
 
     Function* getConstructor() {
         auto res = clazz->getMethod(CONSTRUCTOR_ID);
@@ -1800,6 +1814,8 @@ struct ASTExecutor;
 
 ASTExecutor* RUNTIME = nullptr;
 
+FunctionRef* createMethod(Function* f1, FunctionRef* parent, ObjectRef* self);
+
 struct ObjectRef {
     ClassRef* clazz;
     ObjectRef* proto;
@@ -1816,16 +1832,6 @@ struct ObjectRef {
         }
         return nullptr;
     }
-
-    // vector<FunctionRef*> methods;
-
-/*    LoxValue getMethod(const string& name) {
-        for (auto m : methods) {
-            if (m->func->data.name == name) return LoxValue::Function(m);
-        }
-        if (proto != nullptr) return proto->getMethod(name);
-        PANIC();
-    }*/
 
     LoxValue read(u32 name) {
         if (fields->contains(name)) return fields->at(name);
@@ -1847,10 +1853,8 @@ struct ObjectRef {
         }
         if (m == nullptr) PANIC();
 
-        return LoxValue::Function(createMethod(m));
+        return LoxValue::Function(createMethod(m, clazz->parent, this));
     }
-
-    FunctionRef* createMethod(Function* f1);
 };
 
 size_t toUpvalId(const vector<bool>& locals, size_t id) {
@@ -1890,6 +1894,7 @@ size_t toLocalId(const vector<bool>& locals, size_t id) {
 // translate local names to index in parameter table
 // - deshadow locals
 // - determine if local is captured
+// assign integer value to unique field names
 struct Linerizer: ASTVisitor {
     enum class IdentOp {
         READ,
@@ -1911,6 +1916,11 @@ struct Linerizer: ASTVisitor {
         bool isEscaped() {
             return source->locals[relLocalId];
         }
+
+        bool isModified() {
+            assert(relLocalId < source->isModified.size());
+            return source->isModified[relLocalId];
+        }
     };
     vector<HookData> hookList;
 
@@ -1926,14 +1936,30 @@ struct Linerizer: ASTVisitor {
     };
 
     struct StackScope {
-        Function* function;
+    private:
         vector<bool> isUpVal;
+        vector<bool> isModified;
+    public:
+        void init(Function* f) {
+            assert(f->locals.empty());
+            assert(f->isModified.empty());
+            f->locals = isUpVal;
+            f->isModified = isModified;
+        }
 
+        size_t rawRegisterLocal() {
+            isUpVal.push_back(false);
+            isModified.push_back(false);
+
+            return isUpVal.size()-1;
+        }
+
+        Function* function;
         vector<LexScope> lexicals;
         bool isGlobal = false;
 
         optional<size_t> getLocal(const string& s) {
-            for (auto scope : lexicals | views::reverse) {
+            for (auto& scope : lexicals | views::reverse) {
                 auto l = scope.getLocal(s);
                 if (l.has_value()) return l;
             }
@@ -1946,10 +1972,10 @@ struct Linerizer: ASTVisitor {
             if (isGlobal && cur.has_value()) return *cur;
             if (cur.has_value()) PANIC("local {} already defiend in curren scope", s);
 
-            isUpVal.push_back(false);
-            lexicals.back().vars.emplace_back(s, isUpVal.size()-1);
+            auto id = rawRegisterLocal();
+            lexicals.back().vars.emplace_back(s, id);
 
-            return isUpVal.size()-1;
+            return id;
         }
 
         size_t putRootLocal(const string& s) {
@@ -1957,10 +1983,10 @@ struct Linerizer: ASTVisitor {
             auto cur = lexicals[0].getLocal(s);
             if (cur.has_value()) PANIC("local {} already defiend in curren scope", s);
 
-            isUpVal.push_back(false);
-            lexicals[0].vars.emplace_back(s, isUpVal.size()-1);
+            auto id = rawRegisterLocal();
+            lexicals[0].vars.emplace_back(s, id);
 
-            return isUpVal.size()-1;
+            return id;
         }
 
         void enterScope() {
@@ -1974,6 +2000,10 @@ struct Linerizer: ASTVisitor {
 
         void markUpVal(size_t id) {
             isUpVal[id] = true;
+        }
+
+        void markModified(size_t id) {
+            isModified[id] = true;
         }
 
         size_t toUpvalId(size_t id) {
@@ -2022,24 +2052,49 @@ struct Linerizer: ASTVisitor {
                 auto self = f.source;
                 auto isEscaped = f.isEscaped();
                 if (isEscaped && f.isDecl == IdentOp::DECLARE) { // declaration of escaping upVal (redeclare it/alocate new one)
-                    *f.toPatch = SpecializedVariable(HookedVariableType::ALLOC_UPVAL, f.source->getUpValId(f.relLocalId), 0);
+                    if (f.isModified()) {
+                        *f.toPatch = SpecializedVariable(HookedVariableType::ALLOC_UPVAL, f.source->getUpValId(f.relLocalId), 0);
+                    } else {
+                        *f.toPatch = SpecializedVariable(HookedVariableType::ALLOC_CONST_UPVAL, f.source->getUpValId(f.relLocalId), 0);
+                    }
                 } else if (isEscaped) { // access to localy defined upval
-                    *f.toPatch = SpecializedVariable(HookedVariableType::UPVAL, self->getUpValId(f.relLocalId), 0);
+                    if (f.isModified()) {
+                        *f.toPatch = SpecializedVariable(HookedVariableType::UPVAL, self->getUpValId(f.relLocalId), 0);
+                    } else {
+                        *f.toPatch = SpecializedVariable(HookedVariableType::CONST_UPVAL, self->getUpValId(f.relLocalId), 0);
+                    }
                 } else { // access to ordinary local
                     *f.toPatch = SpecializedVariable(HookedVariableType::LOCAL, self->getLocalId(f.relLocalId), 0);
                 }
             } else if (f.relFrameId == 1) { // capturing parents local
                 auto self = f.sourceUpFunction;
-                auto localId = self->putCapture(f.relLocalId);
-
                 assert(f.isDecl != IdentOp::DECLARE);
-                *f.toPatch = SpecializedVariable(HookedVariableType::UPVAL, self->getUpValId(localId), 0); // offset 0, we copied upval to our frame
+
+                if (f.isModified()) {
+                    auto localId = self->putCapture(f.relLocalId);
+
+                    *f.toPatch = SpecializedVariable(HookedVariableType::UPVAL, self->getUpValId(localId), 0); // offset 0, we copied upval to our frame
+                } else {
+                    assert(f.isDecl != IdentOp::WRITE);
+                    auto localId = self->putCapture(f.relLocalId);
+
+                    *f.toPatch = SpecializedVariable(HookedVariableType::CONST_UPVAL, self->getUpValId(localId), 0); // offset 0, we copied upval to our frame
+                }
             } else { // capturing nested local
                 auto closestChild = f.sourceUpFunction;
-                auto someParentsId = closestChild->putCapture(f.relLocalId);
-
                 assert(f.isDecl != IdentOp::DECLARE);
-                *f.toPatch = SpecializedVariable(HookedVariableType::UPVAL, closestChild->getUpValId(someParentsId), f.relFrameId-1); // relFrameId-1, we access version stored in nodes child
+
+                if (f.isModified()) {
+                    auto someParentsId = closestChild->putCapture(f.relLocalId);
+
+                    *f.toPatch = SpecializedVariable(HookedVariableType::UPVAL, closestChild->getUpValId(someParentsId), f.relFrameId-1); // relFrameId-1, we access version stored in nodes child
+                } else {
+                    // FIXME
+                    assert(f.isDecl != IdentOp::WRITE);
+                    auto someParentsId = closestChild->putCapture(f.relLocalId);
+
+                    *f.toPatch = SpecializedVariable(HookedVariableType::CONST_UPVAL, closestChild->getUpValId(someParentsId), f.relFrameId-1); // relFrameId-1, we access version stored in nodes child
+                }
             }
             if (DEBUG_JIT) {
                 switch (f.isDecl) {
@@ -2139,7 +2194,7 @@ struct Linerizer: ASTVisitor {
                 hook(s);
             }
 
-            method->locals = stack.back().isUpVal;
+            stack.back().init(method);
 
             stack.pop_back();
         }
@@ -2174,6 +2229,9 @@ struct Linerizer: ASTVisitor {
             auto up = scope.getLocal(name);
             if (up.has_value()) {
                 if (i != 0) scope.markUpVal(*up);
+                if (isDecl == IdentOp::WRITE) {
+                    scope.markModified(*up);
+                }
 
                 putPatch(hookedTarget, scope.function, i, *up, isDecl, (i == 0) ? nullptr : stack[stack.size()-i].function, name);
                 return;
@@ -2269,7 +2327,7 @@ struct Linerizer: ASTVisitor {
             hook(idk);
         }
 
-        it.locals = stack.back().isUpVal;
+        stack.back().init(&it);
         stack.pop_back();
     }
 
@@ -2312,7 +2370,7 @@ namespace builtin {
         (*c->captures)[lId] = o;
     }
 
-    LoxValue readClosed(FunctionRef* v, size_t fId, size_t lId) {
+    LoxValue readClosed(FunctionRef* v, size_t fId, size_t lId, bool isConst) {
         if (DEBUG_JIT) println("[readClosed] {} {}:{}", v->func->data.name, fId, lId);
         auto c = v;
         for (size_t i = 0; i < fId; i++) {
@@ -2452,7 +2510,7 @@ namespace builtin {
         }
         auto me = new ObjectRef{clazz, proto, nullptr, data};
         for (auto [m, mId] : clazz->clazz->methodIds) {
-            me->methods[m] = me->createMethod(mId);
+            me->methods[m] = createMethod(mId, clazz->parent, me);
         }
         if (me->construcor == nullptr && clazz->getConstructor() != nullptr) me->construcor = me->getRawMethod(CONSTRUCTOR_ID);
         return me;
@@ -2627,11 +2685,11 @@ struct MilaAssembler: virtual Assembler {
 
     virtual void copyClosed(size_t dst, size_t src, size_t dstId, size_t srcId) = 0;
 
-    virtual void readClosed(size_t dst, size_t ref, size_t frameId, size_t localId) = 0;
+    virtual void readClosed(size_t dst, size_t ref, size_t frameId, size_t localId, bool isConst) = 0;
 
-    virtual void writeClosed(size_t ref, size_t frameId, size_t localId, size_t value) = 0;
+    virtual void writeClosed(size_t ref, size_t frameId, size_t localId, size_t value, bool isConst) = 0;
 
-    virtual void allocateClosed(size_t ref, size_t frameId, size_t localId, size_t value) = 0;
+    virtual void allocateClosed(size_t ref, size_t frameId, size_t localId, size_t value, bool isConst) = 0;
 
     virtual void allocateClosure(size_t tgt, Function* f, size_t parent) = 0;
 
@@ -2649,6 +2707,7 @@ struct MilaAssembler: virtual Assembler {
     }
 
     virtual void writeGlobal(size_t id, size_t value) {
+        // FIXME this can be direct read without adend?
         auto gReg = movImmPtrToReg(&GLOBALS_TABLE);
         writeMem(gReg, value, id*sizeof(LoxValue), sizeof(LoxValue));
 
@@ -2723,7 +2782,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         ctx.restore();
     }
 
-    void fastAdd(size_t dst, size_t lhs, size_t rhs) {
+    void fastAdd(size_t dst, size_t lhs, size_t rhs, Label crashLabel, Label doneLabel) {
         auto ctx = getAllocCtx();
         auto lReg = ctx.ensureReg(lhs);
         auto rReg = ctx.ensureReg(rhs);
@@ -2733,19 +2792,15 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
 
         auto lhsNumberLabel = makeLabel1();
         auto rhsNumberLabel = makeLabel1();
-        auto crashLabel = makeLabel1();
 
         numberGuard(ctx, lReg, tmpReg, tmpReg1, lhsNumberLabel, crashLabel);
 
         bind(lhsNumberLabel);
         numberGuard(ctx, rReg, tmpReg, tmpReg1, rhsNumberLabel, crashLabel);
 
-        bind(crashLabel);
-        // trap();
-        mc.hlt();
-
         bind(rhsNumberLabel);
         addDouble(dstReg, lReg, rReg);
+        cJmp(doneLabel);
 
         ctx.restore();
     }
@@ -2791,6 +2846,61 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         ctx.restore();
     }
 
+    // FIXME broken
+    void fastEq(size_t dst, size_t lhs, size_t rhs, size_t trueValue, size_t falseValue) {
+        auto ctx = getAllocCtx();
+        auto lReg = ctx.ensureReg(lhs);
+        auto rReg = ctx.ensureReg(rhs);
+        auto dstReg = ctx.ensureRegWriteback(dst);
+        auto tmpReg = (dstReg == lReg or dstReg == rReg) ? ctx.allocReg() : dstReg;
+        auto tmpReg1 = ctx.allocReg();
+
+        auto lhsNumberLabel = makeLabel1();
+        auto rhsNumberLabel = makeLabel1();
+        auto crashLabel = makeLabel1();
+        auto isTrueLabel = makeLabel1();
+        auto isDoneLabel = makeLabel1();
+        auto doRawCmp = makeLabel1();
+        auto isTrue = makeLabel1();
+        auto trulyDone = makeLabel1();
+
+        auto checkNotNumber = makeLabel1();
+
+        getLoxTag(tmpReg, lReg);
+        movInt(tmpReg1, LoxValue::ValueType2::FLOAT);
+        cJmp(checkNotNumber, JumpCondType::NOT_EQUALS, tmpReg, tmpReg1);
+        mc.movq(0, allocator.getReg(lReg), true);
+        mc.movq(1, allocator.getReg(rReg), true);
+        mc.comisd(0, 1, true);
+        cJmp(isDoneLabel);
+
+        bind(checkNotNumber);
+        movInt(tmpReg1, LoxValue::ValueType2::STRING);
+        cJmp(doRawCmp, JumpCondType::NOT_EQUALS, tmpReg, tmpReg1);
+
+        getLoxTag(tmpReg, rReg);
+        cJmp(doRawCmp, JumpCondType::NOT_EQUALS, tmpReg, tmpReg1);
+
+        mc.hlt(); // TODO
+        cJmp(isDoneLabel);
+
+        bind(doRawCmp);
+        mc.writeRegInst(X64Instruction::cmp, ctx.REG(lReg), ctx.REG(rReg));
+        // cJmp(isDoneLabel);
+
+        bind(isDoneLabel);
+        cJmp1(isTrue, JumpCondType::EQUALS);
+        movInt(dstReg, falseValue);
+        cJmp(trulyDone);
+
+        bind(isTrue);
+        movInt(dstReg, trueValue);
+
+        bind(trulyDone);
+
+        ctx.restore();
+    }
+
     void doBin(BinaryType type, size_t dst, size_t lhs, size_t rhs) override {
         if (type == BinaryType::SUB) {
             fastArith(dst, lhs, rhs, ArithmeticOp::SUB);
@@ -2820,8 +2930,25 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
             fastCmp(dst, lhs, rhs, JumpCondType::LESS_OR_EQUAL);
             return;
         }
+        /*if (type == BinaryType::EQ) {
+            fastEq(dst, lhs, rhs, std::bit_cast<size_t>(LoxValue::True()), std::bit_cast<size_t>(LoxValue::False()));
+            return;
+        }
+        if (type == BinaryType::NEQ) {
+            fastEq(dst, lhs, rhs, std::bit_cast<size_t>(LoxValue::False()), std::bit_cast<size_t>(LoxValue::True()));
+            return;
+        }*/
+        auto crashLabel = makeLabel1();
+        auto doneLabel = makeLabel1();
+/*        if (type == BinaryType::ADD) {
+            fastAdd(dst, lhs, rhs, crashLabel, doneLabel);
+        }*/
+
+        bind(crashLabel);
         array<Arg, 3> argz{Arg::Imm((size_t)type), handleToArg(lhs), handleToArg(rhs)};
         chadCall(Arg::ImmPtr((void*)&builtin::doSimpleBin), argz, handleToArg(dst));
+
+        bind(doneLabel);
     }
 
     void fastToBool(size_t tgt, size_t src, size_t tmp, size_t trueValue, size_t falseValue) {
@@ -2856,7 +2983,23 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         // chadCall(Arg::ImmPtr((void*)&builtin::toBool), argz, handleToArg(tgt));
     }
 
-    void allocateClosed(size_t ref, size_t frameId, size_t localId, size_t value) override {
+    void allocateClosed(size_t ref, size_t frameId, size_t localId, size_t value, bool isConst) override {
+        if (isConst) {
+            auto tmp = allocateRegister(sizeof(LoxValue*));
+
+            movReg(tmp, ref);
+
+            vector<int> derefs;
+            for (size_t i = 0; i < frameId; i++) {
+                derefs.push_back(offsetof(FunctionRef, parent));
+            }
+            derefChain(tmp, derefs);
+            writeMem(tmp, value, offsetof(FunctionRef, captures)+(sizeof(LoxValue*) * localId), sizeof(LoxValue));
+
+            freeRegister(tmp);
+            return;
+        }
+
         array<Arg, 4> argz{handleToArg(ref), Arg::Imm(frameId), Arg::Imm(localId), handleToArg(value)};
         chadCall(Arg::ImmPtr((void*)builtin::allocateClosed), argz, nullopt);
         return;
@@ -3031,7 +3174,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         chadCall(Arg::ImmPtr((void*)builtin::allocateClass), argz, handleToArg(tgt));
     }
 
-    void readClosed(size_t dst, size_t ref, size_t frameId, size_t localId) override {
+    void readClosed(size_t dst, size_t ref, size_t frameId, size_t localId, bool isConst) override {
         movReg(dst, ref);
 
         vector<int> derefs;
@@ -3039,14 +3182,14 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
             derefs.push_back(offsetof(FunctionRef, parent));
         }
         derefs.push_back(offsetof(FunctionRef, captures)+(sizeof(LoxValue*) * localId));
-        derefs.push_back(0);
+        if (not isConst) derefs.push_back(0);
         derefs.push_back(0);
 
         derefChain(dst, derefs);
         // trap();
     }
 
-    void writeClosed(size_t ref, size_t frameId, size_t localId, size_t value) override {
+    void writeClosed(size_t ref, size_t frameId, size_t localId, size_t value, bool isConst) override {
         // array<Arg, 4> argz{handleToArg(ref), Arg::Imm(frameId), Arg::Imm(localId), handleToArg(value)};
         // chadCall(Arg::ImmPtr((void*)builtin::writeClosed), argz, nullopt);
         // return;
@@ -3054,14 +3197,18 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         for (size_t i = 0; i < frameId; i++) {
             derefs.push_back(offsetof(FunctionRef, parent));
         }
-        derefs.push_back(offsetof(FunctionRef, captures)+(sizeof(LoxValue*) * localId));
+        if (not isConst) derefs.push_back(offsetof(FunctionRef, captures)+(sizeof(LoxValue*) * localId));
         derefs.push_back(0);
 
         auto tmp = this->allocateRegister(sizeof(LoxValue*));
 
         movReg(tmp, ref);
         derefChain(tmp, derefs);
-        writeMem(tmp, value, 0, sizeof(LoxValue));
+        if (not isConst) {
+            writeMem(tmp, value, 0, sizeof(LoxValue));
+        } else {
+            writeMem(tmp, value, offsetof(FunctionRef, captures)+(sizeof(LoxValue*) * localId), sizeof(LoxValue));
+        }
 
         freeRegister(tmp);
     }
@@ -3413,19 +3560,20 @@ struct LoxReadCaptured: public NamedIrInstruction<"read_captured", MilaGenCtx> {
     SSARegisterHandle closure;
     size_t fId = -1;
     size_t locId = -1;
+    bool isConst;
 
-    LoxReadCaptured(SSARegisterHandle target, SSARegisterHandle closure, size_t fId, size_t locId) : NamedIrInstruction(target), closure(closure), fId(fId), locId(locId) {}
+    LoxReadCaptured(SSARegisterHandle target, SSARegisterHandle closure, size_t fId, size_t locId, bool isConst) : NamedIrInstruction(target), closure(closure), fId(fId), locId(locId), isConst(isConst) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(closure);
     }
 
     void print(MilaIrGen&) override {
-        basePrint("{} {}#{}", closure, fId, locId);
+        basePrint("{} {}#{}/{}", closure, fId, locId, isConst);
     }
 
     void generate(MilaCodeGen& gen) override {
-        gen.assembler.readClosed(gen.getReg(target), gen.getReg(closure), fId, locId);
+        gen.assembler.readClosed(gen.getReg(target), gen.getReg(closure), fId, locId, isConst);
     }
 };
 
@@ -3435,8 +3583,9 @@ struct LoxWriteCaptured: public NamedIrInstruction<"write_captured", MilaGenCtx>
     size_t fId = -1;
     size_t locId = -1;
     SSARegisterHandle v;
+    bool isConst;
 
-    LoxWriteCaptured(SSARegisterHandle closure, size_t fId, size_t locId, SSARegisterHandle v) : NamedIrInstruction(SSARegisterHandle::invalid()), closure(closure), fId(fId), locId(locId), v(v) {}
+    LoxWriteCaptured(SSARegisterHandle closure, size_t fId, size_t locId, SSARegisterHandle v, bool isConst) : NamedIrInstruction(SSARegisterHandle::invalid()), closure(closure), fId(fId), locId(locId), v(v), isConst(isConst) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(closure);
@@ -3444,11 +3593,11 @@ struct LoxWriteCaptured: public NamedIrInstruction<"write_captured", MilaGenCtx>
     }
 
     void print(MilaIrGen&) override {
-        basePrint("{} % {}#{} <- {}", closure, fId, locId, v);
+        basePrint("{} % {}#{}/{} <- {}", closure, fId, locId, isConst, v);
     }
 
     void generate(MilaCodeGen& gen) override {
-        gen.assembler.writeClosed(gen.getReg(closure), fId, locId, gen.getReg(v));
+        gen.assembler.writeClosed(gen.getReg(closure), fId, locId, gen.getReg(v), isConst);
     }
 };
 
@@ -3458,8 +3607,9 @@ struct LoxAllocCaptured: public NamedIrInstruction<"alloc_captured", MilaGenCtx>
     size_t fId = -1;
     size_t locId = -1;
     SSARegisterHandle v;
+    bool isConst;
 
-    LoxAllocCaptured(SSARegisterHandle closure, size_t fId, size_t locId, SSARegisterHandle v) : NamedIrInstruction(SSARegisterHandle::invalid()), closure(closure), fId(fId), locId(locId), v(v) {}
+    LoxAllocCaptured(SSARegisterHandle closure, size_t fId, size_t locId, SSARegisterHandle v, bool isConst) : NamedIrInstruction(SSARegisterHandle::invalid()), closure(closure), fId(fId), locId(locId), v(v), isConst(isConst) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(v);
@@ -3467,11 +3617,11 @@ struct LoxAllocCaptured: public NamedIrInstruction<"alloc_captured", MilaGenCtx>
     }
 
     void print(MilaIrGen&) override {
-        basePrint("{} % {}#{} <- {}", closure, fId, locId, v);
+        basePrint("{} % {}#{}/{} <- {}", closure, fId, locId, isConst, v);
     }
 
     void generate(MilaCodeGen& gen) override {
-        gen.assembler.allocateClosed(gen.getReg(closure), fId, locId, gen.getReg(v));
+        gen.assembler.allocateClosed(gen.getReg(closure), fId, locId, gen.getReg(v), isConst);
     }
 };
 
@@ -3675,11 +3825,15 @@ struct Compiler: ASTVisitor {
                 return getCtx().push<LoxReadLocal>(MilaDataType{}, s.id, name, *getCtx().lookupLocal(CURRENT_LOCALS));
                 break;
             case HookedVariableType::UPVAL:
-                return getCtx().push<LoxReadCaptured>(MilaDataType{}, getCurrentClosure(), s.frameId, s.id);
+                return getCtx().push<LoxReadCaptured>(MilaDataType{}, getCurrentClosure(), s.frameId, s.id, false);
                 break;
             case HookedVariableType::GLOBAL:
                 return getCtx().push<LoxReadGlobal>(MilaDataType{}, s.id);
                 break;
+            case HookedVariableType::CONST_UPVAL:
+                return getCtx().push<LoxReadCaptured>(MilaDataType{}, getCurrentClosure(), s.frameId, s.id, true);
+                break;
+            case HookedVariableType::ALLOC_CONST_UPVAL:
             case HookedVariableType::ALLOC_UPVAL:
                 PANIC();
         }
@@ -3692,13 +3846,19 @@ struct Compiler: ASTVisitor {
                 getCtx().pushInstruction<LoxWriteLocal>(s.id, name, v, *getCtx().lookupLocal(CURRENT_LOCALS));
                 break;
             case HookedVariableType::UPVAL:
-                getCtx().pushInstruction<LoxWriteCaptured>(getCurrentClosure(), s.frameId, s.id, v);
+                getCtx().pushInstruction<LoxWriteCaptured>(getCurrentClosure(), s.frameId, s.id, v, false);
                 break;
             case HookedVariableType::GLOBAL:
                 getCtx().pushInstruction<LoxWriteGlobal>(s.id, v);
                 break;
             case HookedVariableType::ALLOC_UPVAL:
-                getCtx().pushInstruction<LoxAllocCaptured>(getCurrentClosure(), s.frameId, s.id, v);
+                getCtx().pushInstruction<LoxAllocCaptured>(getCurrentClosure(), s.frameId, s.id, v, false);
+                break;
+            case HookedVariableType::ALLOC_CONST_UPVAL:
+                getCtx().pushInstruction<LoxAllocCaptured>(getCurrentClosure(), s.frameId, s.id, v, true);
+                break;
+            case HookedVariableType::CONST_UPVAL:
+                getCtx().pushInstruction<LoxWriteCaptured>(getCurrentClosure(), s.frameId, s.id, v, true);
                 break;
             default:
                 PANIC();
@@ -3740,7 +3900,7 @@ struct Compiler: ASTVisitor {
     }
 
     SSARegisterHandle readThis() {
-        return getCtx().push<LoxReadCaptured>(MilaDataType{}, getCurrentClosure(), 0, currentFunction()->getParamUpValOffset());
+        return getCtx().push<LoxReadCaptured>(MilaDataType{}, getCurrentClosure(), 0, currentFunction()->getParamUpValOffset(), true);
     }
 
     void invoke(Return& it) override {
@@ -4031,7 +4191,11 @@ struct Compiler: ASTVisitor {
             auto poop = IR_GEN_CTX.pushRegister(arg, MilaDataType{}, {}, SSARegister::Type::ARG);
 
             if (it.locals[i]) {
-                genWrite(SpecializedVariable::AllocateCaptured(upValId), poop, it.data.argz[i]);
+                if (it.isModified[i]) {
+                    genWrite(SpecializedVariable::AllocateCaptured(upValId), poop, it.data.argz[i]);
+                } else {
+                    genWrite(SpecializedVariable::AllocateConstCaptured(upValId), poop, it.data.argz[i]);
+                }
                 upValId += 1;
             } else {
                 genWrite(SpecializedVariable::Local(localId), poop, it.data.argz[i]);
@@ -4205,6 +4369,12 @@ struct ASTExecutor: ASTVisitor {
             case HookedVariableType::ALLOC_UPVAL:
                 currentFrame->captures[var.id] = new LoxValue(value);
                 break;
+            case HookedVariableType::ALLOC_CONST_UPVAL:
+                TODO();
+                break;
+            case HookedVariableType::CONST_UPVAL:
+                TODO();
+                break;
         }
     }
 
@@ -4229,6 +4399,12 @@ struct ASTExecutor: ASTVisitor {
 
                 return v;
             }
+            case HookedVariableType::CONST_UPVAL:
+                TODO();
+                break;
+            case HookedVariableType::ALLOC_CONST_UPVAL:
+                TODO();
+                break;
             case HookedVariableType::ALLOC_UPVAL:
                 PANIC();
                 break;
@@ -4483,17 +4659,19 @@ struct ASTExecutor: ASTVisitor {
 typedef LoxValue(*GlobalFunck)(FunctionRef*);
 
 
-FunctionRef* ObjectRef::createMethod(Function* f1) {
+FunctionRef* createMethod(Function* f1, FunctionRef* parent, ObjectRef* self) {
     auto f = RUNTIME->allocateFunctionRef(*f1);
     f->func = f1;
-    f->parent = clazz->parent;
+    f->parent = parent;
     f->argCount = f1->data.argz.size();
     f->fPtr = f1->runtimeData;
     for (auto i = 0UL; i < f1->captures.size(); i++) {
-        f->captures[f1->upValCount()+i] = clazz->parent->captures[f1->captures[i]];
+        f->captures[f1->upValCount()+i] = parent->captures[f1->captures[i]];
     }
-    f->captures[f1->getParamUpValOffset()] = new LoxValue(LoxValue::Object(this));
-    f->captures[f1->getParamUpValOffset() + 1] = new LoxValue(proto == nullptr ? LoxValue::Nil() : LoxValue::Object(proto));
+    if (self != nullptr) {
+        f->captures[f1->getParamUpValOffset()] = std::bit_cast<LoxValue*>(LoxValue::Object(self));
+        f->captures[f1->getParamUpValOffset() + 1] = std::bit_cast<LoxValue*>(self->proto == nullptr ? LoxValue::Nil() : LoxValue::Object(self->proto));
+    }
 
     return f;
 }
@@ -4576,7 +4754,7 @@ int main(int argc, const char** argv) {
     }
 
 
-    globalFunc->locals = linerizer.stack.back().isUpVal;
+    linerizer.stack.back().init(globalFunc);
 
     std::chrono::time_point start1 = std::chrono::high_resolution_clock::now();
 
