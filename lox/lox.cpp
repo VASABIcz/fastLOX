@@ -1822,6 +1822,7 @@ struct ObjectRef {
     ClassRef* clazz;
     ObjectRef* proto;
     FunctionRef* construcor;
+    LoxValue proto1;
     std::unordered_map<u32, LoxValue>* fields;
     std::unordered_map<u32, FunctionRef*> methods;
 
@@ -2136,7 +2137,7 @@ struct Linerizer: ASTVisitor {
     }
 
     void invoke(Super& it) override {
-        hookIdent("__super", &it.hookedTarget, IdentOp::READ);
+        hookIdent("__this", &it.hookedTarget, IdentOp::READ);
     }
 
     void invoke(This& it) override {
@@ -2186,7 +2187,6 @@ struct Linerizer: ASTVisitor {
             stack.back().function = method/*.get()*/;
 
             stack.back().markUpVal(stack.back().putLocal("__this"));
-            stack.back().markUpVal(stack.back().putLocal("__super"));
 
             for (auto a : method->data.argz) {
                 stack.back().putLocal(a);
@@ -2510,7 +2510,7 @@ namespace builtin {
         if (clazz->super != nullptr) {
             proto = rawInstant(clazz->super, data);
         }
-        auto me = new ObjectRef{clazz, proto, nullptr, data};
+        auto me = new ObjectRef{clazz, proto, nullptr, proto == nullptr ? LoxValue::Nil() : LoxValue::Object(proto), data};
         for (auto [m, mId] : clazz->clazz->methodIds) {
             me->methods[m] = createMethod(mId, clazz->parent, me);
         }
@@ -3315,7 +3315,7 @@ struct LoxCallMethod: public NamedIrInstruction<"lox_call", MilaGenCtx> {
 
 void FunctionRef::setThis(ObjectRef *self) {
     captures[/*self->clazz->parent->func->getParamUpValOffset()+*/0] = std::bit_cast<LoxValue*>(LoxValue::Object(self));
-    captures[/*self->clazz->parent->func->getParamUpValOffset()+*/1] = std::bit_cast<LoxValue*>(self->proto == nullptr ? LoxValue::Nil() : LoxValue::Object(self->proto));
+    // captures[/*self->clazz->parent->func->getParamUpValOffset()+*/1] = std::bit_cast<LoxValue*>(self->proto == nullptr ? LoxValue::Nil() : LoxValue::Object(self->proto));
 }
 
 
@@ -3744,6 +3744,26 @@ struct LoxCopyCapture: public NamedIrInstruction<"copy_capture", MilaGenCtx> {
     }
 };
 
+struct LoxGetSuper: public NamedIrInstruction<"get_super", MilaGenCtx> {
+    PUB_VIRTUAL_COPY(LoxGetSuper)
+    SSARegisterHandle self;
+
+    LoxGetSuper(SSARegisterHandle target, SSARegisterHandle self) : NamedIrInstruction(target), self(self) {}
+
+    void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
+        fn(self);
+    }
+
+    void print(MilaIrGen&) override {
+        basePrint("{}", self);
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        gen.assembler.getPtr(gen.getReg(target), gen.getReg(self));
+        gen.assembler.readMem(gen.getReg(target), gen.getReg(target), offsetof(ObjectRef, proto1), sizeof(LoxValue));
+    }
+};
+
 struct MilaReg: SSARegister {
     MilaReg(size_t blockId, string name, MilaDataType type1, Type type): SSARegister(blockId, name, type), dataType(type1) {
 
@@ -4035,7 +4055,9 @@ struct Compiler: ASTVisitor {
     }
 
     void invoke(Super& it) override {
-        curRet = genRead(it.hookedTarget, "_super");
+        auto self = genRead(it.hookedTarget, "_this");
+
+        curRet = getCtx().push<LoxGetSuper>(MilaDataType{}, self);
     }
 
     void invoke(This& it) override {
@@ -4203,14 +4225,16 @@ struct Compiler: ASTVisitor {
 
         IR_GEN_CTX.pushInstruction<instructions::Alloca>(frameReg, localsCount*sizeof(LoxValue));
 
-        size_t upValId = isMethod ? 2 : 0;
+        size_t UP_VAL_OFFSET = isMethod ? 1 : 0;
+
+        size_t upValId = UP_VAL_OFFSET;
         size_t localId = 0;
 
         for (auto i = 0u; i < it.data.argz.size(); i++) {
             auto arg = it.data.argz[i];
             auto poop = IR_GEN_CTX.pushRegister(arg, MilaDataType{}, {}, SSARegister::Type::ARG);
 
-            auto realI = isMethod ? i+2 : i;
+            auto realI = UP_VAL_OFFSET+i;
 
             if (it.locals[realI]) {
                 if (it.isModified[realI]) {
