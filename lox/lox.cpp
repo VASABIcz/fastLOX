@@ -1474,7 +1474,7 @@ vector<unique_ptr<MilaParsingUnit>> getMilaParsingUnits() {
 
 struct StackFrame;
 struct LoxValue;
-
+struct ObjectRef;
 
 struct FunctionRef {
     FunctionRef* parent;
@@ -1486,6 +1486,8 @@ struct FunctionRef {
     LoxValue read(size_t id);
 
     void write(size_t id, LoxValue val);
+
+    void setThis(ObjectRef* self);
 };
 
 // closed variables are allocated separately on heap (boxed)
@@ -2183,12 +2185,12 @@ struct Linerizer: ASTVisitor {
             stack.back().lexicals.emplace_back();
             stack.back().function = method/*.get()*/;
 
+            stack.back().markUpVal(stack.back().putLocal("__this"));
+            stack.back().markUpVal(stack.back().putLocal("__super"));
+
             for (auto a : method->data.argz) {
                 stack.back().putLocal(a);
             }
-
-            stack.back().markUpVal(stack.back().putLocal("__this"));
-            stack.back().markUpVal(stack.back().putLocal("__super"));
 
             for (auto& s : method->data.body) {
                 hook(s);
@@ -3117,6 +3119,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         auto tgt = ctx.ensureRegWriteback(tgt1);
         auto subj = ctx.ensureReg(subj1);
         auto tmp = ctx.allocReg();
+        // auto tmp1 = ctx.allocReg();
 
         auto handleNotFunctionLabel = makeLabel1();
         auto doneLabel = makeLabel1();
@@ -3131,7 +3134,19 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         std::array<Arg,3>instArgz{handleToArg(subj), Arg::Imm(fieldId), Arg::Imm(argz.size())};
         chadCall(Arg::ImmPtr((void*)builtin::getMethod), instArgz, handleToArg(tmp));
 
+        // mc.push(ctx.REG(tmp), offsetof(FunctionRef, captures));
+        // mc.push(X64Register::R15);
+
+        // readMem(tmp1, tmp, offsetof(FunctionRef, captures), sizeof(LoxValue));
+        // writeMem(tmp, subj, offsetof(FunctionRef, captures), sizeof(LoxValue));
+
         fasterCall(tgt, tmp, t);
+
+        // mc.pop(X64Register::R15);
+        // mc.pop(ctx.REG(tmp), offsetof(FunctionRef, captures));
+
+        // writeMem(tmp, tmp1, offsetof(FunctionRef, captures), sizeof(LoxValue));
+
         cJmp(doneLabel);
 
         bind(handleNotFunctionLabel);
@@ -3297,6 +3312,11 @@ struct LoxCallMethod: public NamedIrInstruction<"lox_call", MilaGenCtx> {
         gen.assembler.callMethod(gen.getReg(target), gen.getReg(subj), methodId, args);
     }
 };
+
+void FunctionRef::setThis(ObjectRef *self) {
+    captures[/*self->clazz->parent->func->getParamUpValOffset()+*/0] = std::bit_cast<LoxValue*>(LoxValue::Object(self));
+    captures[/*self->clazz->parent->func->getParamUpValOffset()+*/1] = std::bit_cast<LoxValue*>(self->proto == nullptr ? LoxValue::Nil() : LoxValue::Object(self->proto));
+}
 
 
 struct LoxNil: public NamedIrInstruction<"lox_nil", MilaGenCtx> {
@@ -3900,7 +3920,7 @@ struct Compiler: ASTVisitor {
     }
 
     SSARegisterHandle readThis() {
-        return getCtx().push<LoxReadCaptured>(MilaDataType{}, getCurrentClosure(), 0, currentFunction()->getParamUpValOffset(), true);
+        return getCtx().push<LoxReadCaptured>(MilaDataType{}, getCurrentClosure(), 0, 0, true);
     }
 
     void invoke(Return& it) override {
@@ -4183,15 +4203,17 @@ struct Compiler: ASTVisitor {
 
         IR_GEN_CTX.pushInstruction<instructions::Alloca>(frameReg, localsCount*sizeof(LoxValue));
 
-        size_t upValId = 0;
+        size_t upValId = isMethod ? 2 : 0;
         size_t localId = 0;
 
         for (auto i = 0u; i < it.data.argz.size(); i++) {
             auto arg = it.data.argz[i];
             auto poop = IR_GEN_CTX.pushRegister(arg, MilaDataType{}, {}, SSARegister::Type::ARG);
 
-            if (it.locals[i]) {
-                if (it.isModified[i]) {
+            auto realI = isMethod ? i+2 : i;
+
+            if (it.locals[realI]) {
+                if (it.isModified[realI]) {
                     genWrite(SpecializedVariable::AllocateCaptured(upValId), poop, it.data.argz[i]);
                 } else {
                     genWrite(SpecializedVariable::AllocateConstCaptured(upValId), poop, it.data.argz[i]);
@@ -4668,10 +4690,7 @@ FunctionRef* createMethod(Function* f1, FunctionRef* parent, ObjectRef* self) {
     for (auto i = 0UL; i < f1->captures.size(); i++) {
         f->captures[f1->upValCount()+i] = parent->captures[f1->captures[i]];
     }
-    if (self != nullptr) {
-        f->captures[f1->getParamUpValOffset()] = std::bit_cast<LoxValue*>(LoxValue::Object(self));
-        f->captures[f1->getParamUpValOffset() + 1] = std::bit_cast<LoxValue*>(self->proto == nullptr ? LoxValue::Nil() : LoxValue::Object(self->proto));
-    }
+    if (self != nullptr) f->setThis(self);
 
     return f;
 }

@@ -359,6 +359,23 @@ public:
 
     void push(const X64Register& src);
 
+    void push(const X64Register& obj, i32 offset) {
+        if (obj.isExt()) writeRex(false, false, true);
+
+        pushBack(0xFF);
+
+        someOffsetStuffForMov(X64Register::Six, obj, offset);
+    }
+
+    void pop(const X64Register& obj, i32 offset) {
+        if (obj.isExt()) writeRex(false, false, true);
+
+        pushBack(0x8F);
+
+        someOffsetStuffForMov(X64Register::Zero, obj, offset);
+    }
+
+
     void pop(const X64Register& dest);
 
     void ret();
