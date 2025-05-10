@@ -1502,11 +1502,101 @@ struct FunctionRef {
 
 constexpr size_t CONSTRUCTOR_ID = 0;
 
+struct __attribute__ ((packed)) EntryPair {
+    u32 first;
+    size_t second;
+};
+
+struct  __attribute__ ((packed)) LoxMapBucket {
+    u32 size = 0;
+    EntryPair items[];
+};
+
+struct __attribute__ ((packed)) LoxMap {
+    static constexpr size_t BUCKET_SIZE = 2;
+    static constexpr size_t INIT_SIZE = 4;
+    static constexpr size_t INVALID_VALUE = -1;
+
+    LoxMapBucket** buckets = nullptr;
+    u32 size = 0;
+};
+
+LoxMapBucket* allocBucket() {
+    auto bucket = (LoxMapBucket*)malloc(sizeof(LoxMapBucket)+LoxMap::BUCKET_SIZE*sizeof(EntryPair));
+    bucket->size = 0;
+
+    return bucket;
+}
+
+void resize(LoxMap* map) {
+    auto newSize = std::max(map->size*2, (u32)LoxMap::INIT_SIZE);
+
+    auto* newBukcets = new LoxMapBucket*[newSize];
+    std::memset(newBukcets, 0, newSize*sizeof(LoxMapBucket*));
+
+    for (auto i = 0; i < map->size; i++) {
+        auto oldBucket = map->buckets[i];
+        if (oldBucket  == nullptr) continue;
+        for (auto j = 0; j < oldBucket->size; j++) {
+            auto entry = oldBucket->items[j];
+            auto newBucketId = entry.first % newSize;
+            auto& newBucket = newBukcets[newBucketId];
+            if (newBucket == nullptr) {
+                newBucket = allocBucket();
+            }
+            newBucket->items[newBucket->size++] = entry;
+        }
+    }
+
+    map->size = newSize;
+    map->buckets = newBukcets;
+}
+
+size_t readMap(LoxMap* map, size_t id) {
+    if (map->size == 0) return LoxMap::INVALID_VALUE;
+    auto bucket = map->buckets[id % map->size];
+
+    if (bucket == nullptr) return LoxMap::INVALID_VALUE;
+
+    for (auto i = 0; i < bucket->size; i++) {
+        auto entry = bucket->items[i];
+        if (entry.first == id) return entry.second;
+    }
+
+    return LoxMap::INVALID_VALUE;
+}
+
+void writeMap(LoxMap* map, size_t id, size_t value) {
+    if (map->size == 0) resize(map);
+    auto& bucket = map->buckets[id % map->size];
+
+    if (bucket == nullptr) {
+        bucket = allocBucket();
+    } else if (bucket->size == LoxMap::BUCKET_SIZE) {
+        resize(map);
+
+        bucket = map->buckets[id % map->size];
+
+        if (bucket == nullptr) {
+            bucket = allocBucket();
+        }
+    }
+
+    for (auto i = 0; i < bucket->size; i++) {
+        if (bucket->items[i].first == id) {
+            bucket->items[i].second = value;
+            return;
+        }
+    }
+
+    bucket->items[bucket->size++] = {(u32)id, value};
+}
+
 struct ClassRef {
     Class* clazz;
     ClassRef* super;
     FunctionRef* parent;
-    std::unordered_map<u32, FunctionRef*> methods;
+    LoxMap methods;
 
     Function* getConstructor() {
         auto res = clazz->getMethod(CONSTRUCTOR_ID);
@@ -1802,15 +1892,16 @@ struct ObjectRef {
     ObjectRef* proto;
     FunctionRef* construcor;
     LoxValue proto1;
-    std::unordered_map<u32, LoxValue>* fields;
+    LoxMap* fields;
 
     FunctionRef* getRawMethod(u32 m, bool doCrimes) {
         ObjectRef* me = this;
         while (me != nullptr) {
-            auto r = me->clazz->methods.find(m);
-            if (r != me->clazz->methods.end()) {
-                if (doCrimes) r->second->setThis(me);
-                return r->second;
+            auto res = readMap(&me->clazz->methods, m);
+            if (res != LoxMap::INVALID_VALUE) {
+                auto r = std::bit_cast<FunctionRef*>(res);
+                if (doCrimes) r->setThis(me);
+                return r;
             }
             me = me->proto;
         }
@@ -1818,16 +1909,13 @@ struct ObjectRef {
     }
 
     LoxValue read(u32 name) {
-        if (fields->contains(name)) return fields->at(name);
+        auto r = readMap(fields, name);
+        if (r != LoxMap::INVALID_VALUE) return std::bit_cast<LoxValue>(r);
         return getMethod2(name);
     }
 
     void write(u32 name, LoxValue v) {
-        if (fields->contains(name)) {
-            fields->at(name) = v;
-        } else {
-            fields->insert({name, v});
-        }
+        writeMap(fields, name, std::bit_cast<size_t>(v));
     }
 
     LoxValue getMethod2(u32 name) {
@@ -2485,7 +2573,7 @@ namespace builtin {
     return res;
 }
 
-    ObjectRef* rawInstant(ClassRef* clazz, unordered_map<u32, LoxValue>* data) {
+    ObjectRef* rawInstant(ClassRef* clazz, LoxMap* data) {
         ObjectRef* proto = nullptr;
         if (clazz->super != nullptr) {
             proto = rawInstant(clazz->super, data);
@@ -2497,7 +2585,7 @@ namespace builtin {
 
     LoxValue instantiate(LoxValue clazz) {
         // println("instantiate {}", clazz);
-        auto* res = rawInstant(clazz.asClass(), new unordered_map<u32 , LoxValue>{});
+        auto* res = rawInstant(clazz.asClass(), new LoxMap);
         // println("after");
 
         return LoxValue::Object(res);
@@ -2506,8 +2594,9 @@ namespace builtin {
     FunctionRef* getMethod(LoxValue obj, u32 id, size_t argCount) {
         assert(obj.isObject());
         auto self = obj.asObject();
-        if (self->fields->contains(id)) {
-            auto m = self->fields->at(id);
+        auto r = readMap(self->fields, id);
+        if (r != LoxMap::INVALID_VALUE) {
+            auto m = std::bit_cast<LoxValue>(r);
             assert(m.isFunction());
             return m.asFunction();
         }
@@ -2578,7 +2667,7 @@ namespace builtin {
         if (super.isClass()) sup = super.asClass();
         auto claz = new ClassRef{clazz, sup, frame};
         for (auto [m, mId] : clazz->methodIds) {
-            claz->methods[m] = createMethod(mId, frame, nullptr);
+            writeMap(&claz->methods, m, std::bit_cast<size_t>(createMethod(mId, frame, nullptr)));
 
             // FIXME methods can depend on captured value of class, which isn't yet set, try to patch them
             for (auto i = 0ul; i < mId->captures.size(); i++) {
@@ -2586,7 +2675,7 @@ namespace builtin {
 
                 if (capture == clazz->hookedDst.id) {
                     if (clazz->hookedDst.type == HookedVariableType::ALLOC_CONST_UPVAL) {
-                        claz->methods[m]->writeConst(mId->upValCount()+i, LoxValue::Class(claz));
+                        ((FunctionRef*)readMap(&claz->methods, m))->writeConst(mId->upValCount()+i, LoxValue::Class(claz));
                     } else {
                         TODO();
                     }
@@ -4489,7 +4578,7 @@ struct ASTExecutor: ASTVisitor {
         if (constructor == nullptr && not argz.empty()) PANIC();
         if (constructor != nullptr && constructor->data.argz.size() != argz.size()) PANIC();
 
-        auto* res = builtin::rawInstant(clazz, new unordered_map<u32 , LoxValue>{});
+        auto* res = builtin::rawInstant(clazz, new LoxMap);
 
         if (constructor != nullptr) {
             auto f = res->getMethod2(CONSTRUCTOR_ID);
