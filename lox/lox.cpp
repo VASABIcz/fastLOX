@@ -1611,6 +1611,11 @@ struct ClassRef {
 
 struct ObjectRef;
 
+struct LoxStr {
+    uint32_t size;
+    char cString[];
+};
+
 struct LoxValue {
     static constexpr uint64_t NAN_MASK  = 0x7FFC000000000000; // 13 bits
     static constexpr uint64_t TAG_MASK  = 0x8003000000000000; // 3 bits
@@ -1678,7 +1683,8 @@ struct LoxValue {
     }
 
     string_view asString() const {
-        return string_view{*(string*)decodePointer(internal)};
+        auto s = (LoxStr*)decodePointer(internal);
+        return string_view{s->cString, s->size};
     }
 
     FunctionRef* asFunction() const {
@@ -1718,8 +1724,8 @@ struct LoxValue {
         return LoxValue{0};
     }
 
-    static LoxValue String(string_view s) {
-        return{encodePointer((uint64_t)ValueType2::STRING, new string(s))}; // LoxValue{.v=STRING, .str=new string(s)};
+    static LoxValue String(LoxStr* s) {
+        return{encodePointer((uint64_t)ValueType2::STRING, s)};
     }
 
     static LoxValue Class(ClassRef* ref) {
@@ -2430,6 +2436,21 @@ struct Linerizer: ASTVisitor {
 
 LoxValue GLOBALS_TABLE[512];
 
+LoxStr* allocateEmptyLoxString(size_t size) {
+    auto idk = (LoxStr*)malloc(sizeof(LoxStr)+size+1);
+    idk->size = size;
+    idk->cString[size] = 0;
+
+    return idk;
+}
+
+LoxStr* allocateLoxString(std::string_view s) {
+    auto idk = allocateEmptyLoxString(s.size());
+    std::memcpy(idk->cString, s.data(), s.size());
+
+    return idk;
+}
+
 // FIXME could be replace with jited countrapart to get rid of call overhead
 namespace builtin {
     void writeClosed(FunctionRef* v, size_t fId, size_t lId, LoxValue o) {
@@ -2499,10 +2520,10 @@ namespace builtin {
         case BinaryType::ADD:
             if (rhs.isString()) {
                 assert(lhs.isString());
-                auto idk = string{};
-                idk += lhs.asString();
-                idk += rhs.asString();
-                res = LoxValue::String(std::move(idk));
+                auto newString = allocateEmptyLoxString(lhs.asString().size() + rhs.asString().size());
+                std::memcpy(newString->cString, lhs.asString().data(), lhs.asString().size());
+                std::memcpy(newString->cString+lhs.asString().size(), rhs.asString().data(), rhs.asString().size());
+                res = LoxValue::String(newString);
             } else {
                 assert(rhs.isNumber());
                 assert(lhs.isNumber());
@@ -3463,7 +3484,7 @@ struct LoxString: public NamedIrInstruction<"lox_string", MilaGenCtx> {
     }
 
     void generate(MilaCodeGen& gen) override {
-        gen.assembler.movInt(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::String(string_view(v.data()+1, v.size()-2))));
+        gen.assembler.movInt(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::String(allocateLoxString(string_view(v.data()+1, v.size()-2)))));
     }
 };
 
@@ -4777,8 +4798,9 @@ struct ASTExecutor: ASTVisitor {
     }
 
     void invoke(StringLiteral1& it) override {
-        string_view v(it.data.value.data()+1, it.data.value.size()-2);
-        push(LoxValue::String(v));
+        TODO();
+        // string_view v(it.data.value.data()+1, it.data.value.size()-2);
+        // push(LoxValue::String(v));
     }
 
     void invoke(IF& it) override {
