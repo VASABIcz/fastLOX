@@ -1487,6 +1487,10 @@ struct FunctionRef {
 
     void write(size_t id, LoxValue val);
 
+    void writeConst(size_t id, LoxValue value);
+
+    LoxValue readConst(size_t id);
+
     void setThis(ObjectRef* self);
 };
 
@@ -1755,32 +1759,7 @@ struct LoxValue {
         return getType() == FUNCTION_REF;
     }
 
-    string toString() const {
-        switch (getType()) {
-            case FLOAT: {
-                char pepa[16];
-                snprintf(pepa, 16, "%G", asNumber());
-                return {pepa};
-            }
-            case FUNCTION_REF:
-                return (asFunction()->func->native) ? "<native fn>" : stringify("<fn {}>", asFunction()->func->data.name);
-            case NIL:
-                return "nil";
-            case BOOL:
-            case BOOL_FALSE:
-                return asBool() ? "true" : "false";
-            case STRING:
-                return string(asString());
-            case CLASS:
-                return asClass()->clazz->data.name;
-                break;
-            case INSTANCE:
-                return stringify("{} instance", (*((ClassRef**)asObject()))->clazz->data.name);
-                break;
-        }
-        // println("AAAAAAAAAAAAASDADASDASD {}", (long)v);
-        UNREACHABLE();
-    }
+    string toString() const;
 
     bool toBool() const {
         switch (getType()) {
@@ -1824,13 +1803,15 @@ struct ObjectRef {
     FunctionRef* construcor;
     LoxValue proto1;
     std::unordered_map<u32, LoxValue>* fields;
-    std::unordered_map<u32, FunctionRef*> methods;
 
-    FunctionRef* getRawMethod(u32 m) {
+    FunctionRef* getRawMethod(u32 m, bool doCrimes) {
         ObjectRef* me = this;
         while (me != nullptr) {
-            auto r = me->methods.find(m);
-            if (r != me->methods.end()) return r->second;
+            auto r = me->clazz->methods.find(m);
+            if (r != me->clazz->methods.end()) {
+                if (doCrimes) r->second->setThis(me);
+                return r->second;
+            }
             me = me->proto;
         }
         return nullptr;
@@ -2399,7 +2380,6 @@ namespace builtin {
     }
 
     LoxValue readField(LoxValue subj, u32 id) {
-        // println("AAAAAAAAAAAAAAAA readField {} {}", subj, id);
         assert(subj.isObject());
         return subj.asObject()->read(id);
     }
@@ -2511,10 +2491,7 @@ namespace builtin {
             proto = rawInstant(clazz->super, data);
         }
         auto me = new ObjectRef{clazz, proto, nullptr, proto == nullptr ? LoxValue::Nil() : LoxValue::Object(proto), data};
-        for (auto [m, mId] : clazz->clazz->methodIds) {
-            me->methods[m] = createMethod(mId, clazz->parent, me);
-        }
-        if (me->construcor == nullptr && clazz->getConstructor() != nullptr) me->construcor = me->getRawMethod(CONSTRUCTOR_ID);
+        if (me->construcor == nullptr && clazz->getConstructor() != nullptr) me->construcor = me->getRawMethod(CONSTRUCTOR_ID, false);
         return me;
     }
 
@@ -2534,7 +2511,7 @@ namespace builtin {
             assert(m.isFunction());
             return m.asFunction();
         }
-        auto m = self->getRawMethod(id);
+        auto m = self->getRawMethod(id, true);
         assert(m != nullptr);
         assert(m->argCount == argCount);
 
@@ -2600,6 +2577,23 @@ namespace builtin {
         ClassRef* sup = nullptr;
         if (super.isClass()) sup = super.asClass();
         auto claz = new ClassRef{clazz, sup, frame};
+        for (auto [m, mId] : clazz->methodIds) {
+            claz->methods[m] = createMethod(mId, frame, nullptr);
+
+            // FIXME methods can depend on captured value of class, which isn't yet set, try to patch them
+            for (auto i = 0ul; i < mId->captures.size(); i++) {
+                auto capture = mId->captures[i];
+
+                if (capture == clazz->hookedDst.id) {
+                    if (clazz->hookedDst.type == HookedVariableType::ALLOC_CONST_UPVAL) {
+                        claz->methods[m]->writeConst(mId->upValCount()+i, LoxValue::Class(claz));
+                    } else {
+                        TODO();
+                    }
+                }
+            }
+        }
+
         // println("allocateClass out {}", claz);
 
         return LoxValue::Class(claz);
@@ -2626,7 +2620,7 @@ struct MilaAssembler: virtual Assembler {
         return Label{counter++};
     }
 
-    virtual void callMethod(size_t tgt1, size_t subj1, u32 fieldId, span<size_t> argz) = 0;
+    virtual void callMethod(size_t tgt1, size_t subj1, u32 fieldId, span<size_t> argz, std::optional<size_t> methodFrame) = 0;
 
     void bind(Label l) {
         this->createLabel(l.toString());
@@ -3065,6 +3059,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         auto tgt = ctx.ensureRegWriteback(tgt1);
         auto subj = ctx.ensureReg(subj1);
         auto tmp = ctx.allocReg();
+        auto tmp1 = ctx.allocReg();
 
         auto handleNotFunctionLabel = makeLabel1();
         auto doneLabel = makeLabel1();
@@ -3107,19 +3102,25 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         cJmp(doneLabel, JumpCondType::EQUALS, tmp, zeroImm);
         freeRegister(zeroImm);
 
+        readMem(tmp1, tmp, offsetof(FunctionRef, captures), sizeof(LoxValue));
+        writeMem(tmp, tgt, offsetof(FunctionRef, captures), sizeof(LoxValue));
+
         fasterCall(tgt, tmp, t);
+
+        writeMem(tmp, tmp1, offsetof(FunctionRef, captures), sizeof(LoxValue));
+
         cJmp(doneLabel);
 
         bind(doneLabel);
         ctx.restore();
     }
 
-    void callMethod(size_t tgt1, size_t subj1, u32 fieldId, span<size_t> argz) {
+    void callMethod(size_t tgt1, size_t subj1, u32 fieldId, span<size_t> argz, std::optional<size_t> methodFrame) {
         auto ctx = this->getAllocCtx();
         auto tgt = ctx.ensureRegWriteback(tgt1);
         auto subj = ctx.ensureReg(subj1);
         auto tmp = ctx.allocReg();
-        // auto tmp1 = ctx.allocReg();
+        auto tmp1 = methodFrame.has_value() ? ctx.allocReg() : 0;
 
         auto handleNotFunctionLabel = makeLabel1();
         auto doneLabel = makeLabel1();
@@ -3131,21 +3132,20 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         movInt(tgt, LoxValue::ValueType2::INSTANCE);
         cJmp(handleNotFunctionLabel, JumpCondType::NOT_EQUALS, tmp, tgt);
 
+        // preserve `this`
+        if (methodFrame.has_value()) {
+            readMem(tmp1, *methodFrame, offsetof(FunctionRef, captures), sizeof(LoxValue));
+        }
+
         std::array<Arg,3>instArgz{handleToArg(subj), Arg::Imm(fieldId), Arg::Imm(argz.size())};
         chadCall(Arg::ImmPtr((void*)builtin::getMethod), instArgz, handleToArg(tmp));
 
-        // mc.push(ctx.REG(tmp), offsetof(FunctionRef, captures));
-        // mc.push(X64Register::R15);
-
-        // readMem(tmp1, tmp, offsetof(FunctionRef, captures), sizeof(LoxValue));
-        // writeMem(tmp, subj, offsetof(FunctionRef, captures), sizeof(LoxValue));
-
         fasterCall(tgt, tmp, t);
 
-        // mc.pop(X64Register::R15);
-        // mc.pop(ctx.REG(tmp), offsetof(FunctionRef, captures));
-
-        // writeMem(tmp, tmp1, offsetof(FunctionRef, captures), sizeof(LoxValue));
+        // restore `this`
+        if (methodFrame.has_value()) {
+            writeMem(*methodFrame, tmp1, offsetof(FunctionRef, captures), sizeof(LoxValue));
+        }
 
         cJmp(doneLabel);
 
@@ -3295,27 +3295,36 @@ struct LoxCallMethod: public NamedIrInstruction<"lox_call", MilaGenCtx> {
     u32 methodId;
     std::string methodName;
     std::vector<SSARegisterHandle> argz;
+    std::optional<SSARegisterHandle> methodFrame;
 
-    LoxCallMethod(SSARegisterHandle target, SSARegisterHandle subj, u32 methodId, std::string_view methodName, std::vector<SSARegisterHandle> argz) : NamedIrInstruction(target), subj(subj), methodId(methodId), methodName(std::string(methodName)), argz(argz) {}
+    LoxCallMethod(SSARegisterHandle target, SSARegisterHandle subj, u32 methodId, std::string_view methodName, std::vector<SSARegisterHandle> argz, std::optional<SSARegisterHandle> methodFrame) : NamedIrInstruction(target), subj(subj), methodId(methodId), methodName(std::string(methodName)), argz(argz), methodFrame(methodFrame) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         for (auto& a : argz) fn(a);
         fn(subj);
+        if (methodFrame.has_value()) fn(*methodFrame);
     }
 
     void print(MilaIrGen&) override {
-        basePrint("{}#{}@{} {}", subj, methodName, methodId, argz);
+        basePrint("{}#{}@{} {} is? {}", subj, methodName, methodId, argz, methodFrame.has_value() ? "in-method" : "in-function");
     }
 
     void generate(MilaCodeGen& gen) override {
         auto args = gen.getRegs(argz);
-        gen.assembler.callMethod(gen.getReg(target), gen.getReg(subj), methodId, args);
+        gen.assembler.callMethod(gen.getReg(target), gen.getReg(subj), methodId, args, gen.getReg(methodFrame));
     }
 };
 
 void FunctionRef::setThis(ObjectRef *self) {
-    captures[/*self->clazz->parent->func->getParamUpValOffset()+*/0] = std::bit_cast<LoxValue*>(LoxValue::Object(self));
-    // captures[/*self->clazz->parent->func->getParamUpValOffset()+*/1] = std::bit_cast<LoxValue*>(self->proto == nullptr ? LoxValue::Nil() : LoxValue::Object(self->proto));
+    writeConst(0, LoxValue::Object(self));
+}
+
+void FunctionRef::writeConst(size_t id, LoxValue value) {
+    captures[id] = std::bit_cast<LoxValue*>(value);
+}
+
+LoxValue FunctionRef::readConst(size_t id) {
+    return std::bit_cast<LoxValue>(captures[id]);
 }
 
 
@@ -3832,7 +3841,7 @@ struct Compiler: ASTVisitor {
 
     std::vector<MilaIrGenCtx> stuff;
     std::optional<SSARegisterHandle> curRet;
-    vector<std::pair<Function*, bool>> functionStack;
+    vector<std::pair<Function*, std::pair<bool, bool>>> functionStack;
 
     static constexpr std::string CURRENT_CLOSSURE = "__self";
     static constexpr std::string CURRENT_LOCALS = "__frame";
@@ -3967,7 +3976,7 @@ struct Compiler: ASTVisitor {
 
         if (auto field = dynamic_cast<FieldAccess*>(it.fName); field != nullptr) {
             auto v = genExp(field->data.subject);
-            curRet = getCtx().push<LoxCallMethod>(MilaDataType{}, v, field->fieldId, field->data.fieldName, argz);
+            curRet = getCtx().push<LoxCallMethod>(MilaDataType{}, v, field->fieldId, field->data.fieldName, argz, isCurrentFunctionMethod() ? std::optional<SSARegisterHandle>(getCurrentClosure()) : std::nullopt);
         } else {
             auto v = genExp(it.fName);
             curRet = getCtx().push<DynamicCall>(MilaDataType{}, v, argz);
@@ -4221,7 +4230,7 @@ struct Compiler: ASTVisitor {
         auto frameReg = IR_GEN_CTX.pushRegister(CURRENT_LOCALS, MilaDataType{localsCount*sizeof(LoxValue)}, {}, SSARegister::Type::VAR);
 
         pushCtx(IR_GEN_CTX);
-        functionStack.push_back({&it, isConstructor});
+        functionStack.push_back({&it, {isConstructor, isMethod}});
 
         IR_GEN_CTX.pushInstruction<instructions::Alloca>(frameReg, localsCount*sizeof(LoxValue));
 
@@ -4279,7 +4288,11 @@ struct Compiler: ASTVisitor {
     }
 
     bool isCurrentFunctionConstructor() {
-        return functionStack.back().second;
+        return functionStack.back().second.first;
+    }
+
+    bool isCurrentFunctionMethod() {
+        return functionStack.back().second.second;
     }
 
     SSARegisterHandle getCurrentClosure() {
@@ -4893,6 +4906,32 @@ int main(int argc, const char** argv) {
 
     if (DEBUG_JIT)
         std::cout << "execution took: " << std::chrono::duration_cast<std::chrono::milliseconds>(ex2-ex1).count() << std::endl;
+}
+
+string LoxValue::toString() const {
+    switch (getType()) {
+        case FLOAT: {
+            char pepa[16];
+            snprintf(pepa, 16, "%G", asNumber());
+            return {pepa};
+        }
+        case FUNCTION_REF:
+            return (asFunction()->func->native) ? "<native fn>" : stringify("<fn {}>", asFunction()->func->data.name);
+        case NIL:
+            return "nil";
+        case BOOL:
+        case BOOL_FALSE:
+            return asBool() ? "true" : "false";
+        case STRING:
+            return string(asString());
+        case CLASS:
+            return asClass()->clazz->data.name;
+            break;
+        case INSTANCE:
+            return stringify("{} instance", asObject()->clazz->clazz->data.name);
+            break;
+    }
+    UNREACHABLE();
 }
 
 // TODO FIXME!! print() is also VALID
