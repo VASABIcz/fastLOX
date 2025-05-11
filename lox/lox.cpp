@@ -1521,6 +1521,17 @@ struct __attribute__ ((packed)) LoxMap {
     u32 size = 0;
 };
 
+void dump(LoxMap* map) {
+    for (auto i = 0ul; i < map->size; i++) {
+        println("== BUCKET {}", i);
+        auto b = map->buckets[i];
+        if (b == nullptr) continue;
+        for (auto j = 0ul; j < b->size; j++) {
+            println("== key: {}, value: {}", (size_t)b->items[j].first, (size_t)b->items[j].second);
+        }
+    }
+}
+
 LoxMapBucket* allocBucket() {
     auto bucket = (LoxMapBucket*)malloc(sizeof(LoxMapBucket)+LoxMap::BUCKET_SIZE*sizeof(EntryPair));
     bucket->size = 0;
@@ -1529,20 +1540,22 @@ LoxMapBucket* allocBucket() {
 }
 
 void resize(LoxMap* map) {
+    // std::cout << "RESIZE " << map->size << " " << map->size*4 << std::endl;
     auto newSize = std::max(map->size*2, (u32)LoxMap::INIT_SIZE);
 
     auto* newBukcets = new LoxMapBucket*[newSize];
     std::memset(newBukcets, 0, newSize*sizeof(LoxMapBucket*));
 
-    for (auto i = 0; i < map->size; i++) {
+    for (auto i = 0ul; i < map->size; i++) {
         auto oldBucket = map->buckets[i];
         if (oldBucket  == nullptr) continue;
-        for (auto j = 0; j < oldBucket->size; j++) {
+        for (auto j = 0ul; j < oldBucket->size; j++) {
             auto entry = oldBucket->items[j];
             auto newBucketId = entry.first % newSize;
             auto& newBucket = newBukcets[newBucketId];
             if (newBucket == nullptr) {
-                newBucket = allocBucket();
+                newBukcets[newBucketId] = allocBucket();
+                newBucket = newBukcets[newBucketId];
             }
             newBucket->items[newBucket->size++] = entry;
         }
@@ -1553,12 +1566,15 @@ void resize(LoxMap* map) {
 }
 
 size_t readMap(LoxMap* map, size_t id) {
-    if (map->size == 0) return LoxMap::INVALID_VALUE;
+    if (map->size == 0)
+        return LoxMap::INVALID_VALUE;
+
     auto bucket = map->buckets[id % map->size];
 
-    if (bucket == nullptr) return LoxMap::INVALID_VALUE;
+    if (bucket == nullptr)
+        return LoxMap::INVALID_VALUE;
 
-    for (auto i = 0; i < bucket->size; i++) {
+    for (auto i = 0ul; i < bucket->size; i++) {
         auto entry = bucket->items[i];
         if (entry.first == id) return entry.second;
     }
@@ -1578,16 +1594,18 @@ void writeMap(LoxMap* map, size_t id, size_t value) {
         bucket = map->buckets[id % map->size];
 
         if (bucket == nullptr) {
-            bucket = allocBucket();
+            map->buckets[id % map->size] = allocBucket();
         }
+        bucket = map->buckets[id % map->size];
     }
 
-    for (auto i = 0; i < bucket->size; i++) {
+    for (auto i = 0ul; i < bucket->size; i++) {
         if (bucket->items[i].first == id) {
             bucket->items[i].second = value;
             return;
         }
     }
+    assert(bucket->size < LoxMap::BUCKET_SIZE);
 
     bucket->items[bucket->size++] = {(u32)id, value};
 }
@@ -1965,6 +1983,15 @@ size_t toLocalId(const vector<bool>& locals, size_t id) {
         if (not isUp) acu += 1;
     }
     UNREACHABLE();
+}
+
+auto FIELD_LOOKUP = new std::unordered_map<std::string_view, u32>();
+
+std::string_view idToName(u32 id) {
+    for (auto& xd : *FIELD_LOOKUP) {
+        if (xd.second == id) return xd.first;
+    }
+    PANIC();
 }
 
 // GOALS:
@@ -2613,6 +2640,7 @@ namespace builtin {
     }
 
     FunctionRef* getMethod(LoxValue obj, u32 id, size_t argCount) {
+        // println("getMethod {} {}@{} {}", obj.toString(), idToName(id), id, argCount);
         assert(obj.isObject());
         auto self = obj.asObject();
         auto r = readMap(self->fields, id);
@@ -2689,6 +2717,8 @@ namespace builtin {
         auto claz = new ClassRef{clazz, sup, frame};
         for (auto [m, mId] : clazz->methodIds) {
             writeMap(&claz->methods, m, std::bit_cast<size_t>(createMethod(mId, frame, nullptr)));
+            // std::cout << "PUTTING TO MAP " << m << " / " << mId->data.name << std::endl;
+            // dump(&claz->methods);
 
             // FIXME methods can depend on captured value of class, which isn't yet set, try to patch them
             for (auto i = 0ul; i < mId->captures.size(); i++) {
@@ -4903,7 +4933,6 @@ int main(int argc, const char** argv) {
     }
     globalFunc->data.body = globalBody;
 
-    auto FIELD_LOOKUP = new std::unordered_map<std::string_view, u32>();
     FIELD_LOOKUP->emplace(CONSTRUCTOR_NAME, 0);
 
 
