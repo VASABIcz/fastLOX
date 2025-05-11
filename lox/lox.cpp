@@ -4,12 +4,6 @@
 #include "../lexing/lexingUnits.h"
 #include "../lexing/tokenize.h"
 #include "../parsing/Parser.h"
-#include "../parsing/exceptions.h"
-// #include "../codegen/SSARegister.h"
-// #include "../codegen/IRGen.h"
-// #include "../codegen/CodeGen.h"
-// #include "../codegen/IRGenCtx.h"
-// #include "../codegen/x86/X86Assembler.h"
 #include "../utils/pdo_utils.h"
 #include "../codegen/SSARegister.h"
 #include "../codegen/IRGen.h"
@@ -5010,6 +5004,7 @@ int main(int argc, const char** argv) {
         if (DEBUG_JIT) {
             ggs.printLinearized = true;
             ggs.printLiveRanges = true;
+            ggs.warnLeak = true;
         }
 
         UNWRAPV(ggs.gen());

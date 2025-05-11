@@ -209,4 +209,8 @@ public:
     virtual void trap() {
 
     }
+
+    virtual size_t numRegs() {
+        TODO();
+    }
 };

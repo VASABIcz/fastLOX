@@ -62,6 +62,10 @@ public:
         vector<SSARegisterHandle> toFree;
 
         auto canBeDeallocated = [&](SSARegisterHandle reg) {
+            // register that is assigned but doesn't have any use
+            if (not currentLiveRanges.contains(reg)) {
+                return true;
+            }
             auto& bits = currentLiveRanges[reg];
 
             for (auto i = currentInstructionCounter; i < bits.size(); i++) {
@@ -319,7 +323,7 @@ public:
 
     CodeGen(CTX::ASSEMBLER& assembler, CTX::IRGEN& irGen, string name) : assembler(assembler), irGen(irGen), name(name) {}
 
-    bool dumpGraphPNG, printLinearized, printLiveRanges;
+    bool dumpGraphPNG, printLinearized, printLiveRanges, warnLeak;
 private:
 
     void generateInstructions(const vector<CopyPtr<IRInstruction<CTX>>>& instructions) {
@@ -334,15 +338,31 @@ private:
                 if (range.empty()) continue; // aka. if register is never used
                 if (regs.contains(reg) || !range[currentInstructionCounter]) continue;
 
-                // if its alloca dont allocate it
-                if (dynamic_cast<instructions::Alloca<CTX>*>(instruction.get()) != nullptr) {
+                // handle allocating of alloca instructions
+                auto alloca = dynamic_cast<instructions::Alloca<CTX>*>(instruction.get());
+                if (alloca != nullptr) {
+                    doAlloca(alloca->target, alloca->size);
                     continue;
                 }
                 allocateRegister(reg);
             }
 
+            auto tgt = instruction->target;
+            if (tgt.isValid() && not currentLiveRanges.contains(tgt)) {
+                allocateRegister(tgt);
+            }
+
+            auto oldRegs = this->assembler.numRegs();
+
             instruction->generate(static_cast<CTX::GEN&>(*this));
             currentInstructionCounter++;
+
+            auto newRegs = this->assembler.numRegs();
+
+            if (newRegs != oldRegs && warnLeak) {
+                println("[gen] instruction {} leaks registers old: {} vs new: {}", instruction->name, oldRegs, newRegs);
+            }
+
             deallocatePending();
 
             if (instruction->isTerminal()) break;

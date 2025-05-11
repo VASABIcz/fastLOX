@@ -92,6 +92,18 @@ public:
 
     void freeHandle(size_t handle);
 
+    size_t numRealRegs() {
+        size_t acum = 0;
+        for (auto i = 0ul; i < regs.size(); i++) {
+            if (regs[i]) acum += 1;
+        }
+        return acum;
+    }
+
+    size_t numRegs() {
+        return stack.numAllocs() + numRealRegs();
+    }
+
     size_t stackSize(size_t handle) {
         return stack.stackSize(handle);
     }

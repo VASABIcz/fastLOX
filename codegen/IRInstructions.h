@@ -684,7 +684,7 @@ namespace instructions {
         }
 
         void generate(CTX::GEN& gen) override {
-            gen.doAlloca(this->target, size);
+            // handled by CodeGen
         }
     };
 }

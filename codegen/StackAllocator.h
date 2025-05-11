@@ -67,12 +67,17 @@ struct StackAllocator {
         return allocateStackHandle(allocationStart);
     }
 
+    size_t numAllocs() {
+        return stackAllocations.size();
+    }
+
     void freeStack(size_t handle) {
         auto rawOffset = getStackOffset(handle);
         // println("[REG] freeing stack {}-{}", rawOffset, amountBytes);
         for (auto i: views::iota(rawOffset, rawOffset + stackSize(handle))) {
             stack[i] = false;
         }
+        stackAllocations.erase(handle);
     }
 
     void dumpStack() {

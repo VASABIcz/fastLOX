@@ -240,8 +240,10 @@ public:
             if (didSpill) {
                 // println("[reg-ctx] did spill {}", reg);
                 auto hand = self->dumpToStack(reg);
+                assert(not toRestore.contains(reg));
                 toRestore.insert({reg, hand});
             } else {
+                assert(not toFree.contains(self->allocator.toHandleStupid(reg)));
                 toFree.emplace(self->allocator.toHandleStupid(reg));
             }
 
@@ -299,6 +301,7 @@ public:
             auto reg = allocReg();
 
             self->movReg(reg, handle);
+            assert(not toWriteback.contains(reg));
             toWriteback.insert({reg, handle});
 
             return reg;
@@ -308,14 +311,13 @@ public:
         void restore() {
             for (auto [reg, stack] : toWriteback) {
                 self->movReg(stack, reg);
-                self->freeRegister(reg);
             }
             for (auto [reg, hand] : toRestore) {
                 self->movHandleToReg(reg, hand);
                 self->freeRegister(hand);
             }
             for (auto f : toFree) {
-                self->allocator.freeHandle(f);
+                self->freeRegister(f);
             }
         }
     };
@@ -467,5 +469,9 @@ public:
         // mc.pushBack(0xCD);
         mc.pushBack(0xCC);
         // mc.hlt();
+    }
+
+    size_t numRegs() override {
+        return allocator.numRegs();
     }
 };
