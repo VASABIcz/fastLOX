@@ -162,7 +162,8 @@ public:
             }
             buf += "}";
 
-            (void)system(stringify("echo \"{}\" | dot -Tpng > {}.png", buf, name).c_str());
+            auto res = system(stringify("echo \"{}\" | dot -Tpng > {}.png", buf, name).c_str());
+            if (res) println("[gen] dumping exited with {}", res);
         }
 
         if (irGen.graph.nodeCount() != 0)

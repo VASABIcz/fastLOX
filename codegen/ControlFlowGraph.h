@@ -48,7 +48,8 @@ struct ControlFlowGraph {
         }
         buf += "}";
 
-        (void)system(stringify("echo \"{}\" | dot -Tsvg > {}", buf, name).c_str());
+        auto res = system(stringify("echo \"{}\" | dot -Tsvg > {}", buf, name).c_str());
+        if (res) println("[gen] dumping exited with {}", res);
     }
 
     /// tries to look up the original non-shadowed variable
