@@ -162,7 +162,7 @@ public:
             }
             buf += "}";
 
-            system(stringify("echo \"{}\" | dot -Tpng > {}.png", buf, name).c_str());
+            (void)system(stringify("echo \"{}\" | dot -Tpng > {}.png", buf, name).c_str());
         }
 
         if (irGen.graph.nodeCount() != 0)

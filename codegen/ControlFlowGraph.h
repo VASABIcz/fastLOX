@@ -48,7 +48,7 @@ struct ControlFlowGraph {
         }
         buf += "}";
 
-        system(stringify("echo \"{}\" | dot -Tsvg > {}", buf, name).c_str());
+        (void)system(stringify("echo \"{}\" | dot -Tsvg > {}", buf, name).c_str());
     }
 
     /// tries to look up the original non-shadowed variable
