@@ -75,6 +75,10 @@ public:
         return "NO-STUFF";
     }
 
+    void derefChainI(size_t reg, std::initializer_list<int> offsets) {
+        derefChain(reg, offsets);
+    }
+
     // 0 -> reg+0
     // 8 -> reg+8
     // 0 0 -> [reg+0]+0
@@ -92,10 +96,6 @@ public:
             addInt(reg, reg, v);
             freeRegister(v);
         }
-    }
-
-    void derefChainI(size_t reg, std::initializer_list<int> offsets) {
-        derefChain(reg, offsets);
     }
 
     virtual ~Assembler() = default;
@@ -169,25 +169,26 @@ public:
     virtual void f64ToF32(RegisterHandle dest, RegisterHandle value) = 0;
 
     // control flow
-    virtual void jmpLabelTrue(RegisterHandle cond, string_view label) = 0;
-    virtual void jmpLabelFalse(RegisterHandle cond, string_view label) = 0;
-    virtual void jmp(string_view label) = 0;
-    virtual void jmpCond(string_view label, JumpCondType type, RegisterHandle lhs, RegisterHandle rhs) {
+    virtual size_t allocateJmpLabel() {
         PANIC();
     }
-    virtual void createLabel(string_view name) = 0;
+    virtual void jmpLabelTrue(RegisterHandle cond, size_t label) = 0;
+    virtual void jmpLabelFalse(RegisterHandle cond, size_t label) = 0;
+    virtual void jmp(size_t label) = 0;
+    virtual void jmpCond(size_t label, JumpCondType type, RegisterHandle lhs, RegisterHandle rhs) {
+        PANIC();
+    }
+    virtual void createLabel(size_t name) = 0;
 
-    // function calls
-
-    virtual void movSymbol(RegisterHandle dst, size_t value) {
+    virtual void bindHint(std::string_view s) {
         TODO();
     }
 
-    size_t movImmToReg(size_t value) {
-        auto reg = allocateRegister(8);
-        movSymbol(reg, value);
-        return reg;
+    virtual void dumpHints(std::string_view s) {
+        TODO();
     }
+
+    // function calls
 
     size_t movImmValueToReg(size_t value) {
         auto reg = allocateRegister(8);
@@ -207,7 +208,6 @@ public:
     virtual void instructionNumberHint(size_t id) {}
     virtual void nop() = 0;
     virtual void trap() {
-
     }
 
     virtual size_t numRegs() {

@@ -18,6 +18,32 @@ public:
     typedef CodeBlock<CTX> BaseBlock;
     CTX::ASSEMBLER& assembler;
     typedef size_t RegisterHandle;
+    std::map<size_t, size_t> labelMapping;
+
+    void jmpBlock(size_t blockId) {
+        assembler.jmp(getJmpLabelForBlock(blockId));
+    }
+
+    void jmpBlockTrue(size_t reg, size_t blockId) {
+        assembler.jmpLabelTrue(reg, getJmpLabelForBlock(blockId));
+    }
+
+    void jmpBlockFalse(size_t reg, size_t blockId) {
+        assembler.jmpLabelFalse(reg, getJmpLabelForBlock(blockId));
+    }
+
+    void jmpBlockCond(size_t blockId, JumpCondType type, size_t lhs, size_t rhs) {
+        assembler.jmpCond(getJmpLabelForBlock(blockId), type, lhs, rhs);
+    }
+
+    size_t getJmpLabelForBlock(size_t block) {
+        if (labelMapping.contains(block)) return labelMapping.at(block);
+
+        auto label = assembler.allocateJmpLabel();
+        labelMapping[block] = label;
+
+        return label;
+    }
 
     CodeGen::RegisterHandle allocateRegister(const SSARegisterHandle& tgt) {
         if (!tgt.isValid()) PANIC();
@@ -238,7 +264,8 @@ public:
 
     void generateCodeBlock(const BaseBlock& block) {
         // println("[GEN] generating block {}", block.blockId);
-        assembler.createLabel(to_string(block.blockId));
+        assembler.createLabel(getJmpLabelForBlock(block.id()));
+        assembler.bindHint(stringify("== CODE_BLOCK {}", block.id()));
 
         const auto& instructions = block.getInstructions();
 
@@ -277,8 +304,8 @@ public:
         }
     }
 
-    string nextLabel() {
-        return "TEMP_LABEL_"+to_string(labelCounter++);
+    size_t nextLabel() {
+        return assembler.allocateJmpLabel();
     }
 
     vector<CodeGen::RegisterHandle> getRegs(span<SSARegisterHandle> regs) {
@@ -331,6 +358,9 @@ private:
         for (const auto& [id, instruction] : instructions | views::enumerate) {
             this->assembler.nop();
             assembler.instructionNumberHint(currentInstructionCounter);
+            std::stringstream ss;
+            instruction->print(irGen, ss);
+            assembler.bindHint(ss.str());
 
             // cout << "[GEN] generating: ";
             // instruction->print(this->irGen);

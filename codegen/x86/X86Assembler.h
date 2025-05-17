@@ -21,23 +21,109 @@ using namespace std;
 
 Result<void> linkRelative(u8* data, const map<string , vector<Label>>& missing, const map<string, Label>& labels);
 
+struct BoundLabel {
+    size_t offset;
+    size_t type;
+    size_t id;
+};
+
+enum class BaseType {
+    ABSOLUTE_8,
+    ABSOLUTE_4,
+    ABSOLUTE_2,
+    ABSOLUTE_1,
+    RIP_REL_4,
+    RIP_REL_2,
+    RIP_REL_1,
+};
+
+inline size_t labelTypeToSize(BaseType type) {
+    switch (type) {
+        case BaseType::ABSOLUTE_8: return 8;
+        case BaseType::ABSOLUTE_4: return 4;
+        case BaseType::ABSOLUTE_2: return 2;
+        case BaseType::ABSOLUTE_1: return 1;
+        case BaseType::RIP_REL_4: return 4;
+        case BaseType::RIP_REL_2: return 2;
+        case BaseType::RIP_REL_1: return 1;
+    }
+    PANIC();
+}
+
+struct SlotLabel {
+    size_t type;
+    size_t offset;
+    size_t id;
+    BaseType baseType;
+    long adend;
+};
 
 class X86Assembler: virtual public Assembler {
 public:
     RegAlloc allocator;
     vector<u8> bytes;
-    map<string, Label> labels;
-    map<string, vector<Label>> spaces;
-    vector<size_t> absoluteLabels;
+    // map<string, Label> labels;
+    size_t labelId = 10;
+    size_t labelTypeId = 10;
+    // map<string, vector<Label>> spaces;
+    std::map<size_t, BoundLabel> boundLabels;
+    std::map<size_t, std::vector<SlotLabel>> slotLabels;
     X86mc mc;
     vector<size_t> argSizes;
     size_t retSize;
     vector<size_t> argHandles;
 
+    size_t currentOffset() {
+        return bytes.size();
+    }
+
+    void bindRawLabel(size_t id, size_t type) {
+        assert(not boundLabels.contains(id));
+
+        boundLabels[id] = BoundLabel{currentOffset(), type, id};
+    }
+
+    virtual void bindHint(std::string_view h) {}
+
+    void bindJmp(size_t id) {
+        bindRawLabel(id, LABEL_TYPE_JMP);
+    }
+
+    void bindReturn(size_t id) {
+        bindRawLabel(id, LABEL_TYPE_RETURN);
+    }
+
+    size_t allocateLabel() {
+        return labelId++;
+    }
+
+    size_t allocateLabelType() {
+        return labelTypeId++;
+    }
+
+    void requestLabel(size_t id, ImmSpace space, size_t type, BaseType baseType) {
+        assert(labelTypeToSize(baseType) == space.size);
+        slotLabels[id].push_back(SlotLabel{type, space.offset, id, baseType, 0});
+    }
+
+    void requestJmpLabel(size_t id, ImmSpace space) {
+        requestLabel(id, space, LABEL_TYPE_JMP, BaseType::RIP_REL_4);
+    }
+
+    void requestStackSize(size_t id, ImmSpace space) {
+        requestLabel(id, space, LABEL_TYPE_STACK_SIZE, BaseType::ABSOLUTE_4);
+    }
+
     static constexpr size_t REG_SIZE = 8;
     static constexpr size_t STACK_ALIGNMENT = 16;
-    static constexpr string STACK_LABEL = "_STACK_";
     static constexpr string STACK_SIZE_LABEL = "_STACK_SIZE_";
+
+    static constexpr size_t LABEL_TYPE_JMP = 0;
+    static constexpr size_t LABEL_TYPE_RETURN = 1;
+    static constexpr size_t LABEL_TYPE_STACK_SIZE = 2;
+    static constexpr size_t LABEL_TYPE_DEBUG_HINT = 3;
+    static constexpr size_t LABEL_STACK_BEGIN = 4;
+    static constexpr size_t LABEL_SYMBOL = 5;
 
     X86Assembler(span<size_t> argSizes, size_t retSize);
 
@@ -118,10 +204,10 @@ public:
 
     // flow control functions
     void nop() override;
-    void jmp(string_view label) override;
-    void createLabel(string_view name) override;
-    void jmpLabelTrue(RegisterHandle cond, string_view label) override;
-    void jmpLabelFalse(RegisterHandle cond, string_view label) override;
+    void jmp(size_t label) override;
+    void createLabel(size_t name) override;
+    void jmpLabelTrue(RegisterHandle cond, size_t label) override;
+    void jmpLabelFalse(RegisterHandle cond, size_t label) override;
     void generateRet() override;
     void generateRet(RegisterHandle value) override;
 
@@ -135,6 +221,10 @@ public:
     void garbageMemCpy(X64Register ptrReg, size_t stackOffset, size_t stackSize);
 
     void garbageMemCpy(X64Register dst, size_t dstOffset, X64Register src, size_t srcOffset, size_t stackSize);
+
+    size_t allocateJmpLabel() override {
+        return this->labelId++;
+    }
 
     // void invokeBuiltin(LinkSymbol symbol, span<const Assembler::RegisterHandle> args, optional<Assembler::RegisterHandle> ret) override;
 
@@ -153,30 +243,21 @@ public:
 
     string nextReturnLabel();
 
-    void movLabel(const X64Register& dest, size_t value);
-
-    void movLabel(int offset, size_t name);
-
     // beginning of a block (IF0, ELSE1, SWITCH3, FOR7)
-    void makeLabel(string_view name, Label::Type type, int size = 8, size_t data = 0);
+    // void makeLabel(string_view name, Label::Type type, int size = 8, size_t data = 0);
 
-    void makeAbsolute(string_view name, int size) {
+/*    void makeAbsolute(string_view name, int size) {
         makeLabel(name, Label::Type::ABSOLUTE1, size);
-    }
+    }*/
 
-    void putRelative(string_view name, ImmSpace space);
+    // void putRelative(string_view name, ImmSpace space);
 
-    void putAbsolute(string_view name, ImmSpace space);
+    // void putAbsolute(string_view name, ImmSpace space);
 
-    void putLabel(string_view name, ImmSpace space, Label::Type type, size_t data = 0);
-
-    void putGOT(size_t index, ImmSpace space) {
-        spaces["GOT-GOT"].push_back(Label{static_cast<long>(space.offset), static_cast<int>(space.size), Label::Type::GOT, index});
-    }
+    // void putLabel(string_view name, ImmSpace space, Label::Type type, size_t data = 0);
 
     void withSavedCallRegs(span<const X64Register> exclude, span<const X64Register> excluceRestore, const std::function<X64Register::SaveType(const X64Register&)>& convention, const std::function<void(const map<X64Register, size_t>&)>& callback);
 
-    void callC(size_t label, span<const RegisterHandle> args, optional<RegisterHandle> ret);
 
     void callC(Arg label, span<const RegisterHandle> args, optional<RegisterHandle> ret) {
         vector<Arg> argz;
@@ -192,11 +273,40 @@ public:
         chadCall(label, argz, idk);
     }
 
-    void writeJmp(CmpType jmp, string_view label);
+    void writeJmp(CmpType jmp, size_t id);
 
-    void writeJmp(string_view label);
+    void writeJmp(size_t id);
+
+    void insertBytes(std::span<u8> otherBytes, size_t offset) {
+        for (auto& bound : this->boundLabels) {
+            if (bound.second.offset >= offset) {
+                bound.second.offset += otherBytes.size();
+            }
+        }
+
+        for (auto& slots : this->slotLabels) {
+            for (auto& idk : slots.second) {
+                if (idk.offset >= offset) idk.offset += otherBytes.size();
+            }
+        }
+
+        bytes.insert(bytes.begin()+offset, otherBytes.begin(), otherBytes.end());
+    }
 
     void withSpecificReg(const X64Register& reg, const function<void()>& callback);
+
+    BoundLabel getUniqueBoundLabel(size_t type) {
+        for (auto slots : this->boundLabels) {
+            if (slots.second.type == type) return slots.second;
+        }
+        PANIC();
+    }
+
+    void forEachBound(std::function<void(BoundLabel&)> funk) {
+        for (auto& slots : this->boundLabels) {
+            funk(slots.second);
+        }
+    }
 
     size_t preserveCalleeRegs(const std::function<X64Register::SaveType(X64Register)>& save);
 
@@ -347,8 +457,6 @@ public:
 
     void twoWayWrapper(size_t tgt, size_t lhs, size_t rhs, auto fun);
 
-    void movSymbol(RegisterHandle dst, size_t value) override;
-
     void movRegToReg(const X64Register& dst, const X64Register& src, size_t size);
 
     void movRegToStack(size_t handle, int _offset, const X64Register& src);
@@ -435,22 +543,28 @@ public:
     // 8 < value <= 16 will be passed over 2 registers
     void invokeScuffedSYSV(Arg func, span<Arg> args, optional<Arg> ret);
 
-    void generateArgMove(X64Register ret, Arg arg) {
-        ImmSpace space;
+    void generateArgMove(X64Register ret, Arg arg, ImmSpace imm) {
+        if (not arg.symbol.has_value()) return;
+
         switch (arg.type) {
-            case Arg::SYMBOL:
-                movLabel(ret, arg.symbol);
+            case Arg::REGISTER:
+                break;
+            case Arg::IMMEDIATE:
+                assert(imm.size == 8);
+                requestLabel(*arg.symbol, imm, LABEL_SYMBOL, BaseType::ABSOLUTE_8);
+                break;
+            case Arg::REG_OFFSET:
+                break;
+            case Arg::REG_OFFSET_VALUE:
                 break;
             case Arg::SYMBOL_RIP_OFF_32:
-                space = mc.leaRip(ret, 0);
-                putLabel(stringify("__{}", arg.symbol), space, Label::Type::RIP_REL_32_ADR, arg.offset);
+                assert(imm.size == 4);
+                requestLabel(*arg.symbol, imm, LABEL_SYMBOL, BaseType::RIP_REL_4);
                 break;
             case Arg::SYMBOL_RIP_VALUE_32:
-                space = mc.relativeRead(ret, arg.offset);
-                putLabel(stringify("__{}", arg.symbol), space, Label::Type::RIP_REL_32_VAL, arg.offset);
+                assert(imm.size == 4);
+                requestLabel(*arg.symbol, imm, LABEL_SYMBOL, BaseType::RIP_REL_4);
                 break;
-            default:
-                PANIC()
         }
     }
 
@@ -458,11 +572,52 @@ public:
 
     void chadCall(Arg fun, span<Arg> args, optional<Arg> ret);
 
-    void jmpCond(string_view label, JumpCondType type, RegisterHandle lhs, RegisterHandle rhs) override;
+    void jmpCond(size_t label, JumpCondType type, RegisterHandle lhs, RegisterHandle rhs) override;
+
+    static constexpr size_t JMP_OFFSET_SIZE = 4;
+
+    void linkRelative(size_t dst, size_t src, size_t size, long adend) {
+        assert(size == 4);
+
+        i32 offset = ((i32)src-((i32)dst+4))+adend;
+
+        std::memcpy(bytes.data()+dst, &offset, size);
+    }
+
+
+
+    void linkJumps() {
+        forEachLabel([&](SlotLabel& it) {
+            if (it.type != LABEL_TYPE_JMP) return;
+
+            auto bound = this->getBoundLabelById(it.id);
+
+            linkRelative(it.offset, bound.offset, 4, 0);
+        });
+    }
+
+    void forEachLabel(std::function<void(SlotLabel&)> funk) {
+        for (auto& slots : this->slotLabels) {
+            for (auto& slot : slots.second) {
+                funk(slot);
+            }
+        }
+    }
+
+    BoundLabel getBoundLabelById(size_t id){
+        assert(boundLabels.contains(id));
+        return boundLabels[id];
+    }
 
     template<typename T>
-    void patchLabel(Label l, T value) {
-        std::memcpy(bytes.data()+l.index, &value, sizeof value);
+    void patchLabel(SlotLabel l, T value) {
+        assert(labelTypeToSize(l.baseType) == sizeof value);
+        patchOffset<T>(l.offset, value);
+    }
+
+    template<typename T>
+    void patchOffset(size_t offset, T value) {
+        std::memcpy(bytes.data()+offset, &value, sizeof value);
     }
 
     void trap() override {

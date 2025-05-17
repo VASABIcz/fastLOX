@@ -14,7 +14,7 @@ struct Arg {
     enum Type {
         REGISTER,
         IMMEDIATE,
-        SYMBOL, // space = *(&symbol-&space+offset)
+        // SYMBOL, // space = *(&symbol-&space+offset)
         REG_OFFSET,
         REG_OFFSET_VALUE,
         SYMBOL_RIP_OFF_32, // space = &symbol-&space+offset
@@ -26,7 +26,7 @@ struct Arg {
     int offset;
     Type type;
     size_t immValue;
-    size_t symbol;
+    std::optional<size_t> symbol;
 
     size_t sizeBytes() const {
         switch (type) {
@@ -34,8 +34,8 @@ struct Arg {
                 return 8;
             case IMMEDIATE:
                 return 8;
-            case SYMBOL:
-                return 8;
+            // case SYMBOL:
+            //    return 8;
             case REG_OFFSET:
                 return 8;
             case REG_OFFSET_VALUE:
@@ -72,14 +72,6 @@ struct Arg {
         idk.reg = reg;
         idk.offset = offset;
         idk.size = size;
-
-        return idk;
-    }
-
-    static Arg Symbol(size_t symbol) {
-        Arg idk;
-        idk.type = Type::SYMBOL;
-        idk.symbol = symbol;
 
         return idk;
     }
@@ -160,8 +152,8 @@ struct Arg {
                 return stringify("Reg({})", reg.toString());
             case IMMEDIATE:
                 return stringify("Imm({})", immValue);
-            case SYMBOL:
-                return stringify("Sym({})", symbol);
+            // case SYMBOL:
+            //    return stringify("Sym({})", symbol);
             case REG_OFFSET:
                 return stringify("Off({}+{})", reg, offset);
             case REG_OFFSET_VALUE:
@@ -320,6 +312,13 @@ public:
         }
 
         return writeImmValue(offset);
+    }
+
+    ImmSpace mov32(const X64Register& dest, i32 value) {
+        writeRex(true, false, dest.isExt());
+        pushBack(0xC7);
+        writeModRM(X64Register::Zero, dest);
+        return writeImmValue(value);
     }
 
     void writePtr(const X64Register& dest, const X64Register& src, int32_t offset, SibScale scale = SibScale::One);
@@ -636,7 +635,7 @@ public:
         }
     }
 
-    void invokeScuffedSYSV(Arg func, span<Arg> args, optional<Arg> ret, const map<X64Register, size_t>& saved, std::function<void(X64Register, Arg)> movLabel) {
+    void invokeScuffedSYSV(Arg func, span<Arg> args, optional<Arg> ret, const map<X64Register, size_t>& saved, std::function<void(X64Register, Arg, ImmSpace)> movLabel) {
         /// 6GP registers used for passing arguments
         const std::array<X64Register, 6> SYSV_REGS{X64Register::Rdi, X64Register::Rsi, X64Register::Rdx, X64Register::Rcx, X64Register::R8, X64Register::R9};
         /// temporaries for local use
@@ -704,10 +703,12 @@ public:
                     case Arg::IMMEDIATE:
                         mov(argReg, arg.immValue);
                         break;
-                    case Arg::SYMBOL:
-                    case Arg::SYMBOL_RIP_OFF_32: // FIXME this could be gened here
-                    case Arg::SYMBOL_RIP_VALUE_32: // FIXME this could be gened here
-                        movLabel(argReg, arg);
+                    // case Arg::SYMBOL:
+                    case Arg::SYMBOL_RIP_OFF_32:
+                        movLabel(argReg, arg, leaRip(argReg, arg.offset));
+                        break;
+                    case Arg::SYMBOL_RIP_VALUE_32:
+                        movLabel(argReg, arg, relativeRead(argReg, arg.offset));
                         break;
                     case Arg::REG_OFFSET:
                         lea(argReg, movToReg(arg.reg), arg.offset);
@@ -724,7 +725,7 @@ public:
                 switch (arg.type) {
                     case Arg::REGISTER:
                     case Arg::IMMEDIATE:
-                    case Arg::SYMBOL:
+                    // case Arg::SYMBOL:
                     case Arg::REG_OFFSET:
                     case Arg::SYMBOL_RIP_OFF_32:
                     case Arg::SYMBOL_RIP_VALUE_32:
@@ -771,10 +772,13 @@ public:
                         mov(TMP_REG, arg.immValue);
                         writeStack(currentOffset, TMP_REG);
                         break;
-                    case Arg::SYMBOL:
-                    case Arg::SYMBOL_RIP_OFF_32: // FIXME these could be gened here
+                    // case Arg::SYMBOL:
+                    case Arg::SYMBOL_RIP_OFF_32:
+                        movLabel(TMP_REG, arg, leaRip(TMP_REG, arg.offset));
+                        writeStack(currentOffset, TMP_REG);
+                        break;
                     case Arg::SYMBOL_RIP_VALUE_32:
-                        movLabel(TMP_REG, arg);
+                        movLabel(TMP_REG, arg, relativeRead(TMP_REG, arg.offset));
                         writeStack(currentOffset, TMP_REG);
                         break;
                     case Arg::REG_OFFSET: {
@@ -805,10 +809,12 @@ public:
             case Arg::IMMEDIATE:
                 mov(TMP_REG, func.immValue);
                 break;
-            case Arg::SYMBOL:
-            case Arg::SYMBOL_RIP_OFF_32: // FIXME these could be gened here
+            // case Arg::SYMBOL:
+            case Arg::SYMBOL_RIP_OFF_32:
+                movLabel(TMP_REG, func, leaRip(TMP_REG, func.offset));
+                break;
             case Arg::SYMBOL_RIP_VALUE_32:
-                movLabel(TMP_REG, func);
+                movLabel(TMP_REG, func, relativeRead(TMP_REG, func.offset));
                 break;
             case Arg::REG_OFFSET: {
                 auto srcReg = movToReg(func.reg);
@@ -839,7 +845,7 @@ public:
         if (ret.has_value()) {
             switch (ret->type) {
                 case Arg::IMMEDIATE:
-                case Arg::SYMBOL:
+                // case Arg::SYMBOL:
                 case Arg::REG_OFFSET:
                 case Arg::SYMBOL_RIP_OFF_32:
                 case Arg::SYMBOL_RIP_VALUE_32:
@@ -863,7 +869,7 @@ public:
         }
     }
 
-    void invokeScuffedSYSV2(Arg func, span<Arg> args, optional<Arg> ret, const map<X64Register, size_t>& saved, std::function<void(X64Register, Arg)> movLabel) {
+    void invokeScuffedSYSV2(Arg func, span<Arg> args, optional<Arg> ret, const map<X64Register, size_t>& saved, std::function<void(X64Register, Arg, ImmSpace)> movLabel) {
         /// 6GP registers used for passing arguments
         const std::array<X64Register, 6> SYSV_REGS{X64Register::Rdi, X64Register::Rsi, X64Register::Rdx, X64Register::Rcx, X64Register::R8, X64Register::R9};
         /// temporaries for local use
@@ -936,10 +942,12 @@ public:
                     case Arg::IMMEDIATE:
                         mov(argReg, arg.immValue);
                         break;
-                    case Arg::SYMBOL:
-                    case Arg::SYMBOL_RIP_OFF_32: // FIXME this could be gened here
-                    case Arg::SYMBOL_RIP_VALUE_32: // FIXME this could be gened here
-                        movLabel(argReg, arg);
+                    // case Arg::SYMBOL:
+                    case Arg::SYMBOL_RIP_OFF_32:
+                        movLabel(argReg, arg, leaRip(argReg, arg.offset));
+                        break;
+                    case Arg::SYMBOL_RIP_VALUE_32:
+                        movLabel(argReg, arg, relativeRead(argReg, arg.offset));
                         break;
                     case Arg::REG_OFFSET:
                         lea(argReg, movToReg(arg.reg), arg.offset);
@@ -957,7 +965,7 @@ public:
                 switch (arg.type) {
                     case Arg::REGISTER:
                     case Arg::IMMEDIATE:
-                    case Arg::SYMBOL:
+                    // case Arg::SYMBOL:
                     case Arg::REG_OFFSET:
                     case Arg::SYMBOL_RIP_OFF_32:
                     case Arg::SYMBOL_RIP_VALUE_32:
@@ -1007,10 +1015,14 @@ public:
                         writeStack(currentOffset, TMP_REG);
                         markClobbered(TMP_REG);
                         break;
-                    case Arg::SYMBOL:
-                    case Arg::SYMBOL_RIP_OFF_32: // FIXME these could be gened here
+                    // case Arg::SYMBOL:
+                    case Arg::SYMBOL_RIP_OFF_32:
+                        movLabel(TMP_REG, arg, leaRip(TMP_REG, arg.offset));
+                        writeStack(currentOffset, TMP_REG);
+                        markClobbered(TMP_REG);
+                        break;
                     case Arg::SYMBOL_RIP_VALUE_32:
-                        movLabel(TMP_REG, arg);
+                        movLabel(TMP_REG, arg, relativeRead(TMP_REG, arg.offset));
                         writeStack(currentOffset, TMP_REG);
                         markClobbered(TMP_REG);
                         break;
@@ -1044,10 +1056,11 @@ public:
             case Arg::IMMEDIATE:
                 mov(TMP_REG, func.immValue);
                 break;
-            case Arg::SYMBOL:
-            case Arg::SYMBOL_RIP_OFF_32: // FIXME these could be gened here
+            case Arg::SYMBOL_RIP_OFF_32:
+                movLabel(TMP_REG, func, leaRip(TMP_REG, func.offset));
+                break;
             case Arg::SYMBOL_RIP_VALUE_32:
-                movLabel(TMP_REG, func);
+                movLabel(TMP_REG, func, relativeRead(TMP_REG, func.offset));
                 break;
             case Arg::REG_OFFSET: {
                 auto srcReg = movToReg(func.reg);
@@ -1078,7 +1091,7 @@ public:
         if (ret.has_value()) {
             switch (ret->type) {
                 case Arg::IMMEDIATE:
-                case Arg::SYMBOL:
+                // case Arg::SYMBOL:
                 case Arg::REG_OFFSET:
                 case Arg::SYMBOL_RIP_OFF_32:
                 case Arg::SYMBOL_RIP_VALUE_32:
@@ -1103,7 +1116,7 @@ public:
     }
 
     // NOTE: we can theorteicaly make `allocateStack` optional dependency, allocate our stack as fallback
-    void invokeScuffedFastCall(Arg func, span<Arg> args, optional<Arg> ret, const map<X64Register, size_t>& saved, const std::function<void(X64Register, Arg)>& movLabel, const std::function<size_t(size_t)>& allocateStack) {
+    void invokeScuffedFastCall(Arg func, span<Arg> args, optional<Arg> ret, const map<X64Register, size_t>& saved, const std::function<void(X64Register, Arg, ImmSpace)>& movLabel, const std::function<size_t(size_t)>& allocateStack) {
         /// 6GP registers used for passing arguments
         const array<X64Register, 4> ARG_REGS{X64Register::Rcx, X64Register::Rdx, X64Register::R8, X64Register::R9};
         const size_t STACK_BYTES_RESERVED = 8 * ARG_REGS.size();
@@ -1153,10 +1166,12 @@ public:
                     case Arg::IMMEDIATE:
                         mov(dstReg, arg.immValue);
                         break;
-                    case Arg::SYMBOL:
-                    case Arg::SYMBOL_RIP_OFF_32: // FIXME these could be gened here
+                    // case Arg::SYMBOL:
+                    case Arg::SYMBOL_RIP_OFF_32:
+                        movLabel(dstReg, arg, leaRip(dstReg, arg.offset));
+                        break;
                     case Arg::SYMBOL_RIP_VALUE_32:
-                        movLabel(dstReg, arg);
+                        movLabel(dstReg, arg, relativeRead(dstReg, arg.offset));
                         break;
                     case Arg::REG_OFFSET:
                         lea(dstReg, movToReg(arg.reg), arg.offset);
@@ -1215,10 +1230,13 @@ public:
                     mov(TMP_REG, arg.immValue);
                     writeStack(currentOffset, TMP_REG);
                     break;
-                case Arg::SYMBOL:
+                // case Arg::SYMBOL:
                 case Arg::SYMBOL_RIP_OFF_32:
+                    movLabel(TMP_REG, arg, leaRip(TMP_REG, arg.offset));
+                    writeStack(currentOffset, TMP_REG);
+                    break;
                 case Arg::SYMBOL_RIP_VALUE_32:
-                    movLabel(TMP_REG, arg);
+                    movLabel(TMP_REG, arg, relativeRead(TMP_REG, arg.offset));
                     writeStack(currentOffset, TMP_REG);
                     break;
                 case Arg::REG_OFFSET: {
@@ -1247,10 +1265,14 @@ public:
             case Arg::IMMEDIATE:
                 mov(TMP_REG, func.immValue);
                 break;
-            case Arg::SYMBOL:
+            // case Arg::SYMBOL:
             case Arg::SYMBOL_RIP_OFF_32:
+                movLabel(TMP_REG, func, leaRip(TMP_REG, func.offset));
+                writeStack(currentOffset, TMP_REG);
+                break;
             case Arg::SYMBOL_RIP_VALUE_32:
-                movLabel(TMP_REG, func);
+                movLabel(TMP_REG, func, relativeRead(TMP_REG, func.offset));
+                writeStack(currentOffset, TMP_REG);
                 break;
             case Arg::REG_OFFSET: {
                 auto srcReg = movToReg(func.reg);
@@ -1279,7 +1301,7 @@ public:
         if (ret.has_value()) {
             switch (ret->type) {
                 case Arg::IMMEDIATE:
-                case Arg::SYMBOL:
+                // case Arg::SYMBOL:
                 case Arg::REG_OFFSET:
                 case Arg::SYMBOL_RIP_OFF_32:
                 case Arg::SYMBOL_RIP_VALUE_32:
@@ -1299,7 +1321,7 @@ public:
         }
     }
 
-    void generateNativeCallWrapper(span<size_t> argSizes1, size_t retSize1, Arg idk, std::function<void(X64Register, Arg)> movLabel) {
+    void generateNativeCallWrapper(span<size_t> argSizes1, size_t retSize1, Arg idk, std::function<void(X64Register, Arg, ImmSpace)> movLabel) {
 #ifdef __unix__
         return generateCallWrapperSYSV(argSizes1, retSize1, idk, movLabel);
 #else
@@ -1307,7 +1329,7 @@ public:
 #endif
     }
 
-    void generateCallWrapperSYSV(span<size_t> argSizes1, size_t retSize1, Arg idk, std::function<void(X64Register, Arg)> movLabel) {
+    void generateCallWrapperSYSV(span<size_t> argSizes1, size_t retSize1, Arg idk, std::function<void(X64Register, Arg, ImmSpace)> movLabel) {
         // Rdi - args, Rsi - ret, Rcx - runtime
         nop();
         nop();
@@ -1340,7 +1362,7 @@ public:
         this->ret();
     }
 
-    void generateCallWrapperFast(span<size_t> argSizes1, size_t retSize1, Arg idk, std::function<void(X64Register, Arg)> movLabel) {
+    void generateCallWrapperFast(span<size_t> argSizes1, size_t retSize1, Arg idk, std::function<void(X64Register, Arg, ImmSpace)> movLabel) {
         nop();
         nop();
         nop();
@@ -1381,6 +1403,22 @@ public:
         leave();
         this->ret();
     }
+
+/*    void push(const X64Register& obj, i32 offset) {
+        if (obj.isExt()) writeRex(false, false, true);
+
+        pushBack(0xFF);
+
+        someOffsetStuffForMov(X64Register::Six, obj, offset);
+    }
+
+    void pop(const X64Register& obj, i32 offset) {
+        if (obj.isExt()) writeRex(false, false, true);
+
+        pushBack(0x8F);
+
+        someOffsetStuffForMov(X64Register::Zero, obj, offset);
+    }*/
 
     void frameInit() {
         push(X64Register::Rbp);
@@ -1537,6 +1575,9 @@ struct ElfSection {
     u32 info = 0;
     u64 align = 0;
     u64 entrySize = 0;
+
+    // mine
+    u16 SECTION_ID;
 };
 
 struct Relocation {
@@ -1556,6 +1597,15 @@ struct ElfBuilder {
         None = 0,
         amd64 = 0x3E
     };
+
+    ElfBuilder() {
+        // ???????????????
+        {
+            auto sec = this->putSection();
+            sec->type = ElfSection::Type::Null;
+            sec->nameId = 0;
+        }
+    }
 
     vector<u8> bytes;
     vector<unique_ptr<ElfPRogram>> programs;
@@ -1588,6 +1638,7 @@ struct ElfBuilder {
 
     ElfSection* putSection() {
         sections.push_back(make_unique<ElfSection>());
+        sections.back().get()->SECTION_ID = sections.size()-1;
         return sections.back().get();
     }
 
@@ -1752,6 +1803,108 @@ struct ElfBuilder {
                pushBack(0xF4);
            }*/
     }
+
+    struct StringsBuilder {
+        std::vector<u8> table;
+        std::map<std::string, size_t> lookup;
+
+        StringsBuilder() {
+            table.push_back(0);
+        }
+
+        size_t getString(std::string_view name) {
+            std::string ss(name);
+            if (lookup.contains(ss)) return lookup[ss];
+
+            auto idex = table.size();
+
+            table.insert(table.end(), name.begin(), name.end());
+            table.push_back(0);
+
+            lookup[ss] = idex;
+
+            return idex;
+        }
+
+        void bind(ElfSection* sec) {
+            sec->type = ElfSection::Type::STRING_TABLE;
+            sec->data = {table.data(), table.size()};
+            sec->align = 1;
+        }
+    };
+
+    struct SymbolBuilder {
+        std::vector<ElfSymbol> symbols;
+        bool isFreezed = false;
+
+        SymbolBuilder() {
+            symbols.push_back(ElfSymbol{0, (u8)ElfSymbol::Type::None | ElfSymbol::Bind::Local, ElfSymbol::Other::Default, 0, 0, 0});
+        }
+
+        void putGlobalSymbol(u32 name, u16 sectionId, u32 offset) {
+            assert(not isFreezed);
+            auto sym = ElfSymbol{(u32)name, (u8)ElfSymbol::Type::None | ElfSymbol::Bind::Global, ElfSymbol::Other::Default, sectionId, offset, 0};
+
+            symbols.push_back(sym);
+        }
+
+        void bind(ElfSection* sec, u32 stringsSection) {
+            sec->type = ElfSection::Type::SYM_TABLE;
+            sec->link = stringsSection;
+
+            sec->data = {(u8*)symbols.data(), symbols.size()*sizeof(ElfSymbol)};
+            sec->entrySize = sizeof(ElfSymbol);
+            sec->info = 1; // index of first non local symbol
+            sec->align = 1;
+        }
+
+        void freeze() {
+            isFreezed = true;
+        }
+
+        std::optional<u32> getSymbolIdByNameId(size_t nameId) {
+            assert(isFreezed);
+
+            for (auto i = 0ul ; i < symbols.size(); i++) {
+                auto sym = symbols[i];
+                if (sym.st_name == nameId) return i;
+            }
+
+            return {};
+        }
+    };
+
+    struct BytesBuilder {
+        std::vector<u8> bytes;
+
+        void bind(ElfSection* sec, size_t align, size_t flags1) {
+            sec->type = ElfSection::Type::ProgramBits;
+            sec->data = bytes;
+            sec->align = align;
+            sec->flags = flags1;
+        }
+    };
+
+    struct RelocationBuilder {
+        vector<ElfReAllocation> relocation;
+
+        RelocationBuilder() {
+
+        }
+
+        void addRealocation(size_t offset, ElfReAllocation::Type type1, u32 symbolId) {
+            relocation.push_back(ElfReAllocation{offset, type1, symbolId, 0});
+        }
+
+        void bind(ElfSection* sec, u16 namesSectionId, u16 bytesSectionId) {
+            sec->type = ElfSection::Type::REALOCATION_ADENTS;
+            sec->data = {(u8*)relocation.data(), relocation.size()*sizeof(ElfReAllocation)};
+            sec->align = 8;
+            sec->link = namesSectionId;
+            sec->info = bytesSectionId;
+            sec->entrySize = sizeof(ElfReAllocation);
+        }
+    };
 };
 
 inline void stupidElf1() {

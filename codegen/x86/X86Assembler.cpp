@@ -92,7 +92,7 @@ Result<void> linkRelative(u8* data, const map<string , vector<Label>>& missing, 
 
     for (const auto& [name, spaces] : missing) {
         for (const auto& space : spaces) {
-            if (space.type != Label::Type::GOT && space.type != Label::Type::JUMP) continue;
+            if (space.type != Label::Type::JUMP) continue;
             if (!labels.contains(name)) {
                 println("[WARNING] label \"{}\" not found (this can either be bug or its never referenced)", name);
                 // return FAILF("label \"{}\" not found", mName);
@@ -105,9 +105,9 @@ Result<void> linkRelative(u8* data, const map<string , vector<Label>>& missing, 
             if (convSize > space.size) return FAILF("symbol is dataSize of {} bytes, but space is dataSize of {} bytes tag: {}", convSize, space.size, name);
             long offset = static_cast<long>(tag.index)- (static_cast<long>(space.index) + static_cast<long>(space.size));
 
-            if (space.type == Label::Type::GOT) {
+ /*           if (space.type == Label::Type::GOT) {
                 offset += space.data*8;
-            }
+            }*/
 
             // println("[LINK] offset: {} {} {} {}", offset, space.index, space.size, tag.index);
 
@@ -120,7 +120,7 @@ Result<void> linkRelative(u8* data, const map<string , vector<Label>>& missing, 
 
 
 void X86Assembler::generateRet() {
-    makeLabel(nextReturnLabel(), Label::Type::ABSOLUTE1, 0);
+    bindReturn(allocateLabel());
     mc.leave();
     mc.writeSimple(SimpleX64Instruction::ret);
 }
@@ -164,26 +164,26 @@ void X86Assembler::generateRet(RegisterHandle value) {
     generateRet();
 }
 
-void X86Assembler::jmpLabelTrue(RegisterHandle cond, string_view label) {
+void X86Assembler::jmpLabelTrue(RegisterHandle cond, size_t label) {
     withRegs([&](X64Register condReg) {
         mc.makeIsTrue(condReg);
     }, cond);
     writeJmp(CmpType::Equal, label);
 }
 
-void X86Assembler::jmpLabelFalse(RegisterHandle cond, string_view label) {
+void X86Assembler::jmpLabelFalse(RegisterHandle cond, size_t label) {
     withRegs([&](X64Register condReg) {
         mc.makeIsTrue(condReg);
     }, cond);
     writeJmp(CmpType::NotEqual, label);
 }
 
-void X86Assembler::jmp(string_view label) {
+void X86Assembler::jmp(size_t label) {
     writeJmp(label);
 }
 
-void X86Assembler::createLabel(string_view mName) {
-    makeLabel(mName, Label::Type::JUMP);
+void X86Assembler::createLabel(size_t mName) {
+    this->bindJmp(mName);
 }
 
 void X86Assembler::print() const {}
@@ -230,13 +230,11 @@ void X86Assembler::writeMem(Assembler::RegisterHandle obj, Assembler::RegisterHa
 size_t X86Assembler::preserveCalleeRegs(const std::function<X64Register::SaveType(X64Register)>& save) {
     // println("labels before: {}", labels);
     vector<u8> temp;
-    CodeGroup group(bytes, labels, spaces);
     X86mc tempAsm(temp);
 
     size_t stackSize = allocator.stackSize();
 
-    assert(labels.contains(STACK_LABEL));
-    auto managedStack = labels[STACK_LABEL].index;
+    auto managedStack = getUniqueBoundLabel(LABEL_STACK_BEGIN).offset;
 
     auto acumulatedStackSize = stackSize;
     auto clobberedRegs = allocator.clobberedRegs();
@@ -250,12 +248,13 @@ size_t X86Assembler::preserveCalleeRegs(const std::function<X64Register::SaveTyp
         allocator.forceReserveStack(REG_SIZE);
     }
 
-    group.insertBytes(temp, managedStack);
+    insertBytes(temp, managedStack);
     temp.clear();
 
     // generate restoration code
-    for (const auto& [labelName, label] : labels) {
-        if (!labelName.starts_with("return")) continue;
+    forEachBound([&](auto& it) {
+        if (it.type != LABEL_TYPE_RETURN) return;
+
         temp.clear();
 
         auto acumulatedStackSize2 = stackSize;
@@ -267,9 +266,9 @@ size_t X86Assembler::preserveCalleeRegs(const std::function<X64Register::SaveTyp
             acumulatedStackSize2 += REG_SIZE;
         }
 
-        group.insertBytes(temp, label.index);
+        insertBytes(temp, it.offset);
         temp.clear();
-    }
+    });
 
     return acumulatedStackSize;
 }
@@ -283,16 +282,26 @@ size_t X86Assembler::preserveCalleeRegs() {
 }
 
 void X86Assembler::movInt(Assembler::RegisterHandle dest, u64 value, size_t offsetBytes) {
+    auto movToReg = [&](X64Register reg) {
+        if (value == 0) {
+            xorInt(dest, dest, dest);
+        } else if (value <= UINT32_MAX) {
+            mc.mov32(reg, bit_cast<size_t>(value));
+        } else {
+            mc.mov(reg, bit_cast<size_t>(value));
+        }
+    };
+
     if (RegAlloc::isStack(dest)) {
         withTempReg([&](X64Register reg) -> void {
-            mc.mov(reg, bit_cast<size_t>(value));
+            movToReg(reg);
 
             movRegToStack(dest, static_cast<int>(offsetBytes), reg);
         }, {});
     }
     else {
         assert(offsetBytes == 0);
-        mc.mov(allocator.getReg(dest), bit_cast<size_t>(value));
+        movToReg(allocator.getReg(dest));
     }
 }
 
@@ -498,9 +507,11 @@ void X86Assembler::movToArgRegVIPLCallingConvention(const X64Register& dst, Asse
 }
 
 void X86Assembler::patchStackSize(size_t stackSize) {
-    for (const auto& stackLabel : spaces[STACK_SIZE_LABEL]) {
-        patchLabel<i32>(stackLabel, stackSize);
-    }
+    forEachLabel([&](SlotLabel& it) {
+        if (it.type != LABEL_TYPE_STACK_SIZE) return;
+
+        patchLabel<i32>(it, stackSize);
+    });
 }
 
 void X86Assembler::instructionNumberHint(size_t id) {
@@ -636,45 +647,23 @@ void X86Assembler::f64ToInt(RegisterHandle dest, RegisterHandle value) {
     }, dest, value);
 }
 
-void X86Assembler::writeJmp(string_view label) {
+void X86Assembler::writeJmp(size_t id) {
     auto space = mc.writeJmp((u32)0);
-    putRelative(label, space);
+    requestJmpLabel(id, space);
 }
 
-void X86Assembler::writeJmp(CmpType jmp, string_view label) {
+void X86Assembler::writeJmp(CmpType jmp, size_t id) {
     auto space = mc.writeJmp(jmp, (u32)0);
-    putRelative(label, space);
+    requestJmpLabel(id, space);
 }
 
-void X86Assembler::putAbsolute(string_view name, ImmSpace space) {
+/*void X86Assembler::putAbsolute(string_view name, ImmSpace space) {
     putLabel(name, space, Label::Type::ABSOLUTE1);
-}
+}*/
 
-void X86Assembler::putLabel(string_view name, ImmSpace space, Label::Type type, size_t data) {
-    spaces[string(name)].emplace_back(static_cast<long>(space.offset), static_cast<int>(space.size), type, data);
-}
-
-void X86Assembler::putRelative(string_view name, ImmSpace space) {
+/*void X86Assembler::putRelative(string_view name, ImmSpace space) {
     putLabel(name, space, Label::Type::JUMP);
-}
-
-void X86Assembler::makeLabel(string_view name, Label::Type type, int size, size_t data) {
-    // println("LABEL {} : {}", name, bytes.size());
-    labels[string(name)] = Label{static_cast<int>(bytes.size()), size, type, data};
-}
-
-void X86Assembler::movLabel(const X64Register& dest, size_t value) {
-    auto labelId = getLabelId(value);
-    auto imm = mc.relativeRead(dest, 0);
-    putGOT(labelId, imm);
-}
-
-void X86Assembler::movLabel(int offset, size_t name) {
-    withTempReg([&](X64Register reg) {
-        movLabel(reg, name);
-        mc.writeStack(offset, reg);
-    }, span<X64Register>{});
-}
+}*/
 
 string X86Assembler::nextReturnLabel() {
     return stringify("return-{}", returnCounter++);
@@ -702,29 +691,6 @@ void X86Assembler::int2f64(RegisterHandle dest, RegisterHandle value) {
         // flush result to original destination
         movRegToHandle(dest, dst);
     }, dest, value);
-}
-
-void X86Assembler::callC(size_t label, span<const RegisterHandle> args, optional<RegisterHandle> ret) {
-    vector<Arg> argz;
-
-    for (auto [i, arg] : args | views::enumerate) {
-        argz.push_back(handleToArg(arg));
-    }
-    optional<Arg> idk;
-    if (ret.has_value()) {
-        idk = handleToArg(*ret);
-    }
-
-    chadCall(Arg::Symbol(label), argz, idk);
-}
-
-void X86Assembler::movSymbol(Assembler::RegisterHandle handle, size_t name) {
-    if (RegAlloc::isStack(handle)) {
-        movLabel(allocator.getStackOffset(handle), name);
-    }
-    else {
-        movLabel(allocator.getReg(handle), name);
-    }
 }
 
 void X86Assembler::arithmeticInt(ArithmeticOp op, Assembler::RegisterHandle tgt, Assembler::RegisterHandle lhs, Assembler::RegisterHandle rhs) {
@@ -998,9 +964,9 @@ void X86Assembler::initializeSYSV() {
     mc.movReg(X64Register::Rbp, X64Register::Rsp);
 
     auto label = mc.subImm32(X64Register::Rsp, 0x0);
-    putAbsolute(STACK_SIZE_LABEL, label);
+    requestLabel(allocateLabel(), label, LABEL_TYPE_STACK_SIZE, BaseType::ABSOLUTE_4);
 
-    createLabel(STACK_LABEL);
+    bindRawLabel(allocateLabel(), LABEL_STACK_BEGIN);
 
     size_t allocatedArgs = 0;
     size_t stackOffset = 0;
@@ -1048,9 +1014,9 @@ void X86Assembler::initializeFastCall() {
     mc.frameInit();
 
     auto label = mc.subImm32(X64Register::Rsp, 0x0);
-    putAbsolute(STACK_SIZE_LABEL, label);
+    requestLabel(allocateLabel(), label, LABEL_TYPE_STACK_SIZE, BaseType::ABSOLUTE_4);
 
-    createLabel(STACK_LABEL);
+    bindRawLabel(allocateLabel(), LABEL_STACK_BEGIN);
 
     size_t allocatedArgs = 0;
     size_t stackOffset = 0;
@@ -1116,14 +1082,6 @@ void X86Assembler::f64ToF32(Assembler::RegisterHandle dest, Assembler::RegisterH
     }, dest, value);
 }
 
-size_t X86Assembler::getLabelId(size_t name) {
-    for (const auto& [n, label] : absoluteLabels | views::enumerate) {
-        if (label == name) return n;
-    }
-    absoluteLabels.push_back(name);
-    return absoluteLabels.size()-1;
-}
-
 Arg X86Assembler::handleToArg(size_t handle) {
     if (RegAlloc::isStack(handle)) {
         return Arg::StackValue(allocator.getStackOffset(handle), allocator.sizeOf(handle));
@@ -1177,8 +1135,8 @@ void X86Assembler::invokeScuffedSYSV(Arg func, span<Arg> args, optional<Arg> ret
     }
 
     withSavedCallRegs(exclude, excludeRestore, sysVSave, [&](const auto& saved){
-        mc.invokeScuffedSYSV2(func, args, ret, saved, [&](auto dst, auto sym) {
-            generateArgMove(dst, sym);
+        mc.invokeScuffedSYSV2(func, args, ret, saved, [&](auto dst, auto sym, auto imm) {
+            generateArgMove(dst, sym, imm);
         });
     });
 }
@@ -1204,8 +1162,8 @@ void X86Assembler::invokeScuffedFastCall(Arg func, span<Arg> args, optional<Arg>
     }
 
     withSavedCallRegs(exclude, excludeRestore, fastCallSave, [&](const auto& saved){
-        mc.invokeScuffedFastCall(func, args, ret, saved, [&](auto dst, auto sym) {
-                                     generateArgMove(dst, sym);
+        mc.invokeScuffedFastCall(func, args, ret, saved, [&](auto dst, auto sym, auto imm) {
+                                     generateArgMove(dst, sym, imm);
                                  }, [&](auto amount){ return allocator.getStackOffset(allocator.allocateStack(amount)); });
     });
 }
@@ -1242,7 +1200,7 @@ CmpType X86Assembler::toCmpType2(JumpCondType it) {
     PANIC()
 }
 
-void X86Assembler::jmpCond(string_view label, JumpCondType type, RegisterHandle lhs, RegisterHandle rhs) {
+void X86Assembler::jmpCond(size_t label, JumpCondType type, RegisterHandle lhs, RegisterHandle rhs) {
     withRegs([&](X64Register a, X64Register b) {
         mc.writeRegInst(X64Instruction::cmp, a, b);
     }, lhs, rhs);

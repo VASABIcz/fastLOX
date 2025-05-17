@@ -18,7 +18,12 @@ struct IRInstruction: public VirtualCopy<IRInstruction<CTX>> {
 
     IRInstruction(SSARegisterHandle target, string name): target(target), name(std::move(name)) {}
 
-    virtual void print(CTX::IRGEN& gen) = 0;
+    virtual void print(CTX::IRGEN& gen) {
+        print(gen, std::cout);
+        std::cout << std::endl;
+    }
+
+    virtual void print(CTX::IRGEN& gen, std::ostream& stream) = 0;
 
     virtual void visitSrc(function<void(SSARegisterHandle&)> fn) {}
 
@@ -57,8 +62,8 @@ struct IRInstruction: public VirtualCopy<IRInstruction<CTX>> {
     }
 
     template<typename... Args>
-    constexpr void basePrint(StringChecker<type_identity_t<Args>...> strArg, Args&&... argz) {
-        println("{} := {} {}", target, name, stringify(strArg, std::forward<Args>(argz)...));
+    constexpr void basePrint(std::ostream& stream, StringChecker<type_identity_t<Args>...> strArg, Args&&... argz) {
+        stream << stringify("{} := {} {}", target, name, stringify(strArg, std::forward<Args>(argz)...));
     }
 };
 
@@ -101,8 +106,8 @@ struct IR1Instruction: public IRInstruction<CTX> {
         fn(value);
     }
 
-    void print(CTX::IRGEN &gen) override {
-        println("{} := {} {}", this->target.toTextString(), V.value, value.toString());
+    void print(CTX::IRGEN &gen, std::ostream& stream) override {
+        this->basePrint(stream, "{}", value.toString());
     }
 };
 
@@ -113,8 +118,8 @@ struct IR0Instruction: public IRInstruction<CTX> {
 
     void visitSrc(std::function<void (SSARegisterHandle &)> fn) override {}
 
-    void print(CTX::IRGEN &gen) override {
-        println("{} := {}", this->target.toTextString(), V.value);
+    void print(CTX::IRGEN &gen, std::ostream& stream) override {
+        this->basePrint(stream, "{} := {}", this->target.toTextString(), V.value);
     }
 };
 
@@ -129,8 +134,8 @@ struct IRBaseInstruction: public NamedIrInstruction<V, CTX> {
 
     void visitSrc(std::function<void (SSARegisterHandle &)> fn) override {}
 
-    void print(CTX::IRGEN& gen) override {
-        this->basePrint("{}", stringify(value));
+    void print(CTX::IRGEN& gen, std::ostream& stream) override {
+        this->basePrint(stream, "{}", stringify(value));
     }
 
     void generate(BaseGen& gen) override = 0;

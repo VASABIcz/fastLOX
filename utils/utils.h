@@ -92,19 +92,19 @@ typedef int16_t i16;
 typedef int32_t i32;
 typedef int64_t i64;
 
-constexpr u8 operator "" _u8(unsigned long long value) {
+constexpr u8 operator ""_u8(unsigned long long value) {
     return static_cast<u8>(value);
 }
 
-constexpr u16 operator "" _u16(unsigned long long value) {
+constexpr u16 operator ""_u16(unsigned long long value) {
     return static_cast<u16>(value);
 }
 
-constexpr u32 operator "" _u32(unsigned long long value) {
+constexpr u32 operator ""_u32(unsigned long long value) {
     return static_cast<u32>(value);
 }
 
-constexpr u64 operator "" _u64(unsigned long long value) {
+constexpr u64 operator ""_u64(unsigned long long value) {
     return static_cast<u64>(value);
 }
 

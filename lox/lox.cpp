@@ -2740,7 +2740,6 @@ namespace builtin {
 
 struct MilaAssembler: virtual Assembler {
     vector<string> stuff;
-    size_t counter = 0;
 
     struct Label {
         size_t id;
@@ -2751,13 +2750,13 @@ struct MilaAssembler: virtual Assembler {
     };
 
     Label makeLabel1() {
-        return Label{counter++};
+        return Label{this->allocateJmpLabel()};
     }
 
     virtual void callMethod(size_t tgt1, size_t subj1, u32 fieldId, span<size_t> argz, std::optional<size_t> methodFrame) = 0;
 
     void bind(Label l) {
-        this->createLabel(l.toString());
+        this->createLabel(l.id);
     }
 
     size_t getId(string lol) {
@@ -2776,11 +2775,11 @@ struct MilaAssembler: virtual Assembler {
     }
 
     void cJmp(Label l, JumpCondType t, size_t lhs, size_t rhs) {
-        jmpCond(l.toString(), t, lhs, rhs);
+        jmpCond(l.id, t, lhs, rhs);
     }
 
     void cJmp(Label l) {
-        this->jmp(l.toString());
+        this->jmp(l.id);
     }
 
     void getLoxTag(size_t dst, size_t val) {
@@ -2848,6 +2847,32 @@ struct MilaAssembler: virtual Assembler {
 struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     using X86Assembler::X86Assembler;
 
+    std::map<size_t, std::string> hints;
+
+    size_t HINT_ID = 0;
+
+    X86MilaAssembler(span<size_t> args, size_t ret): X86Assembler(args, ret) {
+        HINT_ID = this->allocateLabelType();
+    }
+
+    void bindHint(std::string_view h) override {
+        auto id = allocateLabel();
+        this->bindRawLabel(id, HINT_ID);
+        hints[id] = std::string(h);
+    }
+
+    void dumpHints(std::string_view s) override {
+        std::ofstream idk1{std::string(s)};
+
+        idk1 << hints.size() << std::endl;
+        for (auto& hint : hints) {
+            idk1 << getBoundLabelById(hint.first).offset << std::endl;
+            idk1 << escape(hint.second) << std::endl;
+        }
+
+        idk1.close();
+    }
+
     void readField(size_t tgt, size_t self, u32 id) override {
         array<Arg, 3> argz{handleToArg(self), Arg::Imm(id)};
         chadCall(Arg::ImmPtr((void*)&builtin::readField), argz, handleToArg(tgt));
@@ -2859,11 +2884,11 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     }
 
     void cJmp1(Label l, JumpCondType t) {
-        this->writeJmp(toCmpType(t), l.toString());
+        this->writeJmp(toCmpType(t), l.id);
     }
 
     void cJmp2(Label l, JumpCondType t) {
-        this->writeJmp(toCmpType2(t), l.toString());
+        this->writeJmp(toCmpType2(t), l.id);
     }
 
     void print1(size_t arg) override {
@@ -3163,6 +3188,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     }
 
     void fasterCall(size_t tgt, size_t subj, span<size_t> argz) {
+        bindHint("LOX - fasterCall");
         getPtr(tgt, subj); // FunctionRef* in tgt
 
         auto crashLabel = makeLabel1();
@@ -3186,6 +3212,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         bind(crashLabel);
         mc.hlt();
         bind(doneLabel);
+        bindHint("LOX - fasterCall END");
     }
 
     void dynCall(size_t tgt1, size_t subj1, span<size_t> argz) {
@@ -3248,6 +3275,68 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         bind(doneLabel);
         ctx.restore();
     }
+
+/*    void dinnerCall(size_t tgt1, size_t subj1, span<size_t> argz) {
+        auto ctx = this->getAllocCtx();
+        auto tgt = ctx.ensureRegWriteback(tgt1);
+        auto subj = ctx.ensureReg(subj1);
+        auto tmp = ctx.allocReg();
+        auto tmp1 = ctx.allocReg();
+
+        auto handleNotFunctionLabel = makeLabel1();
+        auto doneLabel = makeLabel1();
+        auto crashLabel = makeLabel1();
+        auto okLabel = makeLabel1();
+
+        auto t = ctx.originalTransform(argz);
+
+        getLoxTag(tmp, subj);
+
+        movInt(tgt, LoxValue::ValueType2::FUNCTION_REF);
+        cJmp(handleNotFunctionLabel, JumpCondType::NOT_EQUALS, tmp, tgt);
+
+        fasterCall(tgt, subj, t);
+        cJmp(doneLabel);
+
+        bind(handleNotFunctionLabel);
+
+        movInt(tgt, LoxValue::ValueType2::CLASS);
+        // trap();
+        cJmp(crashLabel, JumpCondType::NOT_EQUALS, tmp, tgt);
+        cJmp(okLabel);
+
+        bind(crashLabel);
+        mc.hlt();
+        bind(okLabel);
+
+        std::array<Arg,1>instArgz{handleToArg(subj)};
+        chadCall(Arg::ImmPtr((void*)builtin::instantiate), instArgz, handleToArg(tgt));
+
+        getPtr(tmp, tgt);
+
+        readMem(tmp, tmp, offsetof(ObjectRef, construcor), sizeof(FunctionRef*));
+        // TODO FIXME if class doenst have constuctor, and user passes arguments we wont crash
+
+        // std::array<Arg,1>checkArgz{handleToArg(tgt)};
+        // chadCall(Arg::ImmPtr((void*)builtin::getConstructor), checkArgz, handleToArg(tmp));
+
+        auto zeroImm = movImmValueToReg(0);
+        cJmp(doneLabel, JumpCondType::EQUALS, tmp, zeroImm);
+        freeRegister(zeroImm);
+
+        readMem(tmp1, tmp, offsetof(FunctionRef, captures), sizeof(LoxValue));
+        writeMem(tmp, tgt, offsetof(FunctionRef, captures), sizeof(LoxValue));
+
+        fasterCall(tgt, tmp, t);
+
+        writeMem(tmp, tmp1, offsetof(FunctionRef, captures), sizeof(LoxValue));
+
+        cJmp(doneLabel);
+
+        bind(doneLabel);
+        ctx.restore();
+    }*/
+
 
     void callMethod(size_t tgt1, size_t subj1, u32 fieldId, span<size_t> argz, std::optional<size_t> methodFrame) {
         auto ctx = this->getAllocCtx();
@@ -3414,8 +3503,8 @@ struct LoxBool: public NamedIrInstruction<"lox_bool", MilaGenCtx> {
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
 
-    void print(MilaIrGen&) override {
-        basePrint("{}", v);
+    void print(MilaIrGen&, std::ostream& steam) override {
+        basePrint(steam, "{}", v);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3439,8 +3528,8 @@ struct LoxCallMethod: public NamedIrInstruction<"lox_call", MilaGenCtx> {
         if (methodFrame.has_value()) fn(*methodFrame);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{}#{}@{} {} is? {}", subj, methodName, methodId, argz, methodFrame.has_value() ? "in-method" : "in-function");
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{}#{}@{} {} is? {}", subj, methodName, methodId, argz, methodFrame.has_value() ? "in-method" : "in-function");
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3469,8 +3558,8 @@ struct LoxNil: public NamedIrInstruction<"lox_nil", MilaGenCtx> {
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
 
-    void print(MilaIrGen&) override {
-        basePrint("");
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "");
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3486,8 +3575,8 @@ struct LoxNumber: public NamedIrInstruction<"lox_number", MilaGenCtx> {
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
 
-    void print(MilaIrGen&) override {
-        basePrint("{}", v);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{}", v);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3503,8 +3592,8 @@ struct LoxString: public NamedIrInstruction<"lox_string", MilaGenCtx> {
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
 
-    void print(MilaIrGen&) override {
-        basePrint("\"{}\"", escape(v));
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "\"{}\"", escape(v));
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3522,8 +3611,8 @@ struct LoxNeg: public NamedIrInstruction<"lox_neg", MilaGenCtx> {
         fn(v);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{}", v);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{}", v);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3545,8 +3634,8 @@ struct LoxBin: public NamedIrInstruction<"bin", MilaGenCtx> {
         fn(lhs);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{} {} {}", lhs, binarToString(type), rhs);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{} {} {}", lhs, binarToString(type), rhs);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3566,8 +3655,8 @@ struct LoxReadField: public NamedIrInstruction<"read_field", MilaGenCtx> {
         fn(subj);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{}#{}@{}", subj, fieldName, fieldId);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{}#{}@{}", subj, fieldName, fieldId);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3589,8 +3678,8 @@ struct LoxWriteField: public NamedIrInstruction<"write_field", MilaGenCtx> {
         fn(v);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{}#{}@{} <- {}", subj, fieldName, fieldId, v);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{}#{}@{} <- {}", subj, fieldName, fieldId, v);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3611,8 +3700,8 @@ struct DynamicCall: public NamedIrInstruction<"dynamic_call", MilaGenCtx> {
         for (auto arg : argz) fn(arg);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{} {}", self, argz);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{} {}", self, argz);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3631,8 +3720,8 @@ struct BuiltinPrint: public NamedIrInstruction<"print", MilaGenCtx> {
         fn(arg);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{}", arg);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{}", arg);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3650,8 +3739,8 @@ struct LoxBooling: public NamedIrInstruction<"to_bool", MilaGenCtx> {
         fn(v);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{}", v);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{}", v);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3672,8 +3761,8 @@ struct LoxAllocateClass: public NamedIrInstruction<"allocate_class", MilaGenCtx>
         if (super.has_value()) fn(*super);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{} - {}", clazz->data.name, super.has_value() ? super->toString() : "");
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{} - {}", clazz->data.name, super.has_value() ? super->toString() : "");
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3689,8 +3778,8 @@ struct LoxReadGlobal: public NamedIrInstruction<"read_global", MilaGenCtx> {
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
 
-    void print(MilaIrGen&) override {
-        basePrint("{}", id);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{}", id);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3709,8 +3798,8 @@ struct LoxWriteGlobal: public NamedIrInstruction<"write_global", MilaGenCtx> {
         fn(v);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{} <- {}", id, v);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{} <- {}", id, v);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3731,8 +3820,8 @@ struct LoxReadCaptured: public NamedIrInstruction<"read_captured", MilaGenCtx> {
         fn(closure);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{} {}#{}/{}", closure, fId, locId, isConst);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{} {}#{}/{}", closure, fId, locId, isConst);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3755,8 +3844,8 @@ struct LoxWriteCaptured: public NamedIrInstruction<"write_captured", MilaGenCtx>
         fn(v);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{} % {}#{}/{} <- {}", closure, fId, locId, isConst, v);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{} % {}#{}/{} <- {}", closure, fId, locId, isConst, v);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3779,8 +3868,8 @@ struct LoxAllocCaptured: public NamedIrInstruction<"alloc_captured", MilaGenCtx>
         fn(closure);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{} % {}#{}/{} <- {}", closure, fId, locId, isConst, v);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{} % {}#{}/{} <- {}", closure, fId, locId, isConst, v);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3800,8 +3889,8 @@ struct LoxReadLocal: public NamedIrInstruction<"read_local", MilaGenCtx> {
         fn(frame);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{} % {}@{}", frame, name, localId);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{} % {}@{}", frame, name, localId);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3823,8 +3912,8 @@ struct LoxWriteLocal: public NamedIrInstruction<"write_local", MilaGenCtx> {
         fn(frame);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{} - {}@{} <- {}", frame, name, localId, v);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{} - {}@{} <- {}", frame, name, localId, v);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3843,8 +3932,8 @@ struct LoxAllocateClosure: public NamedIrInstruction<"allocate_closure", MilaGen
         fn(parent);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{} {}", func->data.name, parent);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{} {}", func->data.name, parent);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3866,8 +3955,8 @@ struct LoxCopyCapture: public NamedIrInstruction<"copy_capture", MilaGenCtx> {
         fn(tgt);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{}#{} <- {}#{}", tgt, tgtId, src, srcId);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{}#{} <- {}#{}", tgt, tgtId, src, srcId);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -3897,8 +3986,8 @@ struct LoxGetSuper: public NamedIrInstruction<"get_super", MilaGenCtx> {
         fn(self);
     }
 
-    void print(MilaIrGen&) override {
-        basePrint("{}", self);
+    void print(MilaIrGen&, std::ostream& stream) override {
+        basePrint(stream, "{}", self);
     }
 
     void generate(MilaCodeGen& gen) override {
@@ -5013,7 +5102,10 @@ int main(int argc, const char** argv) {
 
         assm.patchStackSize(align(stackSize, X86MilaAssembler::STACK_ALIGNMENT));
 
-        UNWRAPV(linkRelative(assm.bytes.data(), assm.spaces, assm.labels));
+        // UNWRAPV(linkRelative(assm.bytes.data(), assm.spaces, assm.labels));
+        assm.linkJumps();
+
+        ggs.assembler.dumpHints(stringify("hints/{}", comp.funks[i]->data.name));
 
         auto codeSize = assm.bytes.size();
         auto code = cg::allocateJIT(codeSize);

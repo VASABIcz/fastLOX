@@ -39,5 +39,9 @@ add_executable(lox
         lox/lox.cpp
 )
 
+add_executable(anotator
+        anotator.cpp
+)
+
 # Set global property (all targets are impacted)
 set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CMAKE_COMMAND} -E time")

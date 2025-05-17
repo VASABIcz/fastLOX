@@ -119,8 +119,8 @@ namespace instructions {
     template<typename CTX>
     struct PhiFunction: public NamedIrInstruction<"phi", CTX> {
     PUB_VIRTUAL_COPY(PhiFunction)
-        void print(CTX::IRGEN&) override {
-            this->basePrint("{}", stringify(versions, {{", ", "", ""}}));
+        void print(CTX::IRGEN&, std::ostream& stream) override {
+            this->basePrint(stream, "{}", stringify(versions, {{", ", "", ""}}));
         }
 
         void visitSrc(function<void (SSARegisterHandle &)> fn) override {
@@ -215,8 +215,8 @@ namespace instructions {
             fn(condition);
         }
 
-        void print(CTX::IRGEN&) override {
-            this->basePrint("{}, {}, {}", condition.toString(), scopeT, scopeF);
+        void print(CTX::IRGEN&, std::ostream& stream) override {
+            this->basePrint(stream, "{}, {}, {}", condition.toString(), scopeT, scopeF);
         }
 
         Branch(SSARegisterHandle condition, size_t t, size_t f): NamedIrInstruction<"branch", CTX>(SSARegisterHandle::invalid()), condition(condition), scopeT(t), scopeF(f) {
@@ -236,14 +236,14 @@ namespace instructions {
             ctx.assignPhis(scopeF);
 
             // jump to FALSE block
-            ctx.assembler.jmp(to_string(scopeF));
+            ctx.jmpBlock(scopeF);
 
             // TRUE block phi handling
             ctx.assembler.createLabel(label);
             ctx.assignPhis(scopeT);
 
             // jmp to TRUE block
-            ctx.assembler.jmp(to_string(scopeT));
+            ctx.jmpBlock(scopeT);
         }
 
         [[nodiscard]] vector<size_t> branchTargets() const override {
@@ -267,8 +267,8 @@ namespace instructions {
             fn(rhs);
         }
 
-        void print(CTX::IRGEN&) override {
-            this->basePrint("{} {} {} ? @{} : @{}", lhs.toString(), toString1(type), rhs.toString(), scopeT, scopeF);
+        void print(CTX::IRGEN&, std::ostream& stream) override {
+            this->basePrint(stream, "{} {} {} ? @{} : @{}", lhs.toString(), toString1(type), rhs.toString(), scopeT, scopeF);
         }
 
         BranchCond(JumpCondType type, SSARegisterHandle lhs, SSARegisterHandle rhs, size_t t, size_t f): NamedIrInstruction<"branch_cond", CTX>(SSARegisterHandle::invalid()), type(type), lhs(lhs), rhs(rhs), scopeT(t), scopeF(f) {
@@ -289,14 +289,14 @@ namespace instructions {
             ctx.assignPhis(scopeF);
 
             // jump to FALSE block
-            ctx.assembler.jmp(to_string(scopeF));
+            ctx.jmpBlock(scopeF);
 
             // TRUE block phi handling
             ctx.assembler.createLabel(label);
             ctx.assignPhis(scopeT);
 
             // jmp to TRUE block
-            ctx.assembler.jmp(to_string(scopeT));
+            ctx.jmpBlock(scopeT);
         }
 
         [[nodiscard]] vector<size_t> branchTargets() const override {
@@ -317,8 +317,8 @@ namespace instructions {
             fn(condition);
         }
 
-        void print(CTX::IRGEN&) override {
-            this->basePrint("{}, {}, {}", condition.toString(), scopeT, scopeF);
+        void print(CTX::IRGEN&, std::ostream& stream) override {
+            this->basePrint(stream, "{}, {}, {}", condition.toString(), scopeT, scopeF);
         }
 
         JumpFalse(SSARegisterHandle condition, size_t t, size_t f): NamedIrInstruction<"jump_false", CTX>(SSARegisterHandle::invalid()), condition(condition), scopeT(t), scopeF(f) {
@@ -339,11 +339,11 @@ namespace instructions {
                 ctx.assignPhis(scopeF);
 
                 // jump to FALSE block
-                ctx.assembler.jmp(to_string(scopeF));
+                ctx.jmpBlock(scopeF);
             }
             else {
                 // false branch doesnt require phi assigment just jump there
-                ctx.assembler.jmpLabelFalse(condReg, to_string(scopeF));
+                ctx.jmpBlockFalse(condReg, scopeF);
             }
 
             // TRUE block phi handling
@@ -369,8 +369,8 @@ namespace instructions {
             fn(condition);
         }
 
-        void print(CTX::IRGEN&) override {
-            this->basePrint("{}, {}, {}", condition.toString(), scopeT, scopeF);
+        void print(CTX::IRGEN&, std::ostream& stream) override {
+            this->basePrint(stream, "{}, {}, {}", condition.toString(), scopeT, scopeF);
         }
 
         JumpTrue(SSARegisterHandle condition, size_t t, size_t f): NamedIrInstruction<"jump_true", CTX>(SSARegisterHandle::invalid()), condition(condition), scopeT(t), scopeF(f) {
@@ -389,11 +389,11 @@ namespace instructions {
                 ctx.assignPhis(scopeT);
 
                 // jump to FALSE block
-                ctx.assembler.jmp(to_string(scopeT));
+                ctx.jmpBlock(scopeT);
             }
             else {
                 // false branch doesnt require phi assigment just jump there
-                ctx.assembler.jmpLabelTrue(condReg, to_string(scopeT));
+                ctx.jmpBlockTrue(condReg, scopeT);
             }
 
             // TRUE block phi handling
@@ -416,7 +416,7 @@ namespace instructions {
         void generate(CTX::GEN& ctx) override {
             ctx.assignPhis(this->value);
 
-            ctx.assembler.jmp(to_string(this->value));
+            ctx.jmpBlock(this->value);
         }
 
         [[nodiscard]] vector<size_t> branchTargets() const override {return {this->value};}
@@ -439,8 +439,8 @@ namespace instructions {
             fn(lhs);
         }
 
-        void print(CTX::IRGEN&) override {
-            this->basePrint(" {} {} {} ? @{} : @{}", lhs, toString1(type), rhs, scopeT, scopeF);
+        void print(CTX::IRGEN&, std::ostream& stream) override {
+            this->basePrint(stream, " {} {} {} ? @{} : @{}", lhs, toString1(type), rhs, scopeT, scopeF);
         }
 
         JumpCond(JumpCondType type, SSARegisterHandle lhs, SSARegisterHandle rhs, size_t t, size_t f): NamedIrInstruction<"jump_cond", CTX>(SSARegisterHandle::invalid()), type(type), lhs(lhs), rhs(rhs), scopeT(t), scopeF(f) {
@@ -460,11 +460,11 @@ namespace instructions {
                 ctx.assignPhis(scopeT);
 
                 // jump to FALSE block
-                ctx.assembler.jmp(to_string(scopeT));
+                ctx.jmpBlock(scopeT);
             }
             else {
                 // false branch doesnt require phi assigment just jump there
-                ctx.assembler.jmpCond(to_string(scopeT), type, lhsReg, rhsReg);
+                ctx.jmpBlockCond(scopeT, type, lhsReg, rhsReg);
             }
 
             // TRUE block phi handling
@@ -559,6 +559,8 @@ namespace instructions {
 
         explicit VoidReturn(): IR0Instruction<"void_return", CTX>(SSARegisterHandle::invalid()) {}
 
+        // explicit VoidReturn(): IR0Instruction<"void_return", CTX>(SSARegisterHandle::invalid()) {}
+
         void generate(CTX::GEN& gen) override {
             gen.assembler.generateRet();
         }
@@ -585,8 +587,8 @@ namespace instructions {
             fn(obj);
         }
 
-        void print(CTX::IRGEN& gen) override {
-            this->basePrint("{}", obj);
+        void print(CTX::IRGEN& gen, std::ostream& stream) override {
+            this->basePrint(stream, "{}", obj);
         }
 
         void generate(CTX::GEN& gen) override {
@@ -607,8 +609,8 @@ namespace instructions {
             fn(value);
         }
 
-        void print(CTX::IRGEN&) override {
-            this->basePrint("{} {}", ptr, value);
+        void print(CTX::IRGEN&, std::ostream& stream) override {
+            this->basePrint(stream, "{} {}", ptr, value);
         }
 
         void generate(CTX::GEN& gen) override {
@@ -632,8 +634,8 @@ namespace instructions {
             fn(ptr);
         }
 
-        void print(CTX::IRGEN& gen) override {
-            this->basePrint("{}", ptr);
+        void print(CTX::IRGEN& gen, std::ostream& stream) override {
+            this->basePrint(stream, "{}", ptr);
         }
 
         void generate(CTX::GEN& gen) override {
@@ -656,8 +658,8 @@ namespace instructions {
             fn(subject);
         }
 
-        void print(CTX::IRGEN& gen) override {
-            this->basePrint("{}", subject);
+        void print(CTX::IRGEN& gen, std::ostream& stream) override {
+            this->basePrint(stream, "{}", subject);
         }
 
         void generate(CTX::GEN& gen) override {
@@ -679,8 +681,8 @@ namespace instructions {
         void visitSrc(std::function<void (SSARegisterHandle &)> fn) override {
         }
 
-        void print(CTX::IRGEN& gen) override {
-            this->basePrint("{}", size);
+        void print(CTX::IRGEN& gen, std::ostream& stream) override {
+            this->basePrint(stream, "{}", size);
         }
 
         void generate(CTX::GEN& gen) override {

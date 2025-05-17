@@ -17,7 +17,6 @@ using namespace std;
 
 struct Label {
     enum class Type {
-        GOT,
         ABSOLUTE1,
         JUMP,
         RIP_REL_32_ADR,
