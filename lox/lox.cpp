@@ -14,10 +14,36 @@
 #include <cstring>
 #include <cstdlib>
 #include <unordered_map>
+#include <sanitizer/asan_interface.h>
 #include "../utils/code_gen.h"
 
 #define VERBOSE 0
 bool DEBUG_JIT = false;
+
+enum class AllocType {
+    LOX_VALUE, // constant (8B)
+    HASH_MAP, // constant (16B)
+    CLASS_REF, // constant (40B)
+    OBJECT_REF, // constant (40B)
+    STRING, // 8B+N
+    HASH_MAP_BUCKET, // constant ... for now (4+(12*2)/4+(12*2))
+    FUNCTION_REF, // 32B+8*N
+    HASH_MAP_BUCKET_ARRAY // 4*8 (32B) -> 8*8 (64B) -> 16*8 (128B)
+};
+
+std::string_view allocToString(AllocType type) {
+    switch (type) {
+        case AllocType::LOX_VALUE: return "LOX_VALUE";
+        case AllocType::HASH_MAP: return "HASH_MAP";
+        case AllocType::HASH_MAP_BUCKET_ARRAY: return "HASH_MAP_BUCKET_ARRAY";
+        case AllocType::HASH_MAP_BUCKET: return "HASH_MAP_BUCKET";
+        case AllocType::FUNCTION_REF: return "FUNCTION_REF";
+        case AllocType::CLASS_REF: return "CLASS_REF";
+        case AllocType::OBJECT_REF: return "OBJECT_REF";
+        case AllocType::STRING: return "STRING";
+    }
+    UNREACHABLE();
+}
 
 struct SimpleArena {
     struct Chunk {
@@ -98,6 +124,23 @@ struct SimpleArena {
 
     }
 };
+
+struct Heap;
+
+SimpleArena HEAP_ARENA;
+
+
+void* allocate(size_t size, AllocType type);
+
+template<typename T>
+T* allocateTyped(size_t size, AllocType type) {
+    return (T*) allocate(size, type);
+}
+
+template<typename T>
+T* allocateTypedSimple(AllocType type) {
+    return (T*) allocate(sizeof(T), type);
+}
 
 SimpleArena AST_ARENA;
 
@@ -470,6 +513,16 @@ struct Function: Statement {
             if (not locals[i]) acu += 1;
         }
         PANIC();
+    }
+
+    bool isModifiedLocal(size_t localId) {
+        assert(localId < isModified.size());
+
+        return isModified[localId];
+    }
+
+    bool isModifiedCaptured(size_t capturedId) {
+        return isModifiedLocal(getLocalId(capturedId));
     }
 };
 
@@ -1486,6 +1539,8 @@ struct FunctionRef {
     LoxValue readConst(size_t id);
 
     void setThis(ObjectRef* self);
+
+    size_t calculateSize();
 };
 
 // closed variables are allocated separately on heap (boxed)
@@ -1497,23 +1552,38 @@ struct FunctionRef {
 constexpr size_t CONSTRUCTOR_ID = 0;
 
 struct __attribute__ ((packed)) EntryPair {
-    u32 first;
+    size_t first;
     size_t second;
 };
 
-struct  __attribute__ ((packed)) LoxMapBucket {
-    u32 size = 0;
+struct  LoxMapBucket {
+    size_t size = 0;
     EntryPair items[];
 };
 
-struct __attribute__ ((packed)) LoxMap {
+struct LoxMap {
     static constexpr size_t BUCKET_SIZE = 2;
     static constexpr size_t INIT_SIZE = 4;
     static constexpr size_t INVALID_VALUE = -1;
+    static constexpr size_t BBUCKET_SIZE = sizeof(LoxMapBucket)+LoxMap::BUCKET_SIZE*sizeof(EntryPair);
+    static constexpr size_t BUCKET_ARRAY_BASE_SIZE = INIT_SIZE*sizeof(void*);
 
     LoxMapBucket** buckets = nullptr;
-    u32 size = 0;
+    u64 size = 0;
 };
+
+template<typename FN>
+void forEachMap(LoxMap* map, FN&& fn) {
+    if (map->buckets == nullptr) return;
+    for (auto i = 0ul; i < map->size; i++) {
+        auto bucket = map->buckets[i];
+        if (bucket == nullptr) continue;
+
+        for (auto j = 0ul; j < bucket->size; j++) {
+            fn(bucket->items[j].second);
+        }
+    }
+}
 
 void dump(LoxMap* map) {
     for (auto i = 0ul; i < map->size; i++) {
@@ -1527,7 +1597,7 @@ void dump(LoxMap* map) {
 }
 
 LoxMapBucket* allocBucket() {
-    auto bucket = (LoxMapBucket*)malloc(sizeof(LoxMapBucket)+LoxMap::BUCKET_SIZE*sizeof(EntryPair));
+    auto bucket = allocateTyped<LoxMapBucket>(LoxMap::BBUCKET_SIZE, AllocType::HASH_MAP_BUCKET);
     bucket->size = 0;
 
     return bucket;
@@ -1535,9 +1605,9 @@ LoxMapBucket* allocBucket() {
 
 void resize(LoxMap* map) {
     // std::cout << "RESIZE " << map->size << " " << map->size*4 << std::endl;
-    auto newSize = std::max(map->size*2, (u32)LoxMap::INIT_SIZE);
+    auto newSize = std::max(map->size*2, LoxMap::INIT_SIZE);
 
-    auto* newBukcets = new LoxMapBucket*[newSize];
+    auto* newBukcets = allocateTyped<LoxMapBucket*>(newSize*sizeof(LoxMapBucket*), AllocType::HASH_MAP_BUCKET_ARRAY);
     std::memset(newBukcets, 0, newSize*sizeof(LoxMapBucket*));
 
     for (auto i = 0ul; i < map->size; i++) {
@@ -1624,8 +1694,12 @@ struct ClassRef {
 struct ObjectRef;
 
 struct LoxStr {
-    uint32_t size;
+    size_t size;
     char cString[];
+
+    size_t calculateSize() {
+        return align(sizeof(LoxStr)+(size+1), 16);
+    }
 };
 
 struct LoxValue {
@@ -1697,6 +1771,10 @@ struct LoxValue {
     string_view asString() const {
         auto s = (LoxStr*)decodePointer(internal);
         return string_view{s->cString, s->size};
+    }
+
+    LoxStr* asLoxStr() const {
+        return (LoxStr*)decodePointer(internal);
     }
 
     FunctionRef* asFunction() const {
@@ -1900,8 +1978,6 @@ void FunctionRef::write(size_t id, LoxValue val) {
 }
 
 struct ASTExecutor;
-
-ASTExecutor* RUNTIME = nullptr;
 
 FunctionRef* createMethod(Function* f1, FunctionRef* parent, ObjectRef* self);
 
@@ -2458,7 +2534,7 @@ struct Linerizer: ASTVisitor {
 LoxValue GLOBALS_TABLE[512];
 
 LoxStr* allocateEmptyLoxString(size_t size) {
-    auto idk = (LoxStr*)malloc(sizeof(LoxStr)+size+1);
+    auto idk = allocateTyped<LoxStr>(sizeof(LoxStr)+size+1, AllocType::STRING);
     idk->size = size;
     idk->cString[size] = 0;
 
@@ -2506,7 +2582,9 @@ namespace builtin {
             c = c->parent;
         }
 
-        c->captures[lId] = new LoxValue(o);
+        auto v1 = allocateTypedSimple<LoxValue>(AllocType::LOX_VALUE);
+        *v1 = o;
+        c->captures[lId] = v1;
     }
 
     LoxValue readField(LoxValue subj, u32 id) {
@@ -2529,7 +2607,7 @@ namespace builtin {
     }
 
     LoxValue* allocateLoxValue() {
-        return new LoxValue();
+        return allocateTypedSimple<LoxValue>(AllocType::LOX_VALUE);
     }
 
     LoxValue doSimpleBin(BinaryType type, LoxValue lhs, LoxValue rhs) {
@@ -2620,14 +2698,22 @@ namespace builtin {
         if (clazz->super != nullptr) {
             proto = rawInstant(clazz->super, data);
         }
-        auto me = new ObjectRef{clazz, proto, nullptr, proto == nullptr ? LoxValue::Nil() : LoxValue::Object(proto), data};
-        if (me->construcor == nullptr && clazz->getConstructor() != nullptr) me->construcor = me->getRawMethod(CONSTRUCTOR_ID, false);
+        auto me = allocateTypedSimple<ObjectRef>(AllocType::OBJECT_REF);
+        me->clazz = clazz;
+        me->proto = proto;
+        me->proto1 = proto == nullptr ? LoxValue::Nil() : LoxValue::Object(proto);
+        me->fields = data;
+        me->construcor = nullptr;
+        if (clazz->getConstructor() != nullptr) me->construcor = me->getRawMethod(CONSTRUCTOR_ID, false);
         return me;
     }
 
     LoxValue instantiate(LoxValue clazz) {
         // println("instantiate {}", clazz);
-        auto* res = rawInstant(clazz.asClass(), new LoxMap);
+        auto map = allocateTypedSimple<LoxMap>(AllocType::HASH_MAP);
+        map->size = 0;
+        map->buckets = nullptr;
+        auto* res = rawInstant(clazz.asClass(), map);
         // println("after");
 
         return LoxValue::Object(res);
@@ -2692,9 +2778,9 @@ namespace builtin {
     }
 
     LoxValue allocateClosure(Function* f, FunctionRef* closure) {
-        auto c = (FunctionRef*)malloc(sizeof(FunctionRef)+f->totalUpValCount()*sizeof(LoxValue*)+16);
+        auto c = allocateTyped<FunctionRef>(sizeof(FunctionRef)+f->totalUpValCount()*sizeof(LoxValue*), AllocType::FUNCTION_REF);
 
-        memset(c->captures, 0xAA, f->totalUpValCount()*sizeof(LoxValue*));
+        memset(c->captures, 0x0, f->totalUpValCount()*sizeof(LoxValue*));
 
         c->parent = closure;
         c->func = f;
@@ -2708,7 +2794,12 @@ namespace builtin {
         // println("allocateClass {} - {} - {}", clazz, super, frame);
         ClassRef* sup = nullptr;
         if (super.isClass()) sup = super.asClass();
-        auto claz = new ClassRef{clazz, sup, frame};
+        auto claz = allocateTypedSimple<ClassRef>(AllocType::CLASS_REF);
+        claz->clazz = clazz;
+        claz->super = sup;
+        claz->parent = frame;
+        claz->methods.size = 0;
+        claz->methods.buckets = nullptr;
         for (auto [m, mId] : clazz->methodIds) {
             writeMap(&claz->methods, m, std::bit_cast<size_t>(createMethod(mId, frame, nullptr)));
             // std::cout << "PUTTING TO MAP " << m << " / " << mId->data.name << std::endl;
@@ -3548,6 +3639,10 @@ void FunctionRef::writeConst(size_t id, LoxValue value) {
 
 LoxValue FunctionRef::readConst(size_t id) {
     return std::bit_cast<LoxValue>(captures[id]);
+}
+
+size_t FunctionRef::calculateSize() {
+    return sizeof(FunctionRef)+func->upValCount()*sizeof(LoxValue);
 }
 
 
@@ -4578,7 +4673,7 @@ struct ASTExecutor: ASTVisitor {
     FunctionRef* currentFrame;
 
     FunctionRef* allocateFunctionRef(Function& f) {
-        auto idk = (FunctionRef*)malloc(sizeof(FunctionRef)+(f.totalUpValCount()*sizeof(LoxValue*)));
+        auto idk = allocateTyped<FunctionRef>(sizeof(FunctionRef)+(f.totalUpValCount()*sizeof(LoxValue*)), AllocType::FUNCTION_REF);
         idk->func = &f;
 
         // std::memset(idk->captures, 0, f.totalUpValCount()*sizeof(LoxValue*));
@@ -4943,11 +5038,7 @@ typedef LoxValue(*GlobalFunck)(FunctionRef*);
 
 
 FunctionRef* createMethod(Function* f1, FunctionRef* parent, ObjectRef* self) {
-    auto f = RUNTIME->allocateFunctionRef(*f1);
-    f->func = f1;
-    f->parent = parent;
-    f->argCount = f1->data.argz.size();
-    f->fPtr = f1->runtimeData;
+    auto f = builtin::allocateClosure(f1, parent).asFunction();
     for (auto i = 0UL; i < f1->captures.size(); i++) {
         f->captures[f1->upValCount()+i] = parent->captures[f1->captures[i]];
     }
@@ -4965,13 +5056,1212 @@ LoxValue loxClock(FunctionRef* self) {
 
 constexpr std::string_view CONSTRUCTOR_NAME = "init";
 
+string LoxValue::toString() const {
+    switch (getType()) {
+        case FLOAT: {
+            char pepa[16];
+            snprintf(pepa, 16, "%G", asNumber());
+            return {pepa};
+        }
+        case FUNCTION_REF:
+            return (asFunction()->func->native) ? "<native fn>" : stringify("<fn {}>", asFunction()->func->data.name);
+        case NIL:
+            return "nil";
+        case BOOL:
+        case BOOL_FALSE:
+            return asBool() ? "true" : "false";
+        case STRING:
+            return string(asString());
+        case CLASS:
+            return asClass()->clazz->data.name;
+            break;
+        case INSTANCE:
+            return stringify("{} instance", asObject()->clazz->clazz->data.name);
+            break;
+    }
+    UNREACHABLE();
+}
+
+// TODO FIXME!! print() is also VALID
+// GLOBALS of the same name reference the same slot, undefined identifier defaults to global
+// global block destroys this mechanism
+// global slot can be in undefined state
+// thats how global functions work
+// what about overiding method by assigning function, yes you can it will "shadow" the method
+// methods are closures that capture this + super
+// constructors are just "init" method, call it on instantiation
+// canot use return in init / can only return this, must return this
+// vipl is structuraly typed?
+// the whole inheritace thingy is weird
+// std "clock" returns time since start in seconds
+// raylib binding for lox??????????????
+// ARRAY, BREAK, CONTINUE, CONST keyword, IF isType..., REPL, DEBUGER?
+// only repo requirement, RUN TESTS
+// merge requests for checking stuff...
+// FIXME THIS IS FUCKED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+// cache maps in cache
+// maps have creation order
+// mby just cache orders? statically?
+// map creation depends on order
+// how to handle adding new proepry? we need to realocate the object?
+// js spec "species"
+// around 8 objects inline
+// some fancy magic
+// IF WE KNOW THAT METHOD is not compared we can use differen calling convention
+// FIXME this is REAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALY BAD implementation of JIT
+
+// interpret loop has been replaced with builtin call overhead
+// register allocation is netured with __locals shajze
+// evrything around objects is slow - lookup, methods, EVERYTHING
+
+struct BitsetView {
+    char* data;
+    size_t bitSize;
+
+    size_t count() {
+        size_t acu = 0;
+        for (auto i = 0ul; i < this->bitSize; i++) {
+            if (get(i)) acu += 1;
+        }
+
+        return acu;
+    }
+
+    void set(size_t index, bool value) {
+        assert(index < bitSize);
+        auto v = data[index / 8];
+
+        if (value) {
+            data[index / 8] = v | (1 << (index % 8));
+        } else {
+            data[index / 8] = ~(~v | (1 << (index % 8)));
+        }
+    }
+
+    bool get(size_t index) {
+        assert(index < bitSize);
+        return (data[index / 8] & (1 << (index % 8))) >> (index % 8);
+    }
+
+    void clear() {
+        for (auto i = 0ul; i < this->bitSize; i++) {
+            set(i, false);
+        }
+    }
+};
+
+
+/// TODO modulo classe for FunctionRef
+/// TODO HASH MAP BUCKETS ARE ALSO SIMPLE BCS THEIR SIZE GROWS EXPONENTIONALLY ... no wasted bytes
+struct Heap {
+#define GC_LOG(stuff, ...) if (debugGc) println(stuff __VA_OPT__(,) __VA_ARGS__);
+
+    uintptr_t* stackStart;
+
+    char* start;
+    size_t heapSize;
+
+    char* firstFreeBigBlock;
+
+    void setupPages() {
+        heapSize = BIG_BLOCK_SIZE*128;
+        start = (char*)mmap(nullptr, heapSize+BIG_BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        GC_LOG("[heap] setup {}", (void*)start);
+        auto oldStart = start;
+        start = (char*)((uintptr_t)start & ~(BIG_BLOCK_SIZE-1));
+        if (start != oldStart) start += BIG_BLOCK_SIZE;
+        GC_LOG("[heap] setup aligned {}", (void*)start);
+
+        firstFreeBigBlock = nullptr;
+
+        // ((BigBlock*)firstFreeBigBlock)->next = nullptr;
+
+        for (auto i = 0ul; i < heapSize; i += BIG_BLOCK_SIZE) {
+            freeBigBlock(start+i);
+        }
+    }
+
+    void freeBigBlock(char* other) {
+        GC_LOG("[heap] freeBigBlock {}", (void*)other);
+
+        ASAN_UNPOISON_MEMORY_REGION(other, BIG_BLOCK_SIZE);
+        std::memset(other, 0, BIG_BLOCK_SIZE);
+
+        auto cpy = firstFreeBigBlock;
+        firstFreeBigBlock = other;
+        ((BigBlock*)(other))->next = cpy;
+
+        GC_LOG("[poison] poisoning block free {} - {}", (void*)other, bigBlockToId((BigBlock*)other));
+
+        ASAN_POISON_MEMORY_REGION(other, BIG_BLOCK_SIZE);
+    }
+
+    char* allocBigBlock() {
+        if (firstFreeBigBlock == nullptr) {
+            GC_LOG("[heap] allocBigBlock null");
+            return nullptr;
+        }
+
+        auto bb = (BigBlock *) firstFreeBigBlock;
+        ASAN_UNPOISON_MEMORY_REGION(bb, BIG_BLOCK_SIZE);
+        firstFreeBigBlock = bb->next;
+
+        std::memset(bb, 0, BIG_BLOCK_SIZE);
+
+        GC_LOG("[poison] poisoning allocation range {} - {}", bb, bigBlockToId(bb));
+
+        ASAN_POISON_MEMORY_REGION(((char*)bb)+sizeof(BigBlock), BIG_BLOCK_SIZE-sizeof(BigBlock));
+
+        GC_LOG("[heap] allocBigBlock {} - {}", bb, bigBlockToId(bb));
+
+        return (char*)bb;
+    }
+
+    char* markPtr(char* ptr, bool isConservative = false) {
+        auto bigBlock = ptrToBigBlock((uintptr_t)ptr);
+
+        if (isConservative) {
+            GC_LOG("[gc] big block {} - {} - {} - {}", bigBlock, allocToString(bigBlock->type), bigBlock->granularity, ((uintptr_t)bigBlock-(uintptr_t)start)/BIG_BLOCK_SIZE);
+
+            auto ptrValue = (uintptr_t)ptr % bigBlock->granularity;
+
+            if ((uintptr_t)ptr < bigBlock->calculateBaseAddress()) {
+                GC_LOG("[gc] ignoring ptr, it points into block meta {}", (void*)ptr);
+                return nullptr;
+            }
+
+            if ((uintptr_t)ptr >= (size_t)bigBlock->getBitsetAddr()) {
+                GC_LOG("[gc] ignoring ptr, points into mark bits {}", (void*)ptr);
+                return nullptr;
+            }
+
+            if (ptrValue != 0) {
+                GC_LOG("[gc] ignoring ptr granularity does not match {} expected {}", (void*)ptr, bigBlock->granularity);
+                return nullptr;
+            }
+
+            if (not bigBlock->isAllocated(ptr)) {
+                GC_LOG("[gc] ignoring ptr, is not allocated {}", (void*)ptr);
+                return nullptr;
+            }
+
+   /*         if (bigBlock->getMarkBitSet().get(bigBlock->ptrToIndex(ptr))) {
+                println("[gc] ignoring ptr allredy marked {}", ptr);
+            }*/
+
+            return ptr;
+        }
+
+        GC_LOG("[gc] marking {} - {}", (void*)ptr, allocToString(bigBlock->type));
+
+        bigBlock->getMarkBitSet().set(bigBlock->ptrToIndex(ptr), true);
+
+        return nullptr;
+    }
+
+    bool isMarkedPtr(char* ptr) {
+        if (((uintptr_t)ptr & LoxValue::NAN_MASK) == LoxValue::NAN_MASK) {
+            GC_LOG("[gc] pointer looks like LoxValue {}", (void*)ptr);
+            PANIC();
+        }
+        assert(ptr >= start && ptr <= start+heapSize);
+        auto bigBlockBits = (size_t)std::log2(Heap::BIG_BLOCK_SIZE);
+        auto* bigBlock = std::bit_cast<BigBlock*>((std::bit_cast<u64>(ptr) >> bigBlockBits) << bigBlockBits);
+
+        return bigBlock->getMarkBitSet().get(bigBlock->ptrToIndex(ptr));
+    }
+
+    bool cmpMark(char* ptr) {
+        if (isMarkedPtr(ptr)) return false;
+
+        markPtr(ptr);
+
+        return true;
+    }
+
+    // inspired by
+    // https://webkit.org/blog/12967/understanding-gc-in-jsc-from-scratch/
+
+    static constexpr size_t BIG_BLOCK_SIZE = 64*1024;
+
+    enum class BigBlockType {
+        FREE_LIST,
+        BUMP
+    };
+
+    static constexpr size_t allocTypeToConstantSize(AllocType type) {
+        switch (type) {
+            case AllocType::LOX_VALUE: return sizeof(LoxValue);
+            case AllocType::HASH_MAP: return sizeof(LoxMap);
+            case AllocType::CLASS_REF: return sizeof(ClassRef);
+            case AllocType::OBJECT_REF: return sizeof(ObjectRef);
+            case AllocType::HASH_MAP_BUCKET: return LoxMap::BBUCKET_SIZE;
+            case AllocType::STRING: return 0;
+            case AllocType::FUNCTION_REF: return 0;
+            case AllocType::HASH_MAP_BUCKET_ARRAY: return 0;
+        }
+        PANIC()
+    }
+
+    struct BigBlock {
+        AllocType type;
+        BigBlockType blockType;
+        size_t flags;
+        size_t granularity;
+        char* next;
+        char* prev;
+        char* base;
+        char* end;
+
+        char data[];
+
+        void setIsBeignAllocated(bool isAllocated) {
+            flags |= (isAllocated ? 1 : 0) << 1;
+        }
+
+        size_t markedCount() {
+            size_t acu = 0;
+
+            auto set = getMarkBitSet();
+
+            for (auto i = 0ul; i < constantItemCount(); i++) {
+                if (set.get(i)) acu += 1;
+            }
+
+            return acu;
+        }
+
+        size_t getObjectSize(size_t index) {
+            switch (type) {
+                case AllocType::STRING:
+                    return ((LoxStr*)base+(granularity*index))->calculateSize();
+                case AllocType::FUNCTION_REF:
+                    return ((FunctionRef*)base+(granularity*index))->calculateSize();
+                case AllocType::HASH_MAP_BUCKET_ARRAY:
+                TODO();
+                default:
+                    return allocTypeToConstantSize(type);
+            }
+        }
+
+        bool isBeignAllocated() {
+            return flags & 1;
+        }
+
+        uintptr_t calculateBaseAddress() {
+            return align((uintptr_t)this+sizeof(BigBlock), granularity);
+        }
+
+        size_t getOrder(void* ptr) {
+            switch (type) {
+                case AllocType::LOX_VALUE: return sizeof(LoxValue);
+                case AllocType::HASH_MAP: return sizeof(LoxMap);
+                case AllocType::CLASS_REF: return sizeof(ClassRef);
+                case AllocType::OBJECT_REF: return sizeof(ObjectRef);
+                case AllocType::STRING: TODO();
+                case AllocType::HASH_MAP_BUCKET: return LoxMap::BBUCKET_SIZE;
+                case AllocType::FUNCTION_REF: ((FunctionRef*)(ptr))->func->totalUpValCount();
+                case AllocType::HASH_MAP_BUCKET_ARRAY: TODO();
+            }
+        }
+
+        static constexpr size_t PER_GRANULE_BITS = 2;
+
+        size_t constantItemCount() {
+            auto available = BIG_BLOCK_SIZE-(calculateBaseAddress()-(uintptr_t)this);
+
+            auto avialableBits = available*8;
+            auto itemBitSize = granularity*8 + PER_GRANULE_BITS;
+
+            auto itemCount = avialableBits / itemBitSize;
+
+            return itemCount;
+        }
+
+        size_t bitsetSizeBytes() {
+            auto itemz = constantItemCount()*PER_GRANULE_BITS;
+            auto bytes = itemz/8;
+            if (itemz % 8 != 0) bytes += 1;
+            return bytes;
+        }
+
+        char* getBitsetAddr() {
+            auto nItems = constantItemCount();
+            auto startPtr = calculateBaseAddress()+(nItems*granularity);
+
+            return (char*)startPtr;
+        }
+
+        bool isFull() {
+            if (blockType == BigBlockType::BUMP) {
+                return base + granularity > end;
+            } else {
+                return base == nullptr;
+            }
+        }
+
+        BitsetView getMarkBitSet() {
+            return BitsetView{this->getBitsetAddr(), this->constantItemCount()*PER_GRANULE_BITS};
+        }
+
+        size_t ptrToIndex(char* ptr) {
+            auto cc = (uintptr_t)ptr-this->calculateBaseAddress();
+
+            return cc/granularity;
+        }
+
+        void* allocateBump(size_t n) {
+            auto self = base;
+
+            if (self + (granularity*n) > end) {
+                println("[heap] allocateBump OOM");
+                return nullptr;
+            }
+
+            base += (granularity*n);
+
+            return self;
+        }
+
+        void clearMarkBits() {
+            for (auto i = 0ul; i < constantItemCount(); i++) {
+                if (not isMarkedIndex(i)) setIsAllocatedIndex(i, false);
+                this->setIsMarkedIndex(i, false);
+            }
+        }
+
+        bool isConstantSize() {
+            switch (type) {
+                case AllocType::LOX_VALUE: return true;
+                case AllocType::HASH_MAP: return true;
+                case AllocType::CLASS_REF: return true;
+                case AllocType::OBJECT_REF: return true;
+                case AllocType::HASH_MAP_BUCKET: return true;
+                case AllocType::STRING: return false;
+                case AllocType::FUNCTION_REF: return false;
+                case AllocType::HASH_MAP_BUCKET_ARRAY: return false;
+            }
+            PANIC();
+        }
+
+        void* allocateFreeList(size_t n) {
+            assert(n == 1);
+
+            auto self = this->base;
+
+            if (self == nullptr)
+                return nullptr;
+
+            if (isConstantSize()) {
+                this->base = *((char**)self);
+            } else {
+                auto parentPtr = (FreeSlot**)this->base;
+                auto based = (FreeSlot*)this->base;
+                auto requested = n*this->granularity;
+
+                while (true) {
+                    if (based == nullptr) {
+                        return nullptr;
+                    }
+
+                    if (based->size == requested) { // we consumed the entire free space
+                        *parentPtr = based->next;
+
+                        return based;
+                    } else if (based->size < requested) { // not enough space :(
+                        based = based->next;
+                        parentPtr = &based->next;
+                    } else { // more space than we need :(
+                        auto rem = based->size-requested;
+
+                        auto sliced = (FreeSlot*)((char*)based)+requested;
+                        sliced->size = rem;
+                        sliced->next = based->next;
+
+                        *parentPtr = sliced;
+
+                        return based;
+                    }
+                }
+            }
+
+            return self;
+        }
+
+        void markAllocated(void* ptr) {
+            auto objIdex = ptrToIndex((char*)ptr);
+            setIsAllocatedIndex(objIdex, true);
+        }
+
+        void setIsAllocatedIndex(size_t index, bool value) {
+            getMarkBitSet().set(constantItemCount()+index, value);
+        }
+
+        void setIsMarkedIndex(size_t index, bool value) {
+            getMarkBitSet().set(index, value);
+        }
+
+        bool isAllocated(void* ptr) {
+            auto objIdex = ptrToIndex((char*)ptr);
+            return isAllocatedIndex(objIdex);
+        }
+
+        bool isAllocatedIndex(size_t index) {
+            return getMarkBitSet().get(constantItemCount()+index);
+        }
+
+        bool isMarkedIndex(size_t index) {
+            return getMarkBitSet().get(index);
+        }
+
+        void* allocate(size_t order = 1)  {
+            void* res;
+            if (blockType == BigBlockType::BUMP) {
+                res = allocateBump(order);
+            } else {
+                res = allocateFreeList(order);
+            }
+
+            if (res != nullptr) {
+                markAllocated(res);
+
+                ASAN_UNPOISON_MEMORY_REGION(res, granularity*order);
+            }
+
+            return res;
+        }
+    };
+
+    size_t bigBlockToId(BigBlock* bb) {
+        return ((uintptr_t)bb - (uintptr_t)start) / BIG_BLOCK_SIZE;
+    }
+
+    struct FreeSlot {
+        FreeSlot* next;
+        size_t size;
+    };
+
+    struct FreeBigBlock {
+        void* next;
+    };
+
+    // allocation
+    BigBlock* LOX_VALUE_BIG_BLOCK = nullptr;
+    BigBlock* SLOW_LOX_VALUE_BIG_BLOCK = nullptr;
+
+    BigBlock* OBJECT_BIG_BLOCK = nullptr;
+    BigBlock* SLOW_OBJECT_BIG_BLOCK = nullptr;
+
+    BigBlock* MAP_BIG_BLOCK = nullptr;
+    BigBlock* SLOW_MAP_BIG_BLOCK = nullptr;
+
+    BigBlock* CLASS_BIG_BLOCK = nullptr;
+    BigBlock* SLOW_CLASS_BIG_BLOCK = nullptr;
+
+    BigBlock* MAP_BUCKET_BIG_BLOCK = nullptr;
+    BigBlock* SLOW_MAP_BUCKET_BIG_BLOCK = nullptr;
+
+    BigBlock* STRING_BIG_BLOCK = nullptr;
+    BigBlock* SLOW_STRING_BIG_BLOCK = nullptr;
+
+    BigBlock* BUCKETS_BIG_BLOCK = nullptr;
+    BigBlock* SLOW_BUCKETS_BIG_BLOCK = nullptr;
+
+    // modulo alloc classes for FunctionRef, this prevents wasting of precious bytes, ... we will still waste mark bits
+    constexpr static size_t IDK = sizeof(FunctionRef)/sizeof(LoxValue);
+    BigBlock* FUNCTION_REF_BIG_BLOCK[IDK] = {};
+    BigBlock* SLOW_FUNCTION_REF_BIG_BLOCK[IDK] = {};
+
+    BigBlock* putCureentBigBlock(BigBlock*& oldBlock, BigBlock* newBlock) {
+        if (oldBlock != nullptr) {
+            oldBlock->setIsBeignAllocated(false);
+        }
+        newBlock->setIsBeignAllocated(true);
+
+        return newBlock;
+    }
+
+    bool debugGc = false;
+
+    size_t getFunctionRefBigBlockIndex(size_t closedCount) {
+        return closedCount % IDK;
+    }
+
+    size_t getFunctionRefBigBlockIndexBySize(size_t size) {
+        return getFunctionRefBigBlockIndex((size-sizeof(FunctionRef))/sizeof(LoxValue));
+    }
+
+    BigBlock* getFunctionBigBlockBySize(size_t size) {
+        return FUNCTION_REF_BIG_BLOCK[((size-sizeof(FunctionRef))/sizeof(LoxValue))%IDK];
+    }
+
+    constexpr BigBlock* setupBigBlock(char* ptr, AllocType type) {
+        assert(ptr != nullptr);
+        return setupBigBlock(ptr, type, allocTypeToConstantSize(type));
+    }
+
+    BigBlock* setupBigBlock(char* ptr, AllocType type, size_t granularity) {
+        GC_LOG("[heap] setupBigBlock {} - {} - {}", (void*)ptr, allocToString(type), granularity);
+        auto bb = (BigBlock*)ptr;
+        bb->type = type;
+        bb->blockType = BigBlockType::BUMP;
+        bb->granularity = granularity;
+        bb->next = nullptr;
+        bb->prev = nullptr;
+
+        bb->end = (char*)(bb->calculateBaseAddress()+(bb->constantItemCount()*granularity));
+        bb->base = (char*)bb->calculateBaseAddress();
+
+        // ASAN_UNPOISON_MEMORY_REGION(bb->end, BIG_BLOCK_SIZE-(uintptr_t)bb->end);
+        auto headerSize = sizeof(BigBlock);
+        auto dataSize = bb->constantItemCount()*granularity;
+        auto bitsetSize = bb->bitsetSizeBytes();
+
+        GC_LOG("[heap] BIG BOLEST {} - {} - {} - {}", headerSize, dataSize, bitsetSize, BIG_BLOCK_SIZE);
+        assert((headerSize + dataSize + bitsetSize) <= BIG_BLOCK_SIZE);
+
+        ASAN_UNPOISON_MEMORY_REGION(bb->getBitsetAddr(), bitsetSize);
+
+        GC_LOG("[poison] unpoisoning bitset {} - {}", bb, bigBlockToId(bb));
+
+        bb->clearMarkBits();
+
+        return bb;
+    }
+
+    constexpr BigBlock** allocTypeToCurrentAlloc(AllocType type) {
+        switch (type) {
+            case AllocType::LOX_VALUE: return &LOX_VALUE_BIG_BLOCK;
+            case AllocType::HASH_MAP: return &MAP_BIG_BLOCK;
+            case AllocType::CLASS_REF: return &CLASS_BIG_BLOCK;
+            case AllocType::OBJECT_REF: return &OBJECT_BIG_BLOCK;
+            case AllocType::STRING: return &STRING_BIG_BLOCK;
+            case AllocType::HASH_MAP_BUCKET: return &BUCKETS_BIG_BLOCK;
+            case AllocType::HASH_MAP_BUCKET_ARRAY: return &MAP_BUCKET_BIG_BLOCK;
+            case AllocType::FUNCTION_REF: return nullptr;
+        }
+    }
+
+    constexpr BigBlock** allocTypeToCurrentAlloc(AllocType type, size_t size) {
+        switch (type) {
+            case AllocType::LOX_VALUE: return &LOX_VALUE_BIG_BLOCK;
+            case AllocType::HASH_MAP: return &MAP_BIG_BLOCK;
+            case AllocType::CLASS_REF: return &CLASS_BIG_BLOCK;
+            case AllocType::OBJECT_REF: return &OBJECT_BIG_BLOCK;
+            case AllocType::STRING: return &STRING_BIG_BLOCK;
+            case AllocType::HASH_MAP_BUCKET: return &BUCKETS_BIG_BLOCK;
+            case AllocType::HASH_MAP_BUCKET_ARRAY: return &MAP_BUCKET_BIG_BLOCK;
+            case AllocType::FUNCTION_REF: return &FUNCTION_REF_BIG_BLOCK[getFunctionRefBigBlockIndexBySize(size)];
+        }
+        PANIC();
+    }
+
+    constexpr BigBlock** allocTypeToSlowAlloc(AllocType type) {
+        switch (type) {
+            case AllocType::LOX_VALUE: return &SLOW_LOX_VALUE_BIG_BLOCK;
+            case AllocType::HASH_MAP: return &SLOW_MAP_BIG_BLOCK;
+            case AllocType::CLASS_REF: return &SLOW_CLASS_BIG_BLOCK;
+            case AllocType::OBJECT_REF: return &SLOW_OBJECT_BIG_BLOCK;
+            case AllocType::STRING: return &SLOW_STRING_BIG_BLOCK;
+            case AllocType::HASH_MAP_BUCKET: return &SLOW_BUCKETS_BIG_BLOCK;
+            case AllocType::HASH_MAP_BUCKET_ARRAY: return &SLOW_MAP_BUCKET_BIG_BLOCK;
+            case AllocType::FUNCTION_REF: TODO();
+        }
+        PANIC();
+    }
+
+    constexpr BigBlock** getFastByGranularity(AllocType type, size_t granularity) {
+        switch (type) {
+            case AllocType::LOX_VALUE: return &LOX_VALUE_BIG_BLOCK;
+            case AllocType::HASH_MAP: return &MAP_BIG_BLOCK;
+            case AllocType::CLASS_REF: return &CLASS_BIG_BLOCK;
+            case AllocType::OBJECT_REF: return &OBJECT_BIG_BLOCK;
+            case AllocType::STRING: return &STRING_BIG_BLOCK;
+            case AllocType::HASH_MAP_BUCKET: return &BUCKETS_BIG_BLOCK;
+            case AllocType::HASH_MAP_BUCKET_ARRAY: return &MAP_BUCKET_BIG_BLOCK;
+            case AllocType::FUNCTION_REF: TODO();
+        }
+        PANIC();
+    }
+
+    constexpr BigBlock** getSlowByGranularity(AllocType type, size_t granularity) {
+        switch (type) {
+            case AllocType::LOX_VALUE: return &SLOW_LOX_VALUE_BIG_BLOCK;
+            case AllocType::HASH_MAP: return &SLOW_MAP_BIG_BLOCK;
+            case AllocType::CLASS_REF: return &SLOW_CLASS_BIG_BLOCK;
+            case AllocType::OBJECT_REF: return &SLOW_OBJECT_BIG_BLOCK;
+            case AllocType::STRING: return &SLOW_STRING_BIG_BLOCK;
+            case AllocType::HASH_MAP_BUCKET: return &SLOW_BUCKETS_BIG_BLOCK;
+            case AllocType::HASH_MAP_BUCKET_ARRAY: return &SLOW_MAP_BUCKET_BIG_BLOCK;
+            case AllocType::FUNCTION_REF: TODO();
+        }
+        PANIC();
+    }
+
+    constexpr BigBlock** allocTypeToSlowAlloc(AllocType type, size_t size) {
+        switch (type) {
+            case AllocType::LOX_VALUE: return &SLOW_LOX_VALUE_BIG_BLOCK;
+            case AllocType::HASH_MAP: return &SLOW_MAP_BIG_BLOCK;
+            case AllocType::CLASS_REF: return &SLOW_CLASS_BIG_BLOCK;
+            case AllocType::OBJECT_REF: return &SLOW_OBJECT_BIG_BLOCK;
+            case AllocType::STRING: return &SLOW_STRING_BIG_BLOCK;
+            case AllocType::HASH_MAP_BUCKET: return &SLOW_BUCKETS_BIG_BLOCK;
+            case AllocType::HASH_MAP_BUCKET_ARRAY: return &SLOW_MAP_BUCKET_BIG_BLOCK;
+            case AllocType::FUNCTION_REF: return &SLOW_FUNCTION_REF_BIG_BLOCK[getFunctionRefBigBlockIndexBySize(size)];
+        }
+        PANIC();
+    }
+
+    constexpr BigBlock* allocateInitilizeBigBlock(AllocType type, size_t size) {
+        auto block = allocTypeToCurrentAlloc(type, size);
+
+        // try to get free block
+        auto newBlock = allocBigBlock();
+        if (newBlock == nullptr) {
+            GC_LOG("[heap] doTypeAlloc OOM - {}", allocToString(type));
+            doGc();
+            newBlock = allocBigBlock();
+
+            if (newBlock == nullptr) {
+                auto slowBlock = allocTypeToSlowAlloc(type, size);
+                if (*slowBlock == nullptr) {
+                    GC_LOG("[heap] exiting not even free list is available to satisfy allocation after gc :(");
+                    PANIC();
+                }
+
+                return putCureentBigBlock(*block, *slowBlock);
+            } else {
+                return putCureentBigBlock(*block, setupBigBlock(newBlock, type, calculateGranularity(type, size)));
+            }
+        } else {
+            return putCureentBigBlock(*block, setupBigBlock(newBlock, type, calculateGranularity(type, size)));
+        }
+    }
+
+    constexpr size_t calculateGranularity(AllocType type, size_t size) {
+        switch (type) {
+            case AllocType::FUNCTION_REF: return sizeof(FunctionRef)+(getFunctionRefBigBlockIndex((size-sizeof(FunctionRef))/sizeof(LoxValue))*8);
+            case AllocType::HASH_MAP_BUCKET_ARRAY: return LoxMap::BUCKET_ARRAY_BASE_SIZE;
+            case AllocType::STRING: return 16;
+            default: return allocTypeToConstantSize(type); // constant size allocation
+        }
+
+        PANIC();
+    }
+
+    constexpr size_t calculateAllocationOrder(AllocType type, size_t size) {
+        auto granularity = calculateGranularity(type, size);
+
+        if (type != AllocType::STRING && size % granularity != 0) PANIC();
+
+        switch (type) {
+            case AllocType::FUNCTION_REF: return size / granularity;
+            case AllocType::HASH_MAP_BUCKET_ARRAY: return size / granularity;
+            case AllocType::STRING: return align(size, 16)/16;
+            default: return 1; // constant size allocation
+        }
+    }
+
+    constexpr void* doAllocationGeneric(AllocType type, size_t size) {
+        auto block = allocTypeToCurrentAlloc(type, size);
+        auto allocationOrder = calculateAllocationOrder(type, size);
+
+        auto blk = *block;
+
+        if (blk == nullptr) {
+            blk = allocateInitilizeBigBlock(type, size);
+        }
+
+        auto allocated = blk->allocate(allocationOrder);
+
+        if (allocated == nullptr) {
+            blk = allocateInitilizeBigBlock(type, size);
+
+            // FIXME this can still fail when allocating big value eg string that is larger than available space, OR when using free list allocator ... well we failed to get free block which means we are low on memory / fragmentation
+            allocated = blk->allocate(allocationOrder);
+        }
+
+        if (allocated == nullptr) {
+            GC_LOG("[heap] strange OOM - {}", allocToString(type));
+        }
+
+        return allocated;
+    }
+
+    constexpr void* doTypeAlloc(AllocType type) {
+        auto block = allocTypeToCurrentAlloc(type);
+
+        if (*block == nullptr) {
+            *block = setupBigBlock(allocBigBlock(), type);
+        }
+
+        auto blk = *block;
+
+        auto allocated = blk->allocate();
+
+        if (allocated == nullptr) {
+            // try to get free block
+            auto newBlock = allocBigBlock();
+            if (newBlock == nullptr) {
+                GC_LOG("[heap] doTypeAlloc OOM - {}", allocToString(type));
+                doGc();
+                newBlock = allocBigBlock();
+
+                if (newBlock == nullptr) {
+                    auto slowBlock = allocTypeToSlowAlloc(type);
+                    if (*slowBlock == nullptr) {
+                        GC_LOG("[heap] exiting not even free list is available to satisfy allocation after gc :(");
+                        PANIC();
+                    }
+
+                    putCureentBigBlock(*block, *slowBlock);
+                } else {
+                    putCureentBigBlock(*block, setupBigBlock(newBlock, type));
+                    blk = *block;
+                }
+            } else {
+                putCureentBigBlock(*block, setupBigBlock(newBlock, type));
+                blk = *block;
+            }
+
+            allocated = blk->allocate();
+        }
+
+        if (allocated == nullptr) {
+            GC_LOG("[heap] strange OOM - {}", allocToString(type));
+        }
+
+        return allocated;
+    }
+
+    void* allocateFunctionRef(size_t UP_COUNT) {
+        GC_LOG("[heap] allocateFunctionRef {}", UP_COUNT);
+        auto** bBlock = &FUNCTION_REF_BIG_BLOCK[getFunctionRefBigBlockIndex(UP_COUNT)];
+
+        if (*bBlock == nullptr) {
+            *bBlock = setupBigBlock(allocBigBlock(), AllocType::FUNCTION_REF, sizeof(FunctionRef)+sizeof(LoxValue)*UP_COUNT);
+        }
+
+        auto self = (*bBlock)->allocate();
+
+        if (self == nullptr) {
+            TODO();
+        }
+
+        return self;
+    }
+
+    void* allocateString(size_t len) {
+        auto** bBlock = &this->STRING_BIG_BLOCK;
+
+        if (*bBlock == nullptr) {
+            *bBlock = setupBigBlock(allocBigBlock(), AllocType::STRING, 16);
+        }
+
+        auto self = (LoxStr*)(*bBlock)->allocate(align((len+1)+8, 16)/16);
+
+
+        if (self == nullptr) {
+            TODO();
+        }
+
+        self->size = len;
+        self->cString[len] = 0;
+
+        return self;
+    }
+
+    void* allocateMapBucketsArray(size_t size) {
+        GC_LOG("[heap] allocateMapBucketsArray {}", size);
+        auto** bBlock = &this->BUCKETS_BIG_BLOCK;
+
+        if (*bBlock == nullptr) {
+            *bBlock = setupBigBlock(allocBigBlock(), AllocType::HASH_MAP_BUCKET_ARRAY, LoxMap::BUCKET_ARRAY_BASE_SIZE);
+        }
+
+        auto self = (*bBlock)->allocate(size / LoxMap::BUCKET_ARRAY_BASE_SIZE);
+
+        if (self == nullptr) {
+            TODO();
+        }
+
+        GC_LOG("[heap] allocateMapBucketsArray ALLOCATED {}", self);
+
+        return self;
+    }
+
+    constexpr void* allocate(size_t size, AllocType type) {
+        return doAllocationGeneric(type, size);
+/*        switch (type) {
+            case AllocType::LOX_VALUE: return doTypeAlloc(&LOX_VALUE_BIG_BLOCK, type);
+            case AllocType::HASH_MAP: return doTypeAlloc(&MAP_BIG_BLOCK, type);
+            case AllocType::CLASS_REF: return doTypeAlloc(&CLASS_BIG_BLOCK, type);
+            case AllocType::OBJECT_REF: return doTypeAlloc(&OBJECT_BIG_BLOCK, type);
+            case AllocType::HASH_MAP_BUCKET: return doTypeAlloc(&MAP_BUCKET_BIG_BLOCK, type);
+            case AllocType::STRING: return allocateString(size-sizeof(LoxStr));
+            case AllocType::FUNCTION_REF: return allocateFunctionRef((size-sizeof(FunctionRef)) / sizeof(LoxValue));
+            case AllocType::HASH_MAP_BUCKET_ARRAY: return allocateMapBucketsArray(size);
+        }
+        PANIC()*/
+    }
+
+    void visitConservativePtr(uintptr_t ptr, std::vector<uintptr_t>& workList) {
+        if (ptr >= (uintptr_t)this->start && ptr < (((uintptr_t)this->start)+this->heapSize)) { // ptr is possible heap allocation
+            GC_LOG("[gc] value points into heap {} - {}", (void*)ptr, bigBlockToId((BigBlock*)ptr));
+            // try to determine to which object it points
+            // 1. we could set allocation granularity and manage bit set of allocated objects, query it to find out if
+            auto res = markPtr((char*) ptr, true);
+            if (res != nullptr) {
+                GC_LOG("[gc] ROOT PTR FOUND {}", (void*)ptr);
+                workList.push_back((uintptr_t)ptr);
+            }
+        } else {
+            if (ptr > 4096) GC_LOG("[gc] ignoring value {} ... not inside heap", (void*)ptr);
+        }
+    }
+
+    void collectPossibleValue(uintptr_t value, std::vector<uintptr_t>& workList) {
+        if (value & LoxValue::NAN_MASK) { // if value looks like nan try to cellect it as lox value
+            GC_LOG("[gc] value {} looks like LoxValue", (void*)value);
+            visitConservativePtr(value & LoxValue::DATA_MASK, workList);
+        } else {
+            visitConservativePtr(value, workList);
+        }
+    }
+
+    template<typename T>
+    void collectManagedPtr(T* self) {
+        if (self == nullptr) return;
+        if (this->cmpMark((char*)self))
+            collect(self);
+    }
+
+    void collect(LoxValue* self) {
+        collectLox(*self);
+    }
+
+    void collect(FunctionRef* self) {
+        collectManagedPtr(self->parent);
+
+        auto captures = self->func->totalUpValCount();
+        for (auto i = 0ul; i < captures; i++) {
+            auto v = self->captures[i];
+            auto isImutable = not self->func->isModifiedCaptured(i);
+
+            if (isImutable) {
+                collectLox(std::bit_cast<LoxValue>(v));
+            } else {
+                if (v != nullptr) collect(v);
+            }
+        }
+    }
+
+    void collect(ClassRef* self) {
+        collectManagedPtr(self->super);
+
+        collectManagedPtr(self->parent);
+
+        collect(&self->methods);
+    }
+
+    void collect(LoxStr* self) {
+        // do nothing
+    }
+
+    void collect(ObjectRef* self) {
+        collectManagedPtr(self->clazz);
+
+        collectManagedPtr(self->proto);
+
+        collectManagedPtr(self->construcor);
+
+        forEachMap(self->fields, [&](size_t v) {
+            collectLox(std::bit_cast<LoxValue>(v));
+        });
+    }
+
+    void collect(LoxMap* self) {
+        if (self->buckets != nullptr) {
+            markPtr((char*)self->buckets);
+            for (auto i = 0ul; i < self->size; i++) {
+                if (self->buckets[i] == nullptr) continue;
+                markPtr((char*)self->buckets[i]);
+            }
+        }
+
+        forEachMap(self, [&](size_t v) {
+            if (((uintptr_t)v & LoxValue::NAN_MASK) == LoxValue::NAN_MASK) {
+                collectLox(std::bit_cast<LoxValue>(v));
+            } else {
+                collectManagedPtr(std::bit_cast<FunctionRef*>(v));
+            }
+        });
+    }
+
+    void collectLox(LoxValue v) {
+        switch (v.getType()) {
+            case LoxValue::ValueType2::FLOAT:
+            case LoxValue::ValueType2::BOOL:
+            case LoxValue::ValueType2::BOOL_FALSE:
+            case LoxValue::ValueType2::NIL:
+                break;
+            case LoxValue::ValueType2::CLASS:
+                collectManagedPtr(v.asClass());
+                break;
+            case LoxValue::ValueType2::INSTANCE:
+                collectManagedPtr(v.asObject());
+                break;
+            case LoxValue::ValueType2::FUNCTION_REF:
+                collectManagedPtr(v.asFunction());
+                break;
+            case LoxValue::ValueType2::STRING:
+                collectManagedPtr(v.asLoxStr());
+                break;
+        }
+    }
+
+    void collectRegisterRoots(std::vector<uintptr_t>& workList) {
+#ifdef __x86_64__
+        uintptr_t regz[5];
+
+        asm ("mov %%rbx, %0\n"
+             "mov %%r12, %1\n"
+             "mov %%r13, %2\n"
+             "mov %%r14, %3\n"
+             "mov %%r15, %4\n": "=rm" (regz[0]), "=rm" (regz[1]), "=rm" (regz[2]), "=rm" (regz[3]), "=rm" (regz[4]));
+
+        for (auto ptr : regz) {
+            GC_LOG("[gc] collecting reg root {}", (void*)ptr);
+            collectPossibleValue(ptr, workList);
+        }
+#else
+#error unsuported architecture TODO arm64
+#endif
+    }
+
+    __attribute__((no_sanitize("address")))
+    void collectStackRoots(uintptr_t* start1, uintptr_t* end, std::vector<uintptr_t>& workList) {
+        GC_LOG("[gc] collecting stack roots {}..{} - {}B", end, start1, (uintptr_t)start1-(uintptr_t)end);
+
+
+        auto s = std::min(start1, end);
+        auto e = std::max(start1, end);
+
+        for (auto i = s; i <= e; i++) {
+            collectPossibleValue(*i, workList);
+        }
+    }
+
+    BigBlock* ptrToBigBlock(uintptr_t ptr) {
+        auto bigBlockBits = (size_t)std::log2(Heap::BIG_BLOCK_SIZE);
+        return std::bit_cast<BigBlock*>((std::bit_cast<u64>(ptr) >> bigBlockBits) << bigBlockBits);
+    }
+
+    void freeAndCleanupBlock(BigBlock* bb) {
+        if (bb->isBeignAllocated()) { // bb is either fast alloc variable, or part of freelist
+            auto block  = getFastByGranularity(bb->type, bb->granularity);
+            if (*block == bb) {
+                *block = nullptr;
+            }
+
+            if (bb->blockType == BigBlockType::FREE_LIST) {
+                if (bb->prev == nullptr) {
+                    auto idk = getSlowByGranularity(bb->type, bb->granularity);
+                    *idk = (BigBlock*)bb->next;
+                } else {
+                    bb->prev = bb->next;
+                }
+            }
+        }
+
+        freeBigBlock((char*)bb);
+    }
+
+    void setupFreeList(BigBlock* bb) {
+        GC_LOG("[gc] block is full setup free-list {}", bigBlockToId(bb));
+
+        assert(Heap::allocTypeToConstantSize(bb->type) != 0);
+        auto isConstantBlock = bb->isConstantSize();
+
+        ASAN_UNPOISON_MEMORY_REGION(bb, BIG_BLOCK_SIZE);
+
+        if (isConstantBlock) {
+            void* lastAddress = nullptr;
+
+            auto baseAddress = bb->calculateBaseAddress();
+
+            for (auto j = 0ul; j < bb->constantItemCount(); j++) {
+                if (bb->isMarkedIndex(j)) continue;
+
+                auto selfAdr = (void*)(baseAddress+j*bb->granularity);
+
+                std::memcpy(selfAdr, &lastAddress, sizeof lastAddress);
+                lastAddress = selfAdr;
+            }
+
+            bb->base = (char*)lastAddress;
+        } else {
+            void* lastAddress = nullptr;
+
+            char* freeAddr = nullptr;
+            size_t freeIndex = 0;
+
+            auto baseAddress = bb->calculateBaseAddress();
+
+            auto linkFreeList = [&](size_t last) {
+                if (freeAddr != nullptr) {
+                    auto freeSizeBytes = (last-freeIndex)*bb->granularity;
+
+                    if (freeSizeBytes == 0) PANIC();
+
+                    std::memcpy(freeAddr, &lastAddress, 8);
+                    std::memcpy(freeAddr+8, &freeSizeBytes, 8);
+
+                    freeIndex = 0;
+                    freeAddr = nullptr;
+                }
+            };
+
+            for (auto j = 0ul; j < bb->constantItemCount(); j++) {
+                if (bb->isAllocatedIndex(j) && bb->isMarkedIndex(j)) {
+                    linkFreeList(j);
+
+                    auto objSize = bb->getObjectSize(j);
+                    if (objSize % bb->granularity != 0) PANIC();
+                    auto nGranule = objSize / bb->granularity;
+                    if (nGranule == 0) PANIC();
+                    j += nGranule - 1;
+                    continue;
+                }
+                if (freeAddr == nullptr) {
+                    freeAddr = (char*)baseAddress+(j*bb->granularity);
+                    freeIndex = j;
+                }
+            }
+
+            linkFreeList(bb->constantItemCount());
+        }
+
+
+        bb->blockType = BigBlockType::FREE_LIST;
+        bb->clearMarkBits();
+    }
+
+    void doGc() {
+        auto stackEnd = __builtin_stack_address();
+
+        std::vector<uintptr_t> workList;
+
+        GC_LOG("[gc] === start ===");
+        auto nBigBlock = this->heapSize / Heap::BIG_BLOCK_SIZE;
+        GC_LOG("[gc] heapStart: {}, size: {}, bigBlocks: {}, last: {}", (void*)this->start, this->heapSize, nBigBlock, (void*)(this->start + ((nBigBlock-1)*BIG_BLOCK_SIZE)));
+
+        collectRegisterRoots(workList);
+
+        collectStackRoots(stackStart, (uintptr_t*)stackEnd, workList);
+
+        GC_LOG("[gc] roots {} - {}", workList.size(), workList);
+
+        while (not workList.empty()) {
+            auto p = workList.back(); workList.pop_back();
+
+            auto block = ptrToBigBlock(p);
+
+            switch (block->type) {
+                case AllocType::LOX_VALUE:
+                    collectManagedPtr((LoxValue*)p);
+                    break;
+                case AllocType::CLASS_REF:
+                    collectManagedPtr((ClassRef*)p);
+                    break;
+                case AllocType::OBJECT_REF:
+                    collectManagedPtr((ObjectRef*)p);
+                    break;
+                case AllocType::STRING:
+                    collectManagedPtr((LoxStr*)p);
+                    break;
+                case AllocType::FUNCTION_REF:
+                    collectManagedPtr((FunctionRef*)p);
+                    break;
+                case AllocType::HASH_MAP:
+                    collectManagedPtr((LoxMap*)p);
+                    break;
+
+                case AllocType::HASH_MAP_BUCKET_ARRAY:
+                    // collectManagedPtr((LoxMap*)p);
+                    break;
+                case AllocType::HASH_MAP_BUCKET:
+                    // collectManagedPtr((LoxMap*)p);
+                    break;
+            }
+        }
+
+        GC_LOG("[gc] END MARKING {} - {}", (size_t)start, (size_t)(start+heapSize));
+
+        for (auto i = (uintptr_t)start; i < (uintptr_t)(start+heapSize); i += BIG_BLOCK_SIZE) {
+            auto bb = (BigBlock*)i;
+
+            GC_LOG("[gc] sweep {} - {} - {}", bb, allocToString(bb->type), bigBlockToId(bb));
+
+            size_t aliveCount = bb->markedCount();
+
+            if (aliveCount == 0) {
+                GC_LOG("[gc] whole block is free {} - {}", allocToString(bb->type), bigBlockToId(bb));
+            } else {
+                GC_LOG("[gc] {}/{} block is used {} - {}", aliveCount, bb->constantItemCount(), allocToString(bb->type), bigBlockToId(bb));
+            }
+
+            if (aliveCount == 0) { // whole block is free, release it
+                freeAndCleanupBlock(bb);
+                continue;
+            }
+
+            if (bb->isFull()) {
+                setupFreeList(bb);
+            } else {
+                GC_LOG("[gc] block is partially filled {}", bigBlockToId(bb));
+                // if bump allocator dead alive ratio is => 0.4 setup free list
+                GC_LOG("[gc] free data {}", bb->constantItemCount());
+                bb->clearMarkBits();
+            }
+        }
+
+        GC_LOG("[gc] === end ===");
+    }
+};
+
+Heap heap;
+
+void* allocate(size_t size, AllocType type) {
+    // println("[heap] allocate {} - {}", size, allocToString(type));
+#if 0
+    return HEAP_ARENA.allocate(size, 8);
+#elif 0
+    return malloc(size);
+#else
+    auto v = heap.allocate(size, type);
+    std::memset(v, 0, size);
+    // println("[heap] allocated {} {} {}", v, size, allocToString(type));
+    return v;
+#endif
+}
+
 int main(int argc, const char** argv) {
+    heap.setupPages();
+    heap.stackStart = (uintptr_t*)__builtin_stack_address();
     bool USE_AST = false;
     string filePath{argv[1]};
+
     if (argc >= 3) {
-        DEBUG_JIT = string_view{argv[1]} == "-v";
-        USE_AST = string_view{argv[1]} == "-a";
+        auto argz = string_view{argv[1]};
+
+        DEBUG_JIT = argz.contains("v");
+        USE_AST = argz.contains("a");
+        heap.debugGc = argz.contains("g");
+
         filePath = string{argv[2]};
+    } else {
+        DEBUG_JIT = false;
     }
 
     auto fajl = readFile(filePath); // prog
@@ -5048,8 +6338,6 @@ int main(int argc, const char** argv) {
 
     if (USE_AST) {
         ASTExecutor executor;
-
-        RUNTIME = &executor;
 
         executor.currentFrame = executor.allocateFunctionRef(*globalFunc);
         executor.stackBase -= globalFunc->locals.size()-globalFunc->totalUpValCount();
@@ -5134,61 +6422,3 @@ int main(int argc, const char** argv) {
     if (DEBUG_JIT)
         std::cout << "execution took: " << std::chrono::duration_cast<std::chrono::milliseconds>(ex2-ex1).count() << std::endl;
 }
-
-string LoxValue::toString() const {
-    switch (getType()) {
-        case FLOAT: {
-            char pepa[16];
-            snprintf(pepa, 16, "%G", asNumber());
-            return {pepa};
-        }
-        case FUNCTION_REF:
-            return (asFunction()->func->native) ? "<native fn>" : stringify("<fn {}>", asFunction()->func->data.name);
-        case NIL:
-            return "nil";
-        case BOOL:
-        case BOOL_FALSE:
-            return asBool() ? "true" : "false";
-        case STRING:
-            return string(asString());
-        case CLASS:
-            return asClass()->clazz->data.name;
-            break;
-        case INSTANCE:
-            return stringify("{} instance", asObject()->clazz->clazz->data.name);
-            break;
-    }
-    UNREACHABLE();
-}
-
-// TODO FIXME!! print() is also VALID
-// GLOBALS of the same name reference the same slot, undefined identifier defaults to global
-// global block destroys this mechanism
-// global slot can be in undefined state
-// thats how global functions work
-// what about overiding method by assigning function, yes you can it will "shadow" the method
-// methods are closures that capture this + super
-// constructors are just "init" method, call it on instantiation
-// canot use return in init / can only return this, must return this
-// vipl is structuraly typed?
-// the whole inheritace thingy is weird
-// std "clock" returns time since start in seconds
-// raylib binding for lox??????????????
-// ARRAY, BREAK, CONTINUE, CONST keyword, IF isType..., REPL, DEBUGER?
-// only repo requirement, RUN TESTS
-// merge requests for checking stuff...
-// FIXME THIS IS FUCKED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-// cache maps in cache
-// maps have creation order
-// mby just cache orders? statically?
-// map creation depends on order
-// how to handle adding new proepry? we need to realocate the object?
-// js spec "species"
-// around 8 objects inline
-// some fancy magic
-// IF WE KNOW THAT METHOD is not compared we can use differen calling convention
-// FIXME this is REAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALY BAD implementation of JIT
-
-// interpret loop has been replaced with builtin call overhead
-// register allocation is netured with __locals shajze
-// evrything around objects is slow - lookup, methods, EVERYTHING

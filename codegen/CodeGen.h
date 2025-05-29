@@ -351,7 +351,7 @@ public:
 
     CodeGen(CTX::ASSEMBLER& assembler, CTX::IRGEN& irGen, string name) : assembler(assembler), irGen(irGen), name(name) {}
 
-    bool dumpGraphPNG, printLinearized, printLiveRanges, warnLeak;
+    bool dumpGraphPNG = false, printLinearized = false, printLiveRanges = false, warnLeak = false;
 private:
 
     void generateInstructions(const vector<CopyPtr<IRInstruction<CTX>>>& instructions) {

@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 23)
 include(FetchContent)
 
 set(USE_OPENGL OFF)
-set(USE_SANITIZER OFF)
+set(USE_SANITIZER ON)
 
 # set(CMAKE_CXX_FLAGS_DEBUG "-fno-exceptions --time-report -ggdb")
 set(BASE_FLAGS "-fno-exceptions --time-report -Wall -Wextra -Werror -Wno-unused-but-set-variable -Wno-unused-parameter -Wno-unused-function -Wno-nonnull-compare -Wno-missing-field-initializers -Wno-changes-meaning -Wno-invalid-offsetof -m64 -O0")
