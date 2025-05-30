@@ -6452,7 +6452,8 @@ struct SimpleHeap {
     }
 
     void doGc() {
-        auto stackEnd = __builtin_stack_address();
+        void* stack_marker;
+        auto stackEnd = &stack_marker;
         std::unordered_set<SimpleAllocation*> roots;
 
         collectRegisterRoots(roots);
@@ -6494,7 +6495,8 @@ void* allocate(size_t size, AllocType type) {
 
 int main(int argc, const char** argv) {
     // heap.setupPages();
-    heap.stackStart = (uintptr_t*)__builtin_stack_address();
+    void* stackMarker;
+    heap.stackStart = &stackMarker;
     bool USE_AST = false;
     string filePath{argv[1]};
 
