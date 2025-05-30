@@ -1669,19 +1669,20 @@ size_t readMap(LoxMap* map, size_t id) {
 
 void writeMap(LoxMap* map, size_t id, size_t value) {
     if (map->bucks == nullptr) resize(map);
-    auto& bucket = map->bucks->buckets[id % map->bucks->size];
+    auto bucket = map->bucks->buckets[id % map->bucks->size];
 
     if (bucket == nullptr) {
         bucket = allocBucket();
+        map->bucks->buckets[id % map->bucks->size] = bucket;
     } else if (bucket->size == LoxMap::BUCKET_SIZE) {
         resize(map);
 
         bucket = map->bucks->buckets[id % map->bucks->size];
 
         if (bucket == nullptr) {
-            map->bucks->buckets[id % map->bucks->size] = allocBucket();
+            bucket = allocBucket();
+            map->bucks->buckets[id % map->bucks->size] = bucket;
         }
-        bucket = map->bucks->buckets[id % map->bucks->size];
     }
 
     for (auto i = 0ul; i < bucket->size; i++) {
@@ -3698,6 +3699,8 @@ struct LoxNumber: public NamedIrInstruction<"lox_number", MilaGenCtx> {
     }
 };
 
+std::unordered_set<void*> STATIC_ROOTS;
+
 struct LoxString: public NamedIrInstruction<"lox_string", MilaGenCtx> {
     PUB_VIRTUAL_COPY(LoxString)
     string v;
@@ -3711,7 +3714,9 @@ struct LoxString: public NamedIrInstruction<"lox_string", MilaGenCtx> {
     }
 
     void generate(MilaCodeGen& gen) override {
-        gen.assembler.movInt(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::String(allocateLoxString(string_view(v.data()+1, v.size()-2)))));
+        auto alloc = allocateLoxString(string_view(v.data()+1, v.size()-2));
+        STATIC_ROOTS.insert(alloc);
+        gen.assembler.movInt(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::String(alloc)));
     }
 };
 
@@ -6147,9 +6152,331 @@ struct Heap {
 
         GC_LOG("[gc] === end ===");
     }
+
+#undef GC_LOG
 };
 
-Heap heap;
+struct SimpleAllocation {
+    size_t size;
+    AllocType type;
+    char data[];
+};
+
+struct SimpleHeap {
+#define GC_LOG(stuff, ...) if (debugGc) println(stuff __VA_OPT__(,) __VA_ARGS__);
+    std::unordered_set<SimpleAllocation*> allocated;
+    std::unordered_set<SimpleAllocation*> visited;
+    size_t allocCounter = 0;
+    size_t heapSize = 0;
+    void* stackStart = nullptr;
+    bool debugGc = false;
+
+    static constexpr size_t ALLOC_TREASHOLD = 4096*4;
+    static constexpr size_t HEAP_SIZE_TRESHOLD = 128*1024*1024;
+
+    ~SimpleHeap() {
+        for (auto alloc : allocated) {
+            free(alloc);
+        }
+    }
+
+    void* ptrToUser(SimpleAllocation* ptr) {
+      return ((char*)ptr)+sizeof(SimpleAllocation);
+    }
+
+    SimpleAllocation* ptrFromUser(void* ptr) {
+        if ((uintptr_t)ptr < 4096) return nullptr;
+        return (SimpleAllocation*)(((char*)ptr)-sizeof(SimpleAllocation));
+    }
+
+    SimpleAllocation* ptrFromUserSafe(void* ptr) {
+        auto ptr1 = ptrFromUser(ptr);
+        if (not allocated.contains(ptr1)) {
+            GC_LOG("invalid ptr {}", ptr1);
+            assert(allocated.contains(ptr1));
+        }
+
+        return ptr1;
+    }
+
+    void* allocate(AllocType type, size_t size) {
+        auto allocSize = size+sizeof(SimpleAllocation);
+
+        if (heapSize+allocSize >= HEAP_SIZE_TRESHOLD) {
+            doGc();
+            if (heapSize+allocSize >= HEAP_SIZE_TRESHOLD) {
+                PANIC("OOM heap is full even after GC");
+            }
+        }
+
+        auto ptr = (SimpleAllocation*)malloc(allocSize);
+        heapSize += allocSize;
+
+        std::memset(ptr, 0, allocSize);
+
+        ptr->type = type;
+        ptr->size = size;
+
+        allocated.emplace(ptr);
+
+        return ptrToUser(ptr); // convert to user
+    }
+
+    void markPtr(SimpleAllocation* ptr) {
+        assert(allocated.contains(ptr));
+        visited.insert(ptr);
+    }
+
+    void markManagedPtr(void* ptr) {
+        markPtr(ptrFromUserSafe(ptr));
+    }
+
+    bool isValidPtr(SimpleAllocation* ptr) {
+        return allocated.contains(ptr);
+    }
+
+    bool isMarkedPtr(SimpleAllocation* ptr) {
+        return visited.contains(ptr);
+    }
+
+    bool shoulMark(SimpleAllocation* ptr) {
+        if (not isValidPtr(ptr)) return false;
+        if (visited.contains(ptr)) return false;
+        return true;
+    }
+
+    void sweep() {
+        std::vector<SimpleAllocation*> toErase;
+        for (auto alloc: allocated) {
+            if (visited.contains(alloc)) continue;
+            GC_LOG("[gc] freeing {} - {} - {}", alloc , allocToString(alloc->type), alloc->size);
+            heapSize -= alloc->size+sizeof(SimpleAllocation);
+            free(alloc);
+            toErase.push_back(alloc);
+        }
+        for (auto v : toErase) {
+            allocated.erase(v);
+        }
+        visited.clear();
+    }
+
+    void collectPossibleValue(size_t value, std::unordered_set<SimpleAllocation*>& roots) {
+        if ((value & LoxValue::NAN_MASK) == LoxValue::NAN_MASK) {
+            auto ptr = ptrFromUser((void*)(value & LoxValue::DATA_MASK));
+            if (isValidPtr(ptr)) {
+                roots.insert((SimpleAllocation*)ptr);
+            }
+        }
+        if (isValidPtr((SimpleAllocation*)value)) {
+            roots.insert((SimpleAllocation*)value);
+        }
+        auto usrPtr = ptrFromUser((void*)value);
+        if (isValidPtr(usrPtr)) {
+            roots.insert((SimpleAllocation*)usrPtr);
+        }
+    }
+
+    void collectRegisterRoots(std::unordered_set<SimpleAllocation*>& roots) {
+#ifdef __x86_64__
+        uintptr_t regz[16];
+
+
+        asm ("mov %%rbx, %0\n"
+             "mov %%r12, %1\n"
+             "mov %%r13, %2\n"
+             "mov %%r14, %3\n"
+             "mov %%r15, %4\n"
+             "mov %%r8,  %5\n"
+             "mov %%r9,  %6\n"
+             "mov %%r10, %7\n"
+             "mov %%r11, %8\n"
+             "mov %%rdi, %9\n"
+             "mov %%rsi, %10\n"
+             "mov %%rcx, %11\n"
+             "mov %%rdx, %12\n"
+             "mov %%rax, %13\n"
+             "mov %%rsp, %14\n"
+             "mov %%rbp, %15\n": "=rm" (regz[0]), "=rm" (regz[1]), "=rm" (regz[2]), "=rm" (regz[3]), "=rm" (regz[4]), "=rm" (regz[5]), "=rm" (regz[6]), "=rm" (regz[7]), "=rm" (regz[8]), "=rm" (regz[9]), "=rm" (regz[10]), "=rm" (regz[11]), "=rm" (regz[12]), "=rm" (regz[13]), "=rm" (regz[14]), "=rm" (regz[15]));
+        for (auto ptr : regz) {
+            collectPossibleValue(ptr, roots);
+        }
+#else
+#error unsuported architecture TODO arm64
+#endif
+    }
+
+    __attribute__((no_sanitize("address")))
+    void collectStackRoots(std::unordered_set<SimpleAllocation*>& ptrs, void* start, void* end) {
+        auto s = (uintptr_t*)std::min(start, end)-4096;
+        auto e = (uintptr_t*)std::max(start, end)+4096;
+
+        GC_LOG("[gc] stack scan {} - {}", s, e);
+
+        for (auto i = s; i <= e; i++) {
+            collectPossibleValue(*i, ptrs);
+        }
+    }
+
+    template<typename T>
+    void collectManagedPtr(T* ptr) {
+        if (ptr == nullptr) return;
+        // FIXME not safe bcs iam lazy
+        if (shoulMark(ptrFromUser(ptr))) {
+            markManagedPtr(ptr);
+
+            collect(ptr);
+        }
+    }
+
+    void collect(LoxValue* self) {
+        collectLox(*self);
+    }
+
+    void collect(FunctionRef* self) {
+        assertSafePtr(self);
+        collectManagedPtr(self->parent);
+
+        auto captures = self->func->totalUpValCount();
+        for (auto i = 0ul; i < captures; i++) {
+            auto v = self->captures[i];
+
+            if (((uintptr_t)v & LoxValue::NAN_MASK) == LoxValue::NAN_MASK) {
+                collectLox(std::bit_cast<LoxValue>(v));
+            } else {
+                // FIXME this also is not right we should get this inforamtion preciely
+                if (v != nullptr) collectManagedPtr(v);
+            }
+        }
+    }
+
+    void collect(ClassRef* self) {
+        assertSafePtr(self);
+        collectManagedPtr(self->super);
+
+        collectManagedPtr(self->parent);
+
+        collect(&self->methods);
+    }
+
+    void collect(LoxStr* self) {
+        assertSafePtr(self);
+        // do nothing
+    }
+
+    void collect(ObjectRef* self) {
+        assertSafePtr(self);
+        collectManagedPtr(self->clazz);
+
+        collectManagedPtr(self->proto);
+
+        collectManagedPtr(self->construcor);
+
+        collectManagedPtr(self->fields);
+    }
+
+    void assertSafePtr(void* ptr) {
+        ptrFromUserSafe(ptr);
+    }
+
+    void collect(LoxMapBucket* self) {
+        assertSafePtr(self);
+        forEachBucket((LoxMapBucket*)self, [&](size_t v) {
+            if ((v & LoxValue::NAN_MASK) == LoxValue::NAN_MASK) {
+                collectLox(std::bit_cast<LoxValue>(v));
+            } else {
+                collectManagedPtr(std::bit_cast<FunctionRef*>(v));
+            }
+        });
+    }
+
+    void collect(LoxMapBucketArray* self) {
+        assertSafePtr(self);
+        for (auto i = 0ul; i < self->size; i++) {
+            collectManagedPtr(self->buckets[i]);
+        }
+    }
+
+    void collect(LoxMap* self) {
+        collectManagedPtr(self->bucks);
+    }
+
+    void collectLox(LoxValue v) {
+        switch (v.getType()) {
+            case LoxValue::ValueType2::FLOAT:
+            case LoxValue::ValueType2::BOOL:
+            case LoxValue::ValueType2::BOOL_FALSE:
+            case LoxValue::ValueType2::NIL:
+                break;
+            case LoxValue::ValueType2::CLASS:
+                collectManagedPtr(v.asClass());
+                break;
+            case LoxValue::ValueType2::INSTANCE:
+                collectManagedPtr(v.asObject());
+                break;
+            case LoxValue::ValueType2::FUNCTION_REF:
+                collectManagedPtr(v.asFunction());
+                break;
+            case LoxValue::ValueType2::STRING:
+                collectManagedPtr(v.asLoxStr());
+                break;
+        }
+    }
+
+    void idkMarkPtr(SimpleAllocation* ptr) {
+        switch (ptr->type) {
+            case AllocType::LOX_VALUE:
+                collectManagedPtr((LoxValue*)ptrToUser(ptr));
+                break;
+            case AllocType::HASH_MAP:
+                collectManagedPtr((LoxMap*)ptrToUser(ptr));
+                break;
+            case AllocType::CLASS_REF:
+                collectManagedPtr((ClassRef*)ptrToUser(ptr));
+                break;
+            case AllocType::OBJECT_REF:
+                collectManagedPtr((ObjectRef*)ptrToUser(ptr));
+                break;
+            case AllocType::STRING:
+                collectManagedPtr((LoxStr*)ptrToUser(ptr));
+                break;
+            case AllocType::HASH_MAP_BUCKET:
+                collectManagedPtr((LoxMapBucket*) ptrToUser(ptr));
+                break;
+            case AllocType::FUNCTION_REF:
+                collectManagedPtr((FunctionRef*) ptrToUser(ptr));
+                break;
+            case AllocType::HASH_MAP_BUCKET_ARRAY:
+                collectManagedPtr((LoxMapBucketArray*) ptrToUser(ptr));
+                break;
+        }
+    }
+
+    void doGc() {
+        auto stackEnd = __builtin_stack_address();
+        std::unordered_set<SimpleAllocation*> roots;
+
+        collectRegisterRoots(roots);
+
+        collectStackRoots(roots, stackStart, stackEnd);
+
+        for (auto stat : STATIC_ROOTS) {
+            collectPossibleValue((size_t)stat, roots);
+        }
+
+        for (auto g : GLOBALS_TABLE) {
+            collectPossibleValue(std::bit_cast<size_t>(g), roots);
+        }
+
+        for (auto root : roots) {
+            assert(isValidPtr(root));
+            idkMarkPtr(root);
+        }
+
+        sweep();
+    }
+};
+
+SimpleHeap heap;
 
 void* allocate(size_t size, AllocType type) {
     // println("[heap] allocate {} - {}", size, allocToString(type));
@@ -6158,7 +6485,7 @@ void* allocate(size_t size, AllocType type) {
 #elif 0
     return malloc(size);
 #else
-    auto v = heap.allocate(size, type);
+    auto v = heap.allocate(type, size);
     std::memset(v, 0, size);
     // println("[heap] allocated {} {} {}", v, size, allocToString(type));
     return v;
@@ -6166,7 +6493,7 @@ void* allocate(size_t size, AllocType type) {
 }
 
 int main(int argc, const char** argv) {
-    heap.setupPages();
+    // heap.setupPages();
     heap.stackStart = (uintptr_t*)__builtin_stack_address();
     bool USE_AST = false;
     string filePath{argv[1]};
@@ -6176,7 +6503,7 @@ int main(int argc, const char** argv) {
 
         DEBUG_JIT = argz.contains("v");
         USE_AST = argz.contains("a");
-        heap.debugGc = argz.contains("g");
+        // heap.debugGc = argz.contains("g");
 
         filePath = string{argv[2]};
     } else {
