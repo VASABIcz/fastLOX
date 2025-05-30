@@ -1561,20 +1561,25 @@ struct  LoxMapBucket {
     EntryPair items[];
 };
 
+struct LoxMapBucketArray {
+    size_t size;
+    LoxMapBucket* buckets[];
+};
+
 struct LoxMap {
     static constexpr size_t BUCKET_SIZE = 2;
     static constexpr size_t INIT_SIZE = 4;
     static constexpr size_t INVALID_VALUE = -1;
     static constexpr size_t BBUCKET_SIZE = sizeof(LoxMapBucket)+LoxMap::BUCKET_SIZE*sizeof(EntryPair);
-    static constexpr size_t BUCKET_ARRAY_BASE_SIZE = INIT_SIZE*sizeof(void*);
+    static constexpr size_t BUCKET_ARRAY_BASE_SIZE = sizeof(LoxMapBucketArray)+INIT_SIZE*sizeof(LoxMapBucket*);
 
-    LoxMapBucket** buckets = nullptr;
-    u64 size = 0;
+    LoxMapBucketArray* bucks = nullptr;
 };
 
 template<typename FN>
-void forEachMap(LoxMap* map, FN&& fn) {
-    if (map->buckets == nullptr) return;
+void forEachBucketArray(LoxMapBucketArray* map, FN&& fn) {
+    if (map == nullptr) return;
+
     for (auto i = 0ul; i < map->size; i++) {
         auto bucket = map->buckets[i];
         if (bucket == nullptr) continue;
@@ -1585,10 +1590,23 @@ void forEachMap(LoxMap* map, FN&& fn) {
     }
 }
 
+template<typename FN>
+void forEachMap(LoxMap* map, FN&& fn) {
+    if (map->bucks == nullptr) return;
+    forEachBucketArray(map->bucks, fn);
+}
+
+template<typename FN>
+void forEachBucket(LoxMapBucket* bucket, FN&& fn) {
+    for (auto j = 0ul; j < bucket->size; j++) {
+        fn(bucket->items[j].second);
+    }
+}
+
 void dump(LoxMap* map) {
-    for (auto i = 0ul; i < map->size; i++) {
+    for (auto i = 0ul; i < map->bucks->size; i++) {
         println("== BUCKET {}", i);
-        auto b = map->buckets[i];
+        LoxMapBucket* b = map->bucks->buckets[i];
         if (b == nullptr) continue;
         for (auto j = 0ul; j < b->size; j++) {
             println("== key: {}, value: {}", (size_t)b->items[j].first, (size_t)b->items[j].second);
@@ -1605,35 +1623,38 @@ LoxMapBucket* allocBucket() {
 
 void resize(LoxMap* map) {
     // std::cout << "RESIZE " << map->size << " " << map->size*4 << std::endl;
-    auto newSize = std::max(map->size*2, LoxMap::INIT_SIZE);
+    auto oldSize = map->bucks == nullptr ? 0 : map->bucks->size;
 
-    auto* newBukcets = allocateTyped<LoxMapBucket*>(newSize*sizeof(LoxMapBucket*), AllocType::HASH_MAP_BUCKET_ARRAY);
-    std::memset(newBukcets, 0, newSize*sizeof(LoxMapBucket*));
+    auto newSizeBytes = std::max((sizeof(LoxMapBucketArray)+(oldSize*sizeof(LoxMapBucket*)))*2, LoxMap::BUCKET_ARRAY_BASE_SIZE);
+    auto newItemCount = (newSizeBytes - sizeof(LoxMapBucketArray))/(sizeof(LoxMapBucket*));
 
-    for (auto i = 0ul; i < map->size; i++) {
-        auto oldBucket = map->buckets[i];
+    auto* newBukcets = allocateTyped<LoxMapBucketArray>(newSizeBytes, AllocType::HASH_MAP_BUCKET_ARRAY);
+    std::memset(newBukcets, 0, newSizeBytes);
+    newBukcets->size = newItemCount;
+
+    for (auto i = 0ul; i < oldSize; i++) {
+        auto oldBucket = map->bucks->buckets[i];
         if (oldBucket  == nullptr) continue;
         for (auto j = 0ul; j < oldBucket->size; j++) {
             auto entry = oldBucket->items[j];
-            auto newBucketId = entry.first % newSize;
-            auto& newBucket = newBukcets[newBucketId];
+            auto newBucketId = entry.first % newItemCount;
+            auto& newBucket = newBukcets->buckets[newBucketId];
             if (newBucket == nullptr) {
-                newBukcets[newBucketId] = allocBucket();
-                newBucket = newBukcets[newBucketId];
+                newBukcets->buckets[newBucketId] = allocBucket();
+                newBucket = newBukcets->buckets[newBucketId];
             }
             newBucket->items[newBucket->size++] = entry;
         }
     }
 
-    map->size = newSize;
-    map->buckets = newBukcets;
+    map->bucks = newBukcets;
 }
 
 size_t readMap(LoxMap* map, size_t id) {
-    if (map->size == 0)
+    if (map->bucks == nullptr)
         return LoxMap::INVALID_VALUE;
 
-    auto bucket = map->buckets[id % map->size];
+    auto bucket = map->bucks->buckets[id % map->bucks->size];
 
     if (bucket == nullptr)
         return LoxMap::INVALID_VALUE;
@@ -1647,20 +1668,20 @@ size_t readMap(LoxMap* map, size_t id) {
 }
 
 void writeMap(LoxMap* map, size_t id, size_t value) {
-    if (map->size == 0) resize(map);
-    auto& bucket = map->buckets[id % map->size];
+    if (map->bucks == nullptr) resize(map);
+    auto& bucket = map->bucks->buckets[id % map->bucks->size];
 
     if (bucket == nullptr) {
         bucket = allocBucket();
     } else if (bucket->size == LoxMap::BUCKET_SIZE) {
         resize(map);
 
-        bucket = map->buckets[id % map->size];
+        bucket = map->bucks->buckets[id % map->bucks->size];
 
         if (bucket == nullptr) {
-            map->buckets[id % map->size] = allocBucket();
+            map->bucks->buckets[id % map->bucks->size] = allocBucket();
         }
-        bucket = map->buckets[id % map->size];
+        bucket = map->bucks->buckets[id % map->bucks->size];
     }
 
     for (auto i = 0ul; i < bucket->size; i++) {
@@ -2711,8 +2732,7 @@ namespace builtin {
     LoxValue instantiate(LoxValue clazz) {
         // println("instantiate {}", clazz);
         auto map = allocateTypedSimple<LoxMap>(AllocType::HASH_MAP);
-        map->size = 0;
-        map->buckets = nullptr;
+        map->bucks = nullptr;
         auto* res = rawInstant(clazz.asClass(), map);
         // println("after");
 
@@ -2798,8 +2818,7 @@ namespace builtin {
         claz->clazz = clazz;
         claz->super = sup;
         claz->parent = frame;
-        claz->methods.size = 0;
-        claz->methods.buckets = nullptr;
+        claz->methods.bucks = nullptr;
         for (auto [m, mId] : clazz->methodIds) {
             writeMap(&claz->methods, m, std::bit_cast<size_t>(createMethod(mId, frame, nullptr)));
             // std::cout << "PUTTING TO MAP " << m << " / " << mId->data.name << std::endl;
@@ -5266,7 +5285,7 @@ struct Heap {
         }
         assert(ptr >= start && ptr <= start+heapSize);
         auto bigBlockBits = (size_t)std::log2(Heap::BIG_BLOCK_SIZE);
-        auto* bigBlock = std::bit_cast<BigBlock*>((std::bit_cast<u64>(ptr) >> bigBlockBits) << bigBlockBits);
+        auto* bigBlock = std::bit_cast<BigBlock*>((std::bit_cast<uintptr_t>(ptr) >> bigBlockBits) << bigBlockBits);
 
         return bigBlock->getMarkBitSet().get(bigBlock->ptrToIndex(ptr));
     }
@@ -5404,7 +5423,14 @@ struct Heap {
             return BitsetView{this->getBitsetAddr(), this->constantItemCount()*PER_GRANULE_BITS};
         }
 
+        uintptr_t endAddress() {
+            return ((uintptr_t)this)+BIG_BLOCK_SIZE;
+        }
+
         size_t ptrToIndex(char* ptr) {
+            assert((uintptr_t)ptr >= (uintptr_t )this->calculateBaseAddress());
+            assert((uintptr_t)ptr < this->endAddress());
+
             auto cc = (uintptr_t)ptr-this->calculateBaseAddress();
 
             return cc/granularity;
@@ -5414,7 +5440,7 @@ struct Heap {
             auto self = base;
 
             if (self + (granularity*n) > end) {
-                println("[heap] allocateBump OOM");
+                // GC_LOG("[heap] allocateBump OOM");
                 return nullptr;
             }
 
@@ -5752,7 +5778,10 @@ struct Heap {
     constexpr size_t calculateAllocationOrder(AllocType type, size_t size) {
         auto granularity = calculateGranularity(type, size);
 
-        if (type != AllocType::STRING && size % granularity != 0) PANIC();
+        if (type != AllocType::STRING && size % granularity != 0) {
+            GC_LOG("trying to allocate {} with size {} and granularity {}", allocToString(type), size, granularity);
+            PANIC();
+        }
 
         switch (type) {
             case AllocType::FUNCTION_REF: return size / granularity;
@@ -5785,124 +5814,13 @@ struct Heap {
             GC_LOG("[heap] strange OOM - {}", allocToString(type));
         }
 
-        return allocated;
-    }
-
-    constexpr void* doTypeAlloc(AllocType type) {
-        auto block = allocTypeToCurrentAlloc(type);
-
-        if (*block == nullptr) {
-            *block = setupBigBlock(allocBigBlock(), type);
-        }
-
-        auto blk = *block;
-
-        auto allocated = blk->allocate();
-
-        if (allocated == nullptr) {
-            // try to get free block
-            auto newBlock = allocBigBlock();
-            if (newBlock == nullptr) {
-                GC_LOG("[heap] doTypeAlloc OOM - {}", allocToString(type));
-                doGc();
-                newBlock = allocBigBlock();
-
-                if (newBlock == nullptr) {
-                    auto slowBlock = allocTypeToSlowAlloc(type);
-                    if (*slowBlock == nullptr) {
-                        GC_LOG("[heap] exiting not even free list is available to satisfy allocation after gc :(");
-                        PANIC();
-                    }
-
-                    putCureentBigBlock(*block, *slowBlock);
-                } else {
-                    putCureentBigBlock(*block, setupBigBlock(newBlock, type));
-                    blk = *block;
-                }
-            } else {
-                putCureentBigBlock(*block, setupBigBlock(newBlock, type));
-                blk = *block;
-            }
-
-            allocated = blk->allocate();
-        }
-
-        if (allocated == nullptr) {
-            GC_LOG("[heap] strange OOM - {}", allocToString(type));
-        }
+        memset(allocated, 0, size);
 
         return allocated;
-    }
-
-    void* allocateFunctionRef(size_t UP_COUNT) {
-        GC_LOG("[heap] allocateFunctionRef {}", UP_COUNT);
-        auto** bBlock = &FUNCTION_REF_BIG_BLOCK[getFunctionRefBigBlockIndex(UP_COUNT)];
-
-        if (*bBlock == nullptr) {
-            *bBlock = setupBigBlock(allocBigBlock(), AllocType::FUNCTION_REF, sizeof(FunctionRef)+sizeof(LoxValue)*UP_COUNT);
-        }
-
-        auto self = (*bBlock)->allocate();
-
-        if (self == nullptr) {
-            TODO();
-        }
-
-        return self;
-    }
-
-    void* allocateString(size_t len) {
-        auto** bBlock = &this->STRING_BIG_BLOCK;
-
-        if (*bBlock == nullptr) {
-            *bBlock = setupBigBlock(allocBigBlock(), AllocType::STRING, 16);
-        }
-
-        auto self = (LoxStr*)(*bBlock)->allocate(align((len+1)+8, 16)/16);
-
-
-        if (self == nullptr) {
-            TODO();
-        }
-
-        self->size = len;
-        self->cString[len] = 0;
-
-        return self;
-    }
-
-    void* allocateMapBucketsArray(size_t size) {
-        GC_LOG("[heap] allocateMapBucketsArray {}", size);
-        auto** bBlock = &this->BUCKETS_BIG_BLOCK;
-
-        if (*bBlock == nullptr) {
-            *bBlock = setupBigBlock(allocBigBlock(), AllocType::HASH_MAP_BUCKET_ARRAY, LoxMap::BUCKET_ARRAY_BASE_SIZE);
-        }
-
-        auto self = (*bBlock)->allocate(size / LoxMap::BUCKET_ARRAY_BASE_SIZE);
-
-        if (self == nullptr) {
-            TODO();
-        }
-
-        GC_LOG("[heap] allocateMapBucketsArray ALLOCATED {}", self);
-
-        return self;
     }
 
     constexpr void* allocate(size_t size, AllocType type) {
         return doAllocationGeneric(type, size);
-/*        switch (type) {
-            case AllocType::LOX_VALUE: return doTypeAlloc(&LOX_VALUE_BIG_BLOCK, type);
-            case AllocType::HASH_MAP: return doTypeAlloc(&MAP_BIG_BLOCK, type);
-            case AllocType::CLASS_REF: return doTypeAlloc(&CLASS_BIG_BLOCK, type);
-            case AllocType::OBJECT_REF: return doTypeAlloc(&OBJECT_BIG_BLOCK, type);
-            case AllocType::HASH_MAP_BUCKET: return doTypeAlloc(&MAP_BUCKET_BIG_BLOCK, type);
-            case AllocType::STRING: return allocateString(size-sizeof(LoxStr));
-            case AllocType::FUNCTION_REF: return allocateFunctionRef((size-sizeof(FunctionRef)) / sizeof(LoxValue));
-            case AllocType::HASH_MAP_BUCKET_ARRAY: return allocateMapBucketsArray(size);
-        }
-        PANIC()*/
     }
 
     void visitConservativePtr(uintptr_t ptr, std::vector<uintptr_t>& workList) {
@@ -5921,9 +5839,10 @@ struct Heap {
     }
 
     void collectPossibleValue(uintptr_t value, std::vector<uintptr_t>& workList) {
-        if (value & LoxValue::NAN_MASK) { // if value looks like nan try to cellect it as lox value
+        if ((value & LoxValue::NAN_MASK) == LoxValue::NAN_MASK) { // if value looks like nan try to cellect it as lox value
             GC_LOG("[gc] value {} looks like LoxValue", (void*)value);
             visitConservativePtr(value & LoxValue::DATA_MASK, workList);
+            visitConservativePtr(value, workList);
         } else {
             visitConservativePtr(value, workList);
         }
@@ -5975,27 +5894,27 @@ struct Heap {
 
         collectManagedPtr(self->construcor);
 
-        forEachMap(self->fields, [&](size_t v) {
-            collectLox(std::bit_cast<LoxValue>(v));
-        });
+        collectManagedPtr(self->fields);
     }
 
-    void collect(LoxMap* self) {
-        if (self->buckets != nullptr) {
-            markPtr((char*)self->buckets);
-            for (auto i = 0ul; i < self->size; i++) {
-                if (self->buckets[i] == nullptr) continue;
-                markPtr((char*)self->buckets[i]);
-            }
-        }
-
-        forEachMap(self, [&](size_t v) {
+    void collect(LoxMapBucket* self) {
+        forEachBucket((LoxMapBucket*)self, [&](size_t v) {
             if (((uintptr_t)v & LoxValue::NAN_MASK) == LoxValue::NAN_MASK) {
                 collectLox(std::bit_cast<LoxValue>(v));
             } else {
                 collectManagedPtr(std::bit_cast<FunctionRef*>(v));
             }
         });
+    }
+
+    void collect(LoxMapBucketArray* self) {
+        for (auto i = 0ul; i < self->size; i++) {
+            collectManagedPtr(self->buckets[i]);
+        }
+    }
+
+    void collect(LoxMap* self) {
+        collectManagedPtr(self->bucks);
     }
 
     void collectLox(LoxValue v) {
@@ -6188,10 +6107,10 @@ struct Heap {
                     break;
 
                 case AllocType::HASH_MAP_BUCKET_ARRAY:
-                    // collectManagedPtr((LoxMap*)p);
+                    collectManagedPtr((LoxMapBucketArray*)p);
                     break;
                 case AllocType::HASH_MAP_BUCKET:
-                    // collectManagedPtr((LoxMap*)p);
+                    collectManagedPtr((LoxMapBucket*)p);
                     break;
             }
         }
