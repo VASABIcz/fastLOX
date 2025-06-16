@@ -30,6 +30,13 @@ enum class AllocType {
     FUNCTION_REF, // 32B+8*N
     HASH_MAP_BUCKET_ARRAY // 4*8 (32B) -> 8*8 (64B) -> 16*8 (128B)
 };
+#if __has_feature(address_sanitizer) || defined(__SANITIZE_ADDRESS__)
+#define IS_POISONED(...) __asan_address_is_poisoned(__VA_ARGS__)
+#else
+#define IS_POISONED(...) false
+#endif
+
+void assertIsValidPtr(void* ptr);
 
 std::string_view allocToString(AllocType type) {
     switch (type) {
@@ -1668,11 +1675,21 @@ size_t readMap(LoxMap* map, size_t id) {
 }
 
 void writeMap(LoxMap* map, size_t id, size_t value) {
-    if (map->bucks == nullptr) resize(map);
+    assert(map != nullptr);
+    // println("MAP ADDR IZ {}", map);
+    assert(not IS_POISONED(map));
+    if (map->bucks == nullptr) {
+        resize(map);
+    }
+    // println("MAP BUCKZ {}", map->bucks);
+    assertIsValidPtr(map->bucks);
     auto bucket = map->bucks->buckets[id % map->bucks->size];
 
     if (bucket == nullptr) {
         bucket = allocBucket();
+        // println("MAP ADDR IZZZZZZZZZZZZZZ {}", map);
+        assertIsValidPtr(map->bucks);
+        assert(map->bucks != nullptr);
         map->bucks->buckets[id % map->bucks->size] = bucket;
     } else if (bucket->size == LoxMap::BUCKET_SIZE) {
         resize(map);
@@ -2801,7 +2818,7 @@ namespace builtin {
     LoxValue allocateClosure(Function* f, FunctionRef* closure) {
         auto c = allocateTyped<FunctionRef>(sizeof(FunctionRef)+f->totalUpValCount()*sizeof(LoxValue*), AllocType::FUNCTION_REF);
 
-        memset(c->captures, 0x0, f->totalUpValCount()*sizeof(LoxValue*));
+        std::memset(c->captures, 0x0, f->totalUpValCount()*sizeof(LoxValue*));
 
         c->parent = closure;
         c->func = f;
@@ -5155,7 +5172,9 @@ struct BitsetView {
         assert(index < bitSize);
         auto v = data[index / 8];
 
+        // println("MRDA? {} == {}", (int)v, (int)data[index/8]);
         if (value) {
+            data[index / 8] = v;
             data[index / 8] = v | (1 << (index % 8));
         } else {
             data[index / 8] = ~(~v | (1 << (index % 8)));
@@ -5164,7 +5183,7 @@ struct BitsetView {
 
     bool get(size_t index) {
         assert(index < bitSize);
-        return (data[index / 8] & (1 << (index % 8))) >> (index % 8);
+        return (data[index / 8] & (1 << (index % 8))) != 0;
     }
 
     void clear() {
@@ -5179,21 +5198,24 @@ struct BitsetView {
 /// TODO HASH MAP BUCKETS ARE ALSO SIMPLE BCS THEIR SIZE GROWS EXPONENTIONALLY ... no wasted bytes
 struct Heap {
 #define GC_LOG(stuff, ...) if (debugGc) println(stuff __VA_OPT__(,) __VA_ARGS__);
-
-    uintptr_t* stackStart;
+    size_t gcCount = 0;
+    size_t blockReclaimCount = 0;
+    void* stackStart;
 
     char* start;
     size_t heapSize;
 
     char* firstFreeBigBlock;
+    size_t freeBigBlocks = 0;
 
     void setupPages() {
-        heapSize = BIG_BLOCK_SIZE*128;
+        heapSize = 48ul*1024ul*1024ul;
         start = (char*)mmap(nullptr, heapSize+BIG_BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
         GC_LOG("[heap] setup {}", (void*)start);
         auto oldStart = start;
         start = (char*)((uintptr_t)start & ~(BIG_BLOCK_SIZE-1));
         if (start != oldStart) start += BIG_BLOCK_SIZE;
+        heapSize = (heapSize/BIG_BLOCK_SIZE)*BIG_BLOCK_SIZE;
         GC_LOG("[heap] setup aligned {}", (void*)start);
 
         firstFreeBigBlock = nullptr;
@@ -5207,9 +5229,11 @@ struct Heap {
 
     void freeBigBlock(char* other) {
         GC_LOG("[heap] freeBigBlock {}", (void*)other);
+        freeBigBlocks += 1;
 
         ASAN_UNPOISON_MEMORY_REGION(other, BIG_BLOCK_SIZE);
-        std::memset(other, 0, BIG_BLOCK_SIZE);
+        // std::memset(other, 0, BIG_BLOCK_SIZE);
+        ((BigBlock*)other)->setIsAlive(false);
 
         auto cpy = firstFreeBigBlock;
         firstFreeBigBlock = other;
@@ -5225,12 +5249,13 @@ struct Heap {
             GC_LOG("[heap] allocBigBlock null");
             return nullptr;
         }
+        freeBigBlocks -= 1;
 
         auto bb = (BigBlock *) firstFreeBigBlock;
         ASAN_UNPOISON_MEMORY_REGION(bb, BIG_BLOCK_SIZE);
         firstFreeBigBlock = bb->next;
 
-        std::memset(bb, 0, BIG_BLOCK_SIZE);
+        // std::memset(bb, 0, BIG_BLOCK_SIZE);
 
         GC_LOG("[poison] poisoning allocation range {} - {}", bb, bigBlockToId(bb));
 
@@ -5241,46 +5266,59 @@ struct Heap {
         return (char*)bb;
     }
 
-    char* markPtr(char* ptr, bool isConservative = false) {
+    bool isManagedPtr(void* ptr) {
         auto bigBlock = ptrToBigBlock((uintptr_t)ptr);
 
-        if (isConservative) {
-            GC_LOG("[gc] big block {} - {} - {} - {}", bigBlock, allocToString(bigBlock->type), bigBlock->granularity, ((uintptr_t)bigBlock-(uintptr_t)start)/BIG_BLOCK_SIZE);
-
-            auto ptrValue = (uintptr_t)ptr % bigBlock->granularity;
-
-            if ((uintptr_t)ptr < bigBlock->calculateBaseAddress()) {
-                GC_LOG("[gc] ignoring ptr, it points into block meta {}", (void*)ptr);
-                return nullptr;
-            }
-
-            if ((uintptr_t)ptr >= (size_t)bigBlock->getBitsetAddr()) {
-                GC_LOG("[gc] ignoring ptr, points into mark bits {}", (void*)ptr);
-                return nullptr;
-            }
-
-            if (ptrValue != 0) {
-                GC_LOG("[gc] ignoring ptr granularity does not match {} expected {}", (void*)ptr, bigBlock->granularity);
-                return nullptr;
-            }
-
-            if (not bigBlock->isAllocated(ptr)) {
-                GC_LOG("[gc] ignoring ptr, is not allocated {}", (void*)ptr);
-                return nullptr;
-            }
-
-   /*         if (bigBlock->getMarkBitSet().get(bigBlock->ptrToIndex(ptr))) {
-                println("[gc] ignoring ptr allredy marked {}", ptr);
-            }*/
-
-            return ptr;
+        if (not isInsideHeap((uintptr_t)ptr)) {
+            GC_LOG("-  [gc] ignored ptr bcs its outside heap {}", bigBlock);
+            return false;
         }
+
+        if (IS_POISONED(bigBlock) or not bigBlock->isAlive()) {
+            GC_LOG("-  [gc] ignored ptr bcs it points into free block {}", bigBlock);
+            return false;
+        }
+
+        GC_LOG("- [gc] big block {} - {} - {} - {}", bigBlock, allocToString(bigBlock->type), bigBlock->granularity, ((uintptr_t)bigBlock-(uintptr_t)start)/BIG_BLOCK_SIZE);
+
+        auto ptrValue = (uintptr_t)ptr % bigBlock->granularity;
+
+        if ((uintptr_t)ptr < bigBlock->calculateBaseAddress()) {
+            GC_LOG("- [gc] ignoring ptr, it points into block meta {}", (void*)ptr);
+            return false;
+        }
+
+        if ((uintptr_t)ptr >= (size_t)bigBlock->getBitsetAddr()) {
+            GC_LOG("- [gc] ignoring ptr, points into mark bits {}", (void*)ptr);
+            return false;
+        }
+
+        if (ptrValue != 0) {
+            GC_LOG("- [gc] ignoring ptr granularity does not match {} expected {}", (void*)ptr, bigBlock->granularity);
+            return false;
+        }
+
+        if (not bigBlock->isAllocated(ptr)) {
+            GC_LOG("- [gc] ignoring ptr, is not allocated {}", (void*)ptr);
+            return false;
+        }
+
+        return true;
+    }
+
+    void markPtr(char* ptr) {
+        assert(isManagedPtr(ptr));
+
+        auto bigBlock = ptrToBigBlock((uintptr_t)ptr);
 
         GC_LOG("[gc] marking {} - {}", (void*)ptr, allocToString(bigBlock->type));
 
-        bigBlock->getMarkBitSet().set(bigBlock->ptrToIndex(ptr), true);
-
-        return nullptr;
+        auto a = bigBlock->calculateMarkedCount();
+        bigBlock->setIsMarkedIndex(bigBlock->ptrToIndex(ptr), true);
+        auto b = bigBlock->calculateMarkedCount();
+        (void)a;
+        (void)b;
+        assert(a+1 == b);
     }
 
     bool isMarkedPtr(char* ptr) {
@@ -5288,11 +5326,12 @@ struct Heap {
             GC_LOG("[gc] pointer looks like LoxValue {}", (void*)ptr);
             PANIC();
         }
-        assert(ptr >= start && ptr <= start+heapSize);
-        auto bigBlockBits = (size_t)std::log2(Heap::BIG_BLOCK_SIZE);
-        auto* bigBlock = std::bit_cast<BigBlock*>((std::bit_cast<uintptr_t>(ptr) >> bigBlockBits) << bigBlockBits);
+        if (not isInsideHeap((uintptr_t)ptr)) return true;
+        assert(isInsideHeap((uintptr_t)ptr));
 
-        return bigBlock->getMarkBitSet().get(bigBlock->ptrToIndex(ptr));
+        auto* bigBlock = ptrToBigBlock((uintptr_t)ptr);
+
+        return bigBlock->isMarkedIndex(bigBlock->ptrToIndex(ptr));
     }
 
     bool cmpMark(char* ptr) {
@@ -5327,6 +5366,7 @@ struct Heap {
         PANIC()
     }
 
+
     struct BigBlock {
         AllocType type;
         BigBlockType blockType;
@@ -5336,6 +5376,9 @@ struct Heap {
         char* prev;
         char* base;
         char* end;
+        size_t granulaeCount;
+        bool isEvenMarked;
+        bool isPinned;
 
         char data[];
 
@@ -5343,13 +5386,41 @@ struct Heap {
             flags |= (isAllocated ? 1 : 0) << 1;
         }
 
-        size_t markedCount() {
+        bool isBeignAllocated() {
+            return (flags & (1 << 1)) != 0;
+        }
+
+        void setIsAlive(bool isAlive) {
+            flags |= (isAlive ? 1 : 0) << 0;
+        }
+
+        bool isAlive() {
+            return flags & 1;
+        }
+
+        size_t calculateMarkedCount() {
             size_t acu = 0;
 
-            auto set = getMarkBitSet();
+            for (auto i = 0ul; i < constantItemCount(); i++) {
+                if (isMarkedIndex(i)) acu += 1;
+            }
+
+            return acu;
+        }
+
+        size_t markedCount() {
+            if (not isEvenMarked) {
+                return 0;
+            }
+
+            return calculateMarkedCount();
+        }
+
+        size_t calculateAllocatedCount() {
+            size_t acu = 0;
 
             for (auto i = 0ul; i < constantItemCount(); i++) {
-                if (set.get(i)) acu += 1;
+                if (isAllocatedIndex(i)) acu += 1;
             }
 
             return acu;
@@ -5366,10 +5437,6 @@ struct Heap {
                 default:
                     return allocTypeToConstantSize(type);
             }
-        }
-
-        bool isBeignAllocated() {
-            return flags & 1;
         }
 
         uintptr_t calculateBaseAddress() {
@@ -5391,7 +5458,7 @@ struct Heap {
 
         static constexpr size_t PER_GRANULE_BITS = 2;
 
-        size_t constantItemCount() {
+        size_t callculateConstantItemCount() {
             auto available = BIG_BLOCK_SIZE-(calculateBaseAddress()-(uintptr_t)this);
 
             auto avialableBits = available*8;
@@ -5400,6 +5467,11 @@ struct Heap {
             auto itemCount = avialableBits / itemBitSize;
 
             return itemCount;
+        }
+
+        size_t constantItemCount() {
+            assert(granulaeCount != 0);
+            return granulaeCount;
         }
 
         size_t bitsetSizeBytes() {
@@ -5454,9 +5526,11 @@ struct Heap {
             return self;
         }
 
-        void clearMarkBits() {
+
+        void clearMarkBits(bool clearAllocatedBits) {
+            isEvenMarked = false;
             for (auto i = 0ul; i < constantItemCount(); i++) {
-                if (not isMarkedIndex(i)) setIsAllocatedIndex(i, false);
+                if (clearAllocatedBits && not isMarkedIndex(i)) setIsAllocatedIndex(i, false);
                 this->setIsMarkedIndex(i, false);
             }
         }
@@ -5529,6 +5603,7 @@ struct Heap {
         }
 
         void setIsMarkedIndex(size_t index, bool value) {
+            if (value) isEvenMarked = true;
             getMarkBitSet().set(index, value);
         }
 
@@ -5555,6 +5630,7 @@ struct Heap {
 
             if (res != nullptr) {
                 markAllocated(res);
+                assert((uintptr_t)res % granularity == 0);
 
                 ASAN_UNPOISON_MEMORY_REGION(res, granularity*order);
             }
@@ -5640,8 +5716,11 @@ struct Heap {
         bb->next = nullptr;
         bb->prev = nullptr;
 
+        bb->granulaeCount = bb->callculateConstantItemCount();
         bb->end = (char*)(bb->calculateBaseAddress()+(bb->constantItemCount()*granularity));
         bb->base = (char*)bb->calculateBaseAddress();
+        bb->isEvenMarked = false;
+        bb->setIsAlive(true);
 
         // ASAN_UNPOISON_MEMORY_REGION(bb->end, BIG_BLOCK_SIZE-(uintptr_t)bb->end);
         auto headerSize = sizeof(BigBlock);
@@ -5655,7 +5734,8 @@ struct Heap {
 
         GC_LOG("[poison] unpoisoning bitset {} - {}", bb, bigBlockToId(bb));
 
-        bb->clearMarkBits();
+        // FIXME shouldn be needed bcs this is called on freshly allocated block which is zeroed
+        // bb->clearMarkBits();
 
         return bb;
     }
@@ -5710,7 +5790,7 @@ struct Heap {
             case AllocType::STRING: return &STRING_BIG_BLOCK;
             case AllocType::HASH_MAP_BUCKET: return &BUCKETS_BIG_BLOCK;
             case AllocType::HASH_MAP_BUCKET_ARRAY: return &MAP_BUCKET_BIG_BLOCK;
-            case AllocType::FUNCTION_REF: TODO();
+            case AllocType::FUNCTION_REF: return &FUNCTION_REF_BIG_BLOCK[getFunctionRefBigBlockIndexBySize(granularity)];
         }
         PANIC();
     }
@@ -5803,13 +5883,17 @@ struct Heap {
         auto blk = *block;
 
         if (blk == nullptr) {
+            GC_LOG("[heap] blk is null WTF?");
             blk = allocateInitilizeBigBlock(type, size);
+            *block = blk;
         }
 
         auto allocated = blk->allocate(allocationOrder);
 
         if (allocated == nullptr) {
+            GC_LOG("[heap] allocated is null new block");
             blk = allocateInitilizeBigBlock(type, size);
+            *block = blk;
 
             // FIXME this can still fail when allocating big value eg string that is larger than available space, OR when using free list allocator ... well we failed to get free block which means we are low on memory / fragmentation
             allocated = blk->allocate(allocationOrder);
@@ -5817,29 +5901,33 @@ struct Heap {
 
         if (allocated == nullptr) {
             GC_LOG("[heap] strange OOM - {}", allocToString(type));
+            PANIC();
         }
 
-        memset(allocated, 0, size);
+        std::memset(allocated, 0, size);
 
         return allocated;
     }
 
-    constexpr void* allocate(size_t size, AllocType type) {
+    constexpr void* allocate(AllocType type, size_t size) {
+        // doGc();
         return doAllocationGeneric(type, size);
     }
 
+    bool isInsideHeap(uintptr_t ptr) {
+        return ptr >= (uintptr_t)this->start && ptr < (((uintptr_t)this->start)+this->heapSize);
+    }
+
     void visitConservativePtr(uintptr_t ptr, std::vector<uintptr_t>& workList) {
-        if (ptr >= (uintptr_t)this->start && ptr < (((uintptr_t)this->start)+this->heapSize)) { // ptr is possible heap allocation
-            GC_LOG("[gc] value points into heap {} - {}", (void*)ptr, bigBlockToId((BigBlock*)ptr));
-            // try to determine to which object it points
-            // 1. we could set allocation granularity and manage bit set of allocated objects, query it to find out if
-            auto res = markPtr((char*) ptr, true);
-            if (res != nullptr) {
-                GC_LOG("[gc] ROOT PTR FOUND {}", (void*)ptr);
-                workList.push_back((uintptr_t)ptr);
-            }
-        } else {
-            if (ptr > 4096) GC_LOG("[gc] ignoring value {} ... not inside heap", (void*)ptr);
+        if (!isInsideHeap(ptr)) return;
+
+        // ptr is possible heap allocation
+        GC_LOG("[gc] value points into heap {} - {}", (void*)ptr, bigBlockToId((BigBlock*)ptr));
+        // try to determine to which object it points
+        // 1. we could set allocation granularity and manage bit set of allocated objects, query it to find out if
+        if (isManagedPtr((char*)ptr)) {
+            GC_LOG("- [gc] ROOT PTR FOUND {}", (void*)ptr);
+            workList.push_back((uintptr_t)ptr);
         }
     }
 
@@ -5944,7 +6032,7 @@ struct Heap {
         }
     }
 
-    void collectRegisterRoots(std::vector<uintptr_t>& workList) {
+    void collectRegisterRoots(std::vector<uintptr_t>& roots) {
 #ifdef __x86_64__
         uintptr_t regz[5];
 
@@ -5955,8 +6043,7 @@ struct Heap {
              "mov %%r15, %4\n": "=rm" (regz[0]), "=rm" (regz[1]), "=rm" (regz[2]), "=rm" (regz[3]), "=rm" (regz[4]));
 
         for (auto ptr : regz) {
-            GC_LOG("[gc] collecting reg root {}", (void*)ptr);
-            collectPossibleValue(ptr, workList);
+            collectPossibleValue(ptr, roots);
         }
 #else
 #error unsuported architecture TODO arm64
@@ -5964,12 +6051,12 @@ struct Heap {
     }
 
     __attribute__((no_sanitize("address")))
-    void collectStackRoots(uintptr_t* start1, uintptr_t* end, std::vector<uintptr_t>& workList) {
+    void collectStackRoots(void* start1, void* end, std::vector<uintptr_t>& workList) {
         GC_LOG("[gc] collecting stack roots {}..{} - {}B", end, start1, (uintptr_t)start1-(uintptr_t)end);
 
 
-        auto s = std::min(start1, end);
-        auto e = std::max(start1, end);
+        auto s = (uintptr_t*)std::min(start1, end);
+        auto e = (uintptr_t*)std::max(start1, end);
 
         for (auto i = s; i <= e; i++) {
             collectPossibleValue(*i, workList);
@@ -6068,28 +6155,12 @@ struct Heap {
 
 
         bb->blockType = BigBlockType::FREE_LIST;
-        bb->clearMarkBits();
+        bb->clearMarkBits(true);
     }
 
-    void doGc() {
-        auto stackEnd = __builtin_stack_address();
-
-        std::vector<uintptr_t> workList;
-
-        GC_LOG("[gc] === start ===");
-        auto nBigBlock = this->heapSize / Heap::BIG_BLOCK_SIZE;
-        GC_LOG("[gc] heapStart: {}, size: {}, bigBlocks: {}, last: {}", (void*)this->start, this->heapSize, nBigBlock, (void*)(this->start + ((nBigBlock-1)*BIG_BLOCK_SIZE)));
-
-        collectRegisterRoots(workList);
-
-        collectStackRoots(stackStart, (uintptr_t*)stackEnd, workList);
-
-        GC_LOG("[gc] roots {} - {}", workList.size(), workList);
-
-        while (not workList.empty()) {
-            auto p = workList.back(); workList.pop_back();
-
-            auto block = ptrToBigBlock(p);
+    void markFromRoots(std::unordered_set<void*>& roots) {
+        for (auto p : roots) {
+            auto block = ptrToBigBlock((uintptr_t)p);
 
             switch (block->type) {
                 case AllocType::LOX_VALUE:
@@ -6110,7 +6181,6 @@ struct Heap {
                 case AllocType::HASH_MAP:
                     collectManagedPtr((LoxMap*)p);
                     break;
-
                 case AllocType::HASH_MAP_BUCKET_ARRAY:
                     collectManagedPtr((LoxMapBucketArray*)p);
                     break;
@@ -6119,36 +6189,91 @@ struct Heap {
                     break;
             }
         }
+    }
 
-        GC_LOG("[gc] END MARKING {} - {}", (size_t)start, (size_t)(start+heapSize));
+    void sweepGarbage() {
+        size_t blocksReclaimed = 0;
+        size_t freeListsCreated = 0;
+
 
         for (auto i = (uintptr_t)start; i < (uintptr_t)(start+heapSize); i += BIG_BLOCK_SIZE) {
             auto bb = (BigBlock*)i;
+            if (IS_POISONED(bb) or not bb->isAlive()) continue;
 
-            GC_LOG("[gc] sweep {} - {} - {}", bb, allocToString(bb->type), bigBlockToId(bb));
+            // GC_LOG("[gc] sweep {} - {} - {}", bb, allocToString(bb->type), bigBlockToId(bb));
 
             size_t aliveCount = bb->markedCount();
+            size_t allocatedCount = bb->calculateAllocatedCount();
 
             if (aliveCount == 0) {
                 GC_LOG("[gc] whole block is free {} - {}", allocToString(bb->type), bigBlockToId(bb));
             } else {
-                GC_LOG("[gc] {}/{} block is used {} - {}", aliveCount, bb->constantItemCount(), allocToString(bb->type), bigBlockToId(bb));
+                GC_LOG("[gc] {}/{} - {} block is used {} - {}", aliveCount, bb->constantItemCount(), allocatedCount, allocToString(bb->type), bigBlockToId(bb));
             }
 
             if (aliveCount == 0) { // whole block is free, release it
                 freeAndCleanupBlock(bb);
+                blocksReclaimed += 1;
                 continue;
             }
 
             if (bb->isFull()) {
-                setupFreeList(bb);
+                // FIXME
+                // setupFreeList(bb);
+                // PANIC();
+                // freeListsCreated += 1;
+                bb->clearMarkBits(false);
             } else {
-                GC_LOG("[gc] block is partially filled {}", bigBlockToId(bb));
+                // GC_LOG("[gc] block is partially filled {}", bigBlockToId(bb));
                 // if bump allocator dead alive ratio is => 0.4 setup free list
-                GC_LOG("[gc] free data {}", bb->constantItemCount());
-                bb->clearMarkBits();
+                // GC_LOG("[gc] free data {}", bb->constantItemCount());
+                bb->clearMarkBits(false);
+                assert(bb->calculateMarkedCount() == 0);
             }
         }
+
+        blockReclaimCount += blocksReclaimed;
+
+        GC_LOG("[gc] ### STAT ### => BLOCKS_FREE={} - FREE_LISTS={} - AVIALIABLE_BLOCKS={}, RECLAIMED_TOTAL={}", blocksReclaimed, freeListsCreated, freeBigBlocks, blockReclaimCount);
+    }
+
+    void collectRoots(std::vector<uintptr_t>& roots) {
+        auto stackEnd = __builtin_stack_address();
+
+        collectRegisterRoots(roots);
+
+        collectStackRoots(stackStart, (uintptr_t*)stackEnd, roots);
+
+        for (auto stat : STATIC_ROOTS) {
+            collectPossibleValue((uintptr_t)stat, roots);
+        }
+
+        for (auto stat : GLOBALS_TABLE) {
+            collectPossibleValue(std::bit_cast<uintptr_t>(stat), roots);
+        }
+    }
+
+    void doGc() {
+        gcCount += 1;
+
+        std::vector<uintptr_t> roots1;
+
+        GC_LOG("[gc] === start ===");
+        auto nBigBlock = this->heapSize / Heap::BIG_BLOCK_SIZE;
+        GC_LOG("[gc] heapStart: {}, size: {}, bigBlocks: {}, last: {}", (void*)this->start, this->heapSize, nBigBlock, (void*)(this->start + ((nBigBlock-1)*BIG_BLOCK_SIZE)));
+
+        collectRoots(roots1);
+
+        std::unordered_set<void*> roots;
+        for (auto root : roots1) roots.insert((void*)root);
+
+        GC_LOG("[gc] roots {} - {}", roots.size(), roots);
+
+        markFromRoots(roots);
+
+        GC_LOG("[gc] END MARKING {} - {}", (size_t)start, (size_t)(start+heapSize));
+
+        sweepGarbage();
 
         GC_LOG("[gc] === end ===");
     }
@@ -6170,6 +6295,7 @@ struct SimpleHeap {
     size_t heapSize = 0;
     void* stackStart = nullptr;
     bool debugGc = false;
+    size_t gcCount = 0;
 
     static constexpr size_t ALLOC_TREASHOLD = 4096*4;
     static constexpr size_t HEAP_SIZE_TRESHOLD = 128*1024*1024;
@@ -6178,6 +6304,10 @@ struct SimpleHeap {
         for (auto alloc : allocated) {
             free(alloc);
         }
+    }
+
+    void setupPages() {
+
     }
 
     void* ptrToUser(SimpleAllocation* ptr) {
@@ -6228,6 +6358,7 @@ struct SimpleHeap {
     }
 
     void markManagedPtr(void* ptr) {
+        GC_LOG("[gc] * marking ptr {}", ptr);
         markPtr(ptrFromUserSafe(ptr));
     }
 
@@ -6452,6 +6583,7 @@ struct SimpleHeap {
     }
 
     void doGc() {
+        gcCount += 1;
         void* stack_marker;
         auto stackEnd = &stack_marker;
         std::unordered_set<SimpleAllocation*> roots;
@@ -6477,7 +6609,11 @@ struct SimpleHeap {
     }
 };
 
-SimpleHeap heap;
+Heap heap;
+size_t allocTime = 0;
+size_t allocCount = 0;
+size_t allocAmount = 0;
+auto startTime = std::chrono::high_resolution_clock::now();
 
 void* allocate(size_t size, AllocType type) {
     // println("[heap] allocate {} - {}", size, allocToString(type));
@@ -6486,15 +6622,30 @@ void* allocate(size_t size, AllocType type) {
 #elif 0
     return malloc(size);
 #else
+    auto start = std::chrono::high_resolution_clock::now();
     auto v = heap.allocate(type, size);
     std::memset(v, 0, size);
+    auto end = std::chrono::high_resolution_clock::now();
+    allocTime += std::chrono::duration_cast<std::chrono::nanoseconds>(end-start).count();
+    allocCount += 1;
+    allocAmount += size;
+    if (allocCount % 10'000 == 0) {
+        auto curTime = std::chrono::high_resolution_clock::now();
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(curTime-startTime).count();
+        (void)elapsedMs;
+        // println("[stats] allocs={}, avg-time={}ns, GCs={}, ALLOC_SPEED={}KB/S", allocCount, allocTime/allocCount, heap.gcCount, ((allocAmount/elapsedMs)*1000)/1024);
+    }
     // println("[heap] allocated {} {} {}", v, size, allocToString(type));
     return v;
 #endif
 }
 
+void assertIsValidPtr(void* ptr) {
+    assert(heap.isManagedPtr(ptr));
+}
+
 int main(int argc, const char** argv) {
-    // heap.setupPages();
+    heap.setupPages();
     void* stackMarker;
     heap.stackStart = &stackMarker;
     bool USE_AST = false;
@@ -6505,7 +6656,7 @@ int main(int argc, const char** argv) {
 
         DEBUG_JIT = argz.contains("v");
         USE_AST = argz.contains("a");
-        // heap.debugGc = argz.contains("g");
+        heap.debugGc = argz.contains("g");
 
         filePath = string{argv[2]};
     } else {
