@@ -52,6 +52,20 @@ std::string_view allocToString(AllocType type) {
     UNREACHABLE();
 }
 
+volatile u64 PERF_COUNTERS[128];
+const char* PERF_NAMES[128];
+u64 PERF_TIMES[128];
+u64 PERF_START[128];
+
+extern void startPerf(size_t id) {
+    PERF_START[id] = (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+}
+
+extern void endPerf(size_t id) {
+    PERF_TIMES[id] += (u64)(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()).count()-PERF_START[id]);
+}
+
+
 struct SimpleArena {
     struct Chunk {
         Chunk* next = nullptr;
@@ -2021,11 +2035,11 @@ struct ASTExecutor;
 FunctionRef* createMethod(Function* f1, FunctionRef* parent, ObjectRef* self);
 
 struct ObjectRef {
+    LoxMap* fields;
     ClassRef* clazz;
     ObjectRef* proto;
     FunctionRef* construcor;
     LoxValue proto1;
-    LoxMap* fields;
 
     FunctionRef* getRawMethod(u32 m, bool doCrimes) {
         ObjectRef* me = this;
@@ -2041,13 +2055,23 @@ struct ObjectRef {
         return nullptr;
     }
 
+    size_t readFields(u32 name) {
+        return fields == nullptr ? LoxMap::INVALID_VALUE : readMap(fields, name);
+    }
+
     LoxValue read(u32 name) {
-        auto r = readMap(fields, name);
+        auto r = readFields(name);
         if (r != LoxMap::INVALID_VALUE) return std::bit_cast<LoxValue>(r);
         return getMethod2(name);
     }
 
     void write(u32 name, LoxValue v) {
+        if (fields == nullptr) {
+            auto map = allocateTypedSimple<LoxMap>(AllocType::HASH_MAP);
+            map->bucks = nullptr;
+            fields = map;
+        }
+
         writeMap(fields, name, std::bit_cast<size_t>(v));
     }
 
@@ -2747,12 +2771,27 @@ namespace builtin {
         return me;
     }
 
+    ObjectRef* rawInstant(ClassRef* clazz) {
+        LoxMap* data = nullptr;
+
+        ObjectRef* proto = nullptr;
+        if (clazz->super != nullptr) {
+            data = allocateTypedSimple<LoxMap>(AllocType::HASH_MAP);
+            data->bucks = nullptr;
+            proto = rawInstant(clazz->super, data);
+        }
+        auto me = allocateTypedSimple<ObjectRef>(AllocType::OBJECT_REF);
+        me->clazz = clazz;
+        me->proto = proto;
+        me->proto1 = proto == nullptr ? LoxValue::Nil() : LoxValue::Object(proto);
+        me->fields = data;
+        me->construcor = nullptr;
+        if (clazz->getConstructor() != nullptr) me->construcor = me->getRawMethod(CONSTRUCTOR_ID, false);
+        return me;
+    }
+
     LoxValue instantiate(LoxValue clazz) {
-        // println("instantiate {}", clazz);
-        auto map = allocateTypedSimple<LoxMap>(AllocType::HASH_MAP);
-        map->bucks = nullptr;
-        auto* res = rawInstant(clazz.asClass(), map);
-        // println("after");
+        auto* res = rawInstant(clazz.asClass());
 
         return LoxValue::Object(res);
     }
@@ -2761,7 +2800,7 @@ namespace builtin {
         // println("getMethod {} {}@{} {}", obj.toString(), idToName(id), id, argCount);
         assert(obj.isObject());
         auto self = obj.asObject();
-        auto r = readMap(self->fields, id);
+        auto r = self->readFields(id);
         if (r != LoxMap::INVALID_VALUE) {
             auto m = std::bit_cast<LoxValue>(r);
             assert(m.isFunction());
@@ -2910,26 +2949,24 @@ struct MilaAssembler: virtual Assembler {
         this->jmp(l.id);
     }
 
-    void getLoxTag(size_t dst, size_t val) {
+    void getLoxTag(size_t dst, size_t val, size_t tmp) {
         auto done = makeLabel1();
         auto extractTag = makeLabel1();
-        auto mask = movImmValueToReg(LoxValue::NAN_MASK);
+        movUnsigned(tmp, LoxValue::NAN_MASK);
 
-        andInt(dst, val, mask);
-        cJmp(extractTag, JumpCondType::EQUALS, dst, mask);
+        andInt(dst, val, tmp);
+        cJmp(extractTag, JumpCondType::EQUALS, dst, tmp);
         { // its not nan we are float
             movUnsigned(dst, LoxValue::ValueType2::FLOAT);
             cJmp(done);
         }
         { // extract tag
             bind(extractTag);
-            movInt(mask, LoxValue::TAG_MASK);
-            andInt(dst, val, mask);
+            movUnsigned(tmp, LoxValue::TAG_MASK);
+            andInt(dst, val, tmp);
         }
 
         bind(done);
-
-        freeRegister(mask);
     }
 
     virtual void doBin(BinaryType type, size_t dst, size_t lhs, size_t rhs) = 0;
@@ -2972,21 +3009,179 @@ struct MilaAssembler: virtual Assembler {
     }
 };
 
+constexpr size_t START_PERF = __COUNTER__;
+
+struct PerfEntry {
+    size_t counter;
+    size_t start;
+    size_t time;
+};
+
 struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
-    using X86Assembler::X86Assembler;
+#if 0
+#define MAKE_PERF() auto __id = __COUNTER__-START_PERF; /*putPerf(__id);*/ PERF_NAMES[__id] = __FUNCTION__;
+#define MAKE_PERF1(name) auto __id = __COUNTER__-START_PERF; /*putPerf(__id);*/ PERF_NAMES[__id] = name;
+#define DO_PERF(name) auto __id = __COUNTER__-START_PERF; /*putPerf(__id);*/ PERF_NAMES[__id] = name; putPerfStart2(__id); Cleanup{[this,__id]{ putPerfEnd2(__id); }};
+#define PERF() DO_PERF(__FUNCTION__)
+#define PERF_START() putPerfStart2(__id);
+#define PERF_STOP() putPerfEnd2(__id);
+#else
+#define MAKE_PERF()
+#define MAKE_PERF1(name)
+#define DO_PERF(name)
+#define PERF() DO_PERF(__FUNCTION__)
+#define PERF_START()
+#define PERF_STOP()
+#endif
 
     std::map<size_t, std::string> hints;
 
     size_t HINT_ID = 0;
+    size_t PERF_ID = 0;
+    size_t PERF_LABEL_ID = 0;
+
+    void putPerfStart2(size_t id) {
+        mc.push(X64Register::Rax);
+        mc.push(X64Register::Rdx);
+        mc.push(X64Register::Rcx);
+
+        // edi:eax = ticks
+        mc.RDTSC();
+
+        // rdx = edi:eax
+        mc.shiftLImm(X64Register::Rdx, 32);
+        mc.writeRegInst(X64Instruction::Or, X64Register::Rdx, X64Register::Rax);
+
+        // set start time
+        auto space = mc.writeRipRegInst(X64Instruction::mov, 0, X64Register::Rdx);
+        requestLabelRel4(PERF_LABEL_ID, space, PERF_ID, id*sizeof(PerfEntry)+offsetof(PerfEntry, start));
+
+        // increment counter
+        space = mc.writeRegRipInst(X64Instruction::inc, X64Register::Zero, 0);
+        requestLabelRel4(PERF_LABEL_ID, space, PERF_ID, id*sizeof(PerfEntry)+offsetof(PerfEntry, counter));
+
+        mc.pop(X64Register::Rcx);
+        mc.pop(X64Register::Rdx);
+        mc.pop(X64Register::Rax);
+    }
+
+    size_t getPerfOffset() {
+        return this->getBoundLabelById(PERF_LABEL_ID).offset;
+    }
+
+    void linkPerf() {
+        bindRawLabel(PERF_LABEL_ID, PERF_ID);
+
+        for (auto i = 0ul; i < 8ul-(bytes.size() % 8); i++) {
+            mc.pushBack(0);
+        }
+
+        for (auto i = 0; i < 8*100; i++) {
+            mc.pushBack(0);
+        }
+
+        this->simpleLink(PERF_ID);
+    }
+
+    void putPerfEnd2(size_t id) {
+        mc.push(X64Register::Rax);
+        mc.push(X64Register::Rdx);
+
+        // edi:eax = ticks
+        mc.RDTSC();
+
+        // rdx = edi:eax
+        mc.shiftLImm(X64Register::Rdx, 32);
+        mc.writeRegInst(X64Instruction::Or, X64Register::Rdx, X64Register::Rax);
+
+        // rdx -= PERF_START[id]
+        auto space = mc.writeRegRipInst(X64Instruction::sub, X64Register::Rdx, 0);
+        requestLabelRel4(PERF_LABEL_ID, space, PERF_ID, id*sizeof(PerfEntry)+offsetof(PerfEntry, start));
+
+        // PERF_TIME[id] += rdx
+        space = mc.writeRipRegInst(X64Instruction::add, 0, X64Register::Rdx);
+        requestLabelRel4(PERF_LABEL_ID, space, PERF_ID, id*sizeof(PerfEntry)+offsetof(PerfEntry, time));
+
+        mc.pop(X64Register::Rdx);
+        mc.pop(X64Register::Rax);
+    }
+
+
+    void putPerfStart(size_t id) {
+        mc.push(X64Register::Rax);
+        mc.push(X64Register::Rdx);
+        mc.push(X64Register::Rcx);
+
+        // edi:eax = ticks
+        mc.RDTSC();
+
+        // rdx = edi:eax
+        mc.shiftLImm(X64Register::Rdx, 32);
+        mc.writeRegInst(X64Instruction::Or, X64Register::Rdx, X64Register::Rax);
+
+        mc.mov(X64Register::Rax, (size_t)&PERF_START[id]);
+        mc.writeMem(X64Register::Rax, X64Register::Rdx, 0, 8);
+
+        // increment counter
+        mc.mov(X64Register::Rax, (size_t)(&PERF_COUNTERS[id]));
+        mc.writeRegMemInst(X64Instruction::inc, X64Register::Zero, X64Register::Rax, 0);
+
+        mc.pop(X64Register::Rcx);
+        mc.pop(X64Register::Rdx);
+        mc.pop(X64Register::Rax);
+    }
+
+    void putPerfEnd(size_t id) {
+        mc.push(X64Register::Rax);
+        mc.push(X64Register::Rdx);
+        mc.push(X64Register::Rcx);
+
+        // edi:eax = ticks
+        mc.RDTSC();
+
+        // rdx = edi:eax
+        mc.shiftLImm(X64Register::Rdx, 32);
+        mc.writeRegInst(X64Instruction::Or, X64Register::Rdx, X64Register::Rax);
+
+        // rax = &PERF_START[id]
+        mc.mov(X64Register::Rax, (size_t)&PERF_START[id]);
+
+        // rdx = rdx - *rax
+        mc.writeRegMemInst(X64Instruction::sub, X64Register::Rdx, X64Register::Rax, 0);
+
+        // rax = &PERF_TIMES[id]
+        mc.mov(X64Register::Rax, (size_t)&PERF_TIMES[id]);
+
+        // *rax = rdx
+        mc.writeMemRegInst(X64Instruction::add, X64Register::Rax, 0, X64Register::Rdx);
+
+        mc.pop(X64Register::Rcx);
+        mc.pop(X64Register::Rdx);
+        mc.pop(X64Register::Rax);
+    }
 
     X86MilaAssembler(span<size_t> args, size_t ret): X86Assembler(args, ret) {
         HINT_ID = this->allocateLabelType();
+        PERF_ID = this->allocateLabelType();
+        PERF_LABEL_ID = allocateLabel();
+    }
+
+    void beSpetial() {
+        MAKE_PERF1("valid");
+        for (auto i = 0; i < 1000; i++) {
+            PERF_START();
+            PERF_STOP();
+        }
     }
 
     void bindHint(std::string_view h) override {
         auto id = allocateLabel();
         this->bindRawLabel(id, HINT_ID);
         hints[id] = std::string(h);
+    }
+
+    void doStuff() override {
+        // PERF();
     }
 
     void dumpHints(std::string_view s) override {
@@ -3002,11 +3197,13 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     }
 
     void readField(size_t tgt, size_t self, u32 id) override {
+        PERF()
         array<Arg, 3> argz{handleToArg(self), Arg::Imm(id)};
         chadCall(Arg::ImmPtr((void*)&builtin::readField), argz, handleToArg(tgt));
     }
 
     void writeField(size_t self, u32 id, size_t value) override {
+        PERF()
         array<Arg, 4> argz{handleToArg(self), handleToArg(value), Arg::Imm(id)};
         chadCall(Arg::ImmPtr((void*)&builtin::writeField), argz, {});
     }
@@ -3025,8 +3222,12 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         chadCall(Arg::ImmPtr((void*)&builtin::loxPrint), argz, {});
     }
 
-    void numberGuard(RegAllocCtx& alloc, size_t subjReg, size_t tmp1, size_t tmp2, Label doneLabel, Label crashLabel) {
-        movInt(tmp1, LoxValue::NAN_MASK);
+    void numberGuard(RegAllocCtx& alloc, size_t subjReg, size_t tmp1, size_t tmp2, Label crashLabel) {
+        DO_PERF("numberGuard")
+
+        auto doneLabel = makeLabel1();
+
+        movUnsigned(tmp1, LoxValue::NAN_MASK);
         movReg(tmp2, subjReg);
         mc.doNot(alloc.REG(tmp2));
         mc.writeRegInst(X64Instruction::Test, alloc.REG(tmp1), alloc.REG(tmp2));
@@ -3034,11 +3235,12 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
 
         movUnsigned(tmp1, LoxValue::TAG_MASK);
         mc.writeRegInst(X64Instruction::Test, alloc.REG(subjReg), alloc.REG(tmp1));
-        cJmp1(doneLabel, JumpCondType::NOT_EQUALS);
-        cJmp(crashLabel);
+        cJmp1(crashLabel, JumpCondType::NOT_EQUALS);
+
+        bind(doneLabel);
     }
 
-    void fastArith(size_t dst, size_t lhs, size_t rhs, ArithmeticOp op) {
+    void fastArith(size_t dst, size_t lhs, size_t rhs, ArithmeticOp op, Label crashLabel) {
         auto ctx = getAllocCtx();
         auto lReg = ctx.ensureReg(lhs);
         auto rReg = ctx.ensureReg(rhs);
@@ -3046,20 +3248,9 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         auto tmpReg = (dstReg == lReg or dstReg == rReg) ? ctx.allocReg() : dstReg;
         auto tmpReg1 = ctx.allocReg();
 
-        auto lhsNumberLabel = makeLabel1();
-        auto rhsNumberLabel = makeLabel1();
-        auto crashLabel = makeLabel1();
+        numberGuard(ctx, lReg, tmpReg, tmpReg1, crashLabel);
+        numberGuard(ctx, rReg, tmpReg, tmpReg1, crashLabel);
 
-        numberGuard(ctx, lReg, tmpReg, tmpReg1, lhsNumberLabel, crashLabel);
-
-        bind(lhsNumberLabel);
-        numberGuard(ctx, rReg, tmpReg, tmpReg1, rhsNumberLabel, crashLabel);
-
-        bind(crashLabel);
-        // trap();
-        mc.hlt();
-
-        bind(rhsNumberLabel);
         this->arithmeticFloat(op, FloatingPointType::Double, dstReg, lReg, rReg);
 
         ctx.restore();
@@ -3072,23 +3263,16 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         auto dstReg = ctx.ensureRegWriteback(dst);
         auto tmpReg = (dstReg == lReg or dstReg == rReg) ? ctx.allocReg() : dstReg;
         auto tmpReg1 = ctx.allocReg();
+        numberGuard(ctx, lReg, tmpReg, tmpReg1, crashLabel);
+        numberGuard(ctx, rReg, tmpReg, tmpReg1, crashLabel);
 
-        auto lhsNumberLabel = makeLabel1();
-        auto rhsNumberLabel = makeLabel1();
-
-        numberGuard(ctx, lReg, tmpReg, tmpReg1, lhsNumberLabel, crashLabel);
-
-        bind(lhsNumberLabel);
-        numberGuard(ctx, rReg, tmpReg, tmpReg1, rhsNumberLabel, crashLabel);
-
-        bind(rhsNumberLabel);
         addDouble(dstReg, lReg, rReg);
         cJmp(doneLabel);
 
         ctx.restore();
     }
 
-    void fastCmp(size_t dst, size_t lhs, size_t rhs, JumpCondType type) {
+    void fastCmp(size_t dst, size_t lhs, size_t rhs, JumpCondType type, Label crashLabel) {
         auto ctx = getAllocCtx();
         auto lReg = ctx.ensureReg(lhs);
         auto rReg = ctx.ensureReg(rhs);
@@ -3096,33 +3280,20 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         auto tmpReg = (dstReg == lReg or dstReg == rReg) ? ctx.allocReg() : dstReg;
         auto tmpReg1 = ctx.allocReg();
 
-        auto lhsNumberLabel = makeLabel1();
-        auto rhsNumberLabel = makeLabel1();
-        auto crashLabel = makeLabel1();
-        auto isTrueLabel = makeLabel1();
         auto isDoneLabel = makeLabel1();
 
-        numberGuard(ctx, lReg, tmpReg, tmpReg1, lhsNumberLabel, crashLabel);
+        numberGuard(ctx, lReg, tmpReg, tmpReg1, crashLabel);
 
-        bind(lhsNumberLabel);
-        numberGuard(ctx, rReg, tmpReg, tmpReg1, rhsNumberLabel, crashLabel);
+        numberGuard(ctx, rReg, tmpReg, tmpReg1, crashLabel);
 
-        bind(crashLabel);
-        // trap();
-        mc.hlt();
-
-        bind(rhsNumberLabel);
         // this->trap();
         mc.movq(0, allocator.getReg(lReg), true);
         mc.movq(1, allocator.getReg(rReg), true);
         mc.comisd(0, 1, true);
+        movUnsigned(dstReg, std::bit_cast<u64>(LoxValue::True()));
         // this->trap();
-        cJmp2(isTrueLabel, type);
-        movInt(dstReg, std::bit_cast<u64>(LoxValue::False()));
-        cJmp(isDoneLabel);
-
-        bind(isTrueLabel);
-        movInt(dstReg, std::bit_cast<u64>(LoxValue::True()));
+        cJmp2(isDoneLabel, type);
+        movUnsigned(dstReg, std::bit_cast<u64>(LoxValue::False()));
 
         bind(isDoneLabel);
 
@@ -3140,7 +3311,6 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
 
         auto lhsNumberLabel = makeLabel1();
         auto rhsNumberLabel = makeLabel1();
-        auto crashLabel = makeLabel1();
         auto isTrueLabel = makeLabel1();
         auto isDoneLabel = makeLabel1();
         auto doRawCmp = makeLabel1();
@@ -3149,8 +3319,8 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
 
         auto checkNotNumber = makeLabel1();
 
-        getLoxTag(tmpReg, lReg);
-        movInt(tmpReg1, LoxValue::ValueType2::FLOAT);
+        getLoxTag(tmpReg, lReg, -1);
+        movUnsigned(tmpReg1, LoxValue::ValueType2::FLOAT);
         cJmp(checkNotNumber, JumpCondType::NOT_EQUALS, tmpReg, tmpReg1);
         mc.movq(0, allocator.getReg(lReg), true);
         mc.movq(1, allocator.getReg(rReg), true);
@@ -3158,13 +3328,12 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         cJmp(isDoneLabel);
 
         bind(checkNotNumber);
-        movInt(tmpReg1, LoxValue::ValueType2::STRING);
+        movUnsigned(tmpReg1, LoxValue::ValueType2::STRING);
         cJmp(doRawCmp, JumpCondType::NOT_EQUALS, tmpReg, tmpReg1);
 
-        getLoxTag(tmpReg, rReg);
-        cJmp(doRawCmp, JumpCondType::NOT_EQUALS, tmpReg, tmpReg1);
+        getLoxTag(tmpReg, rReg, -1);
+        cJmp(crashLabel, JumpCondType::EQUALS, tmpReg, tmpReg1);
 
-        mc.hlt(); // TODO
         cJmp(isDoneLabel);
 
         bind(doRawCmp);
@@ -3173,11 +3342,11 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
 
         bind(isDoneLabel);
         cJmp1(isTrue, JumpCondType::EQUALS);
-        movInt(dstReg, falseValue);
+        movUnsigned(dstReg, falseValue);
         cJmp(trulyDone);
 
         bind(isTrue);
-        movInt(dstReg, trueValue);
+        movUnsigned(dstReg, trueValue);
 
         bind(trulyDone);
 
@@ -3186,31 +3355,38 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
 
     void doBin(BinaryType type, size_t dst, size_t lhs, size_t rhs) override {
         if (type == BinaryType::SUB) {
-            fastArith(dst, lhs, rhs, ArithmeticOp::SUB);
+            DO_PERF("sub")
+            fastArith(dst, lhs, rhs, ArithmeticOp::SUB, crashLabel);
             return;
         }
         if (type == BinaryType::MUL) {
-            fastArith(dst, lhs, rhs, ArithmeticOp::MUL);
+            DO_PERF("mul")
+            fastArith(dst, lhs, rhs, ArithmeticOp::MUL, crashLabel);
             return;
         }
         if (type == BinaryType::DIV) {
-            fastArith(dst, lhs, rhs, ArithmeticOp::DIV);
+            DO_PERF("div")
+            fastArith(dst, lhs, rhs, ArithmeticOp::DIV, crashLabel);
             return;
         }
         if (type == BinaryType::GT) {
-            fastCmp(dst, lhs, rhs, JumpCondType::GREATER);
+            DO_PERF("gt")
+            fastCmp(dst, lhs, rhs, JumpCondType::GREATER, crashLabel);
             return;
         }
         if (type == BinaryType::LESS) {
-            fastCmp(dst, lhs, rhs, JumpCondType::LESS);
+            DO_PERF("less")
+            fastCmp(dst, lhs, rhs, JumpCondType::LESS, crashLabel);
             return;
         }
         if (type == BinaryType::GEQ) {
-            fastCmp(dst, lhs, rhs, JumpCondType::GREATER_OR_EQUAL);
+            DO_PERF("geq")
+            fastCmp(dst, lhs, rhs, JumpCondType::GREATER_OR_EQUAL, crashLabel);
             return;
         }
         if (type == BinaryType::LEQ) {
-            fastCmp(dst, lhs, rhs, JumpCondType::LESS_OR_EQUAL);
+            DO_PERF("leq")
+            fastCmp(dst, lhs, rhs, JumpCondType::LESS_OR_EQUAL, crashLabel);
             return;
         }
         /*if (type == BinaryType::EQ) {
@@ -3221,39 +3397,41 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
             fastEq(dst, lhs, rhs, std::bit_cast<size_t>(LoxValue::False()), std::bit_cast<size_t>(LoxValue::True()));
             return;
         }*/
-        auto crashLabel = makeLabel1();
         auto doneLabel = makeLabel1();
 /*        if (type == BinaryType::ADD) {
             fastAdd(dst, lhs, rhs, crashLabel, doneLabel);
         }*/
 
-        bind(crashLabel);
-        array<Arg, 3> argz{Arg::Imm((size_t)type), handleToArg(lhs), handleToArg(rhs)};
-        chadCall(Arg::ImmPtr((void*)&builtin::doSimpleBin), argz, handleToArg(dst));
+        {
+            DO_PERF("slow bin")
+            array<Arg, 3> argz{Arg::Imm((size_t)type), handleToArg(lhs), handleToArg(rhs)};
+            chadCall(Arg::ImmPtr((void*)&builtin::doSimpleBin), argz, handleToArg(dst));
+        }
 
         bind(doneLabel);
     }
 
     void fastToBool(size_t tgt, size_t src, size_t tmp, size_t trueValue, size_t falseValue) {
-        this->getLoxTag(tgt, src);
-
+        PERF()
         auto doneLabel = makeLabel1();
         auto falseLabel = makeLabel1();
         auto trueLabel = makeLabel1();
 
+        getLoxTag(tgt, src, tmp);
+
         // trap();
-        movInt(tmp, LoxValue::ValueType2::NIL);
+        movUnsigned(tmp, LoxValue::ValueType2::NIL);
         cJmp(falseLabel, JumpCondType::EQUALS, tgt, tmp);
 
-        movInt(tmp, LoxValue::ValueType2::BOOL_FALSE);
+        movUnsigned(tmp, LoxValue::ValueType2::BOOL_FALSE);
         cJmp(trueLabel, JumpCondType::NOT_EQUALS, tgt, tmp);
 
         bind(falseLabel);
-        movInt(tgt, falseValue);
+        movUnsigned(tgt, falseValue);
         cJmp(doneLabel);
 
         bind(trueLabel);
-        movInt(tgt, trueValue);
+        movUnsigned(tgt, trueValue);
 
         bind(doneLabel);
     }
@@ -3267,6 +3445,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     }
 
     void allocateClosed(size_t ref, size_t frameId, size_t localId, size_t value, bool isConst) override {
+        PERF()
         if (isConst) {
             auto tmp = allocateRegister(sizeof(LoxValue*));
 
@@ -3315,11 +3494,12 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         }
     }
 
-    void fasterCall(size_t tgt, size_t subj, span<size_t> argz) {
+    void fasterCall(size_t tgt, size_t subj, span<size_t> argz, Label crashLabel) {
+        MAKE_PERF()
+        PERF_START()
         bindHint("LOX - fasterCall");
         getPtr(tgt, subj); // FunctionRef* in tgt
 
-        auto crashLabel = makeLabel1();
         auto doneLabel = makeLabel1();
 
         assert(not allocator.isStack(tgt));
@@ -3333,17 +3513,27 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         }
 
         assert(not allocator.isStack(tgt));
+        PERF_STOP()
         callC(Arg::MemoryValue(allocator.getReg(tgt), offsetof(FunctionRef, fPtr), 8), argz2, tgt);
 
-        cJmp(doneLabel);
-
-        bind(crashLabel);
-        mc.hlt();
-        bind(doneLabel);
         bindHint("LOX - fasterCall END");
     }
 
-    void dynCall(size_t tgt1, size_t subj1, span<size_t> argz) {
+    void putPerf(size_t perfId) {
+        mc.push(X64Register::Rax);
+        mc.push(X64Register::Rcx);
+
+        mc.mov(X64Register::Rax, (size_t)(&PERF_COUNTERS[perfId]));
+        mc.mov(X64Register::Rcx, 1);
+        mc.writeMemRegInst(X64Instruction::add, X64Register::Rax, 0, X64Register::Rcx);
+
+        mc.pop(X64Register::Rcx);
+        mc.pop(X64Register::Rax);
+    }
+
+    void dynCall(size_t tgt1, size_t subj1, span<size_t> argz, Label crashLabel) {
+        MAKE_PERF()
+        PERF_START()
         auto ctx = this->getAllocCtx();
         auto tgt = ctx.ensureRegWriteback(tgt1);
         auto subj = ctx.ensureReg(subj1);
@@ -3352,29 +3542,24 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
 
         auto handleNotFunctionLabel = makeLabel1();
         auto doneLabel = makeLabel1();
-        auto crashLabel = makeLabel1();
         auto okLabel = makeLabel1();
 
         auto t = ctx.originalTransform(argz);
 
-        getLoxTag(tmp, subj);
+        getLoxTag(tmp, subj, tmp1);
 
-        movInt(tgt, LoxValue::ValueType2::FUNCTION_REF);
+        movUnsigned(tgt, LoxValue::ValueType2::FUNCTION_REF);
         cJmp(handleNotFunctionLabel, JumpCondType::NOT_EQUALS, tmp, tgt);
-
-        fasterCall(tgt, subj, t);
+        PERF_STOP()
+        fasterCall(tgt, subj, t, crashLabel);
+        PERF_START()
         cJmp(doneLabel);
 
         bind(handleNotFunctionLabel);
 
-        movInt(tgt, LoxValue::ValueType2::CLASS);
+        movUnsigned(tgt, LoxValue::ValueType2::CLASS);
         // trap();
         cJmp(crashLabel, JumpCondType::NOT_EQUALS, tmp, tgt);
-        cJmp(okLabel);
-
-        bind(crashLabel);
-        mc.hlt();
-        bind(okLabel);
 
         std::array<Arg,1>instArgz{handleToArg(subj)};
         chadCall(Arg::ImmPtr((void*)builtin::instantiate), instArgz, handleToArg(tgt));
@@ -3394,7 +3579,8 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         readMem(tmp1, tmp, offsetof(FunctionRef, captures), sizeof(LoxValue));
         writeMem(tmp, tgt, offsetof(FunctionRef, captures), sizeof(LoxValue));
 
-        fasterCall(tgt, tmp, t);
+        PERF_STOP()
+        fasterCall(tgt, tmp, t, crashLabel);
 
         writeMem(tmp, tmp1, offsetof(FunctionRef, captures), sizeof(LoxValue));
 
@@ -3465,23 +3651,26 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         ctx.restore();
     }*/
 
+    Label crashLabel = makeLabel1();
+
 
     void callMethod(size_t tgt1, size_t subj1, u32 fieldId, span<size_t> argz, std::optional<size_t> methodFrame) {
+        MAKE_PERF()
+        PERF_START()
         auto ctx = this->getAllocCtx();
         auto tgt = ctx.ensureRegWriteback(tgt1);
         auto subj = ctx.ensureReg(subj1);
         auto tmp = ctx.allocReg();
-        auto tmp1 = methodFrame.has_value() ? ctx.allocReg() : 0;
+        auto tmp1 = ctx.allocReg();
 
-        auto handleNotFunctionLabel = makeLabel1();
         auto doneLabel = makeLabel1();
 
         auto t = ctx.originalTransform(argz);
 
-        getLoxTag(tmp, subj);
+        getLoxTag(tmp, subj, tmp1);
 
-        movInt(tgt, LoxValue::ValueType2::INSTANCE);
-        cJmp(handleNotFunctionLabel, JumpCondType::NOT_EQUALS, tmp, tgt);
+        movUnsigned(tgt, LoxValue::ValueType2::INSTANCE);
+        cJmp(crashLabel, JumpCondType::NOT_EQUALS, tmp, tgt);
 
         // preserve `this`
         if (methodFrame.has_value()) {
@@ -3489,26 +3678,22 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         }
 
         std::array<Arg,3>instArgz{handleToArg(subj), Arg::Imm(fieldId), Arg::Imm(argz.size())};
+        PERF_STOP()
         chadCall(Arg::ImmPtr((void*)builtin::getMethod), instArgz, handleToArg(tmp));
 
-        fasterCall(tgt, tmp, t);
+        fasterCall(tgt, tmp, t, crashLabel);
 
         // restore `this`
         if (methodFrame.has_value()) {
             writeMem(*methodFrame, tmp1, offsetof(FunctionRef, captures), sizeof(LoxValue));
         }
 
-        cJmp(doneLabel);
-
-        bind(handleNotFunctionLabel);
-        mc.hlt();
-
         bind(doneLabel);
         ctx.restore();
     }
 
     void dynamicCall(size_t tgt, size_t subj, span<size_t> argz) override {
-        dynCall(tgt, subj, argz);
+        dynCall(tgt, subj, argz, crashLabel);
         // VALIDATE CALL
         /*array<Arg, 2> argz1{handleToArg(subj), Arg::Imm(argz.size())};
         chadCall(Arg::ImmPtr((void*)&builtin::getCallPtr), argz1, handleToArgAssume8(tgt));
@@ -3530,17 +3715,25 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     }
 
     void allocateClosure(size_t tgt, Function *f, size_t parent) override {
+        PERF()
         array<Arg, 2> argz{Arg::ImmPtr(f), handleToArg(parent)};
         chadCall(Arg::ImmPtr((void*)builtin::allocateClosure), argz, handleToArg(tgt));
     }
 
     void allocateClass(size_t tgt, Class* clazz, size_t frame, std::optional<size_t> super) override {
+        PERF()
         array<Arg, 3> argz{Arg::ImmPtr(clazz), Arg::Imm(LoxValue::Nil().internal), handleToArg(frame)};
         if (super.has_value()) argz[1] = handleToArg(*super);
         chadCall(Arg::ImmPtr((void*)builtin::allocateClass), argz, handleToArg(tgt));
     }
 
     void readClosed(size_t dst, size_t ref, size_t frameId, size_t localId, bool isConst) override {
+        PERF()
+        if (frameId == 0 && isConst) {
+            readMem(dst, ref, offsetof(FunctionRef, captures)+(sizeof(LoxValue*) * localId), 8);
+            return;
+        }
+
         movReg(dst, ref);
 
         vector<int> derefs;
@@ -3556,6 +3749,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     }
 
     void writeClosed(size_t ref, size_t frameId, size_t localId, size_t value, bool isConst) override {
+        PERF()
         // array<Arg, 4> argz{handleToArg(ref), Arg::Imm(frameId), Arg::Imm(localId), handleToArg(value)};
         // chadCall(Arg::ImmPtr((void*)builtin::writeClosed), argz, nullopt);
         // return;
@@ -3580,6 +3774,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     }
 
     void negate(size_t dst, size_t src) override {
+        PERF()
         auto tmp = allocateRegister(8);
         fastToBool(dst, src, tmp, std::bit_cast<size_t>(LoxValue::False()), std::bit_cast<size_t>(LoxValue::True()));
         freeRegister(tmp);
@@ -3589,6 +3784,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
 
     // FIXME raw code
     void copyClosed(size_t dst, size_t src, size_t dstId, size_t srcId) override {
+        PERF()
         auto tmp = allocateRegister(8);
         auto tmp1 = allocateRegister(8);
 
@@ -3636,7 +3832,7 @@ struct LoxBool: public NamedIrInstruction<"lox_bool", MilaGenCtx> {
     }
 
     void generate(MilaCodeGen& gen) override {
-        gen.assembler.movInt(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::Bool(v)));
+        gen.assembler.movUnsigned(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::Bool(v)));
     }
 };
 
@@ -3695,7 +3891,7 @@ struct LoxNil: public NamedIrInstruction<"lox_nil", MilaGenCtx> {
     }
 
     void generate(MilaCodeGen& gen) override {
-        gen.assembler.movInt(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::Nil()));
+        gen.assembler.movUnsigned(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::Nil()));
     }
 };
 
@@ -3712,7 +3908,7 @@ struct LoxNumber: public NamedIrInstruction<"lox_number", MilaGenCtx> {
     }
 
     void generate(MilaCodeGen& gen) override {
-        gen.assembler.movInt(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::Number(v)));
+        gen.assembler.movUnsigned(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::Number(v)));
     }
 };
 
@@ -3733,7 +3929,7 @@ struct LoxString: public NamedIrInstruction<"lox_string", MilaGenCtx> {
     void generate(MilaCodeGen& gen) override {
         auto alloc = allocateLoxString(string_view(v.data()+1, v.size()-2));
         STATIC_ROOTS.insert(alloc);
-        gen.assembler.movInt(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::String(alloc)));
+        gen.assembler.movUnsigned(gen.getReg(target), std::bit_cast<uint64_t>(LoxValue::String(alloc)));
     }
 };
 
@@ -4552,7 +4748,7 @@ struct Compiler: ASTVisitor {
 
                 SSARegisterHandle v3;
                 if (not it.data.cond.has_value()) {
-                    v3 = getCtx().push<instructions::IntLiteral>(MilaDataType{}, 1);
+                    v3 = getCtx().push<instructions::IntLiteral>(MilaDataType{}, 1, false);
                 } else {
                     auto ss = genExp(*it.data.cond);
                     v3 = getCtx().push<LoxBooling>(MilaDataType{}, ss);
@@ -4651,6 +4847,7 @@ struct Compiler: ASTVisitor {
     }
 
     bool isCurrentFunctionMethod() {
+        assert(not functionStack.empty());
         return functionStack.back().second.second;
     }
 
@@ -4848,7 +5045,7 @@ struct ASTExecutor: ASTVisitor {
         if (constructor == nullptr && not argz.empty()) PANIC();
         if (constructor != nullptr && constructor->data.argz.size() != argz.size()) PANIC();
 
-        auto* res = builtin::rawInstant(clazz, new LoxMap);
+        auto* res = builtin::rawInstant(clazz);
 
         if (constructor != nullptr) {
             auto f = res->getMethod2(CONSTRUCTOR_ID);
@@ -5209,7 +5406,7 @@ struct Heap {
     size_t freeBigBlocks = 0;
 
     void setupPages() {
-        heapSize = 48ul*1024ul*1024ul;
+        heapSize = 2048ul*1024ul*1024ul;
         start = (char*)mmap(nullptr, heapSize+BIG_BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
         GC_LOG("[heap] setup {}", (void*)start);
         auto oldStart = start;
@@ -6609,7 +6806,31 @@ struct SimpleHeap {
     }
 };
 
-Heap heap;
+struct EpsilonHeap {
+    char* heap;
+    size_t offset;
+    bool debugGc;
+    void* stackStart;
+    size_t gcCount = 0;
+
+    void setupPages() {
+        heap = (char*)mmap(nullptr, 2048*1024*1024ul, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        // memset(heap, 0, 2048*1024*1024ul);
+        offset = 0;
+    }
+
+    bool isManagedPtr(void* ptr) {
+        return true;
+    }
+
+    void* allocate(AllocType type, size_t size) {
+        auto ptr = heap+offset;
+        offset += size;
+        return ptr;
+    }
+};
+
+EpsilonHeap heap;
 size_t allocTime = 0;
 size_t allocCount = 0;
 size_t allocAmount = 0;
@@ -6622,6 +6843,10 @@ void* allocate(size_t size, AllocType type) {
 #elif 0
     return malloc(size);
 #else
+    auto v1 = heap.allocate(type, size);
+    // std::memset(v1, 0, size);
+    return v1;
+
     auto start = std::chrono::high_resolution_clock::now();
     auto v = heap.allocate(type, size);
     std::memset(v, 0, size);
@@ -6645,6 +6870,13 @@ void assertIsValidPtr(void* ptr) {
 }
 
 int main(int argc, const char** argv) {
+ /*   cpu_set_t mask;
+    int cpu = 10; // CPU core to pin to
+
+    // Initialize the CPU set
+    CPU_ZERO(&mask);
+    CPU_SET(cpu, &mask);
+    sched_setaffinity(0, sizeof(mask), &mask);*/
     heap.setupPages();
     void* stackMarker;
     heap.stackStart = &stackMarker;
@@ -6767,15 +6999,21 @@ int main(int argc, const char** argv) {
         }
     }
 
+    std::vector<std::pair<Function*, void*>> perfs;
+
     for (size_t i = 0; i < comp.funks.size(); i++) {
+        auto funk = comp.funks[i];
         std::vector<size_t> argSizes;
         argSizes.push_back(sizeof(FunctionRef*));
-        for (size_t j = 0; j < comp.funks[i]->data.argz.size(); j++) {
+        for (size_t j = 0; j < funk->data.argz.size(); j++) {
             argSizes.push_back(sizeof(LoxValue));
         }
 
         X86MilaAssembler assm(argSizes, sizeof(LoxValue));
-        MilaCodeGen ggs(assm, *comp.irGens[i], comp.funks[i]->data.name);
+        if (funk == globalFunc) {
+            assm.beSpetial();
+        }
+        MilaCodeGen ggs(assm, *comp.irGens[i], funk->data.name);
 
         if (DEBUG_JIT) {
             ggs.printLinearized = true;
@@ -6785,6 +7023,10 @@ int main(int argc, const char** argv) {
 
         UNWRAPV(ggs.gen());
 
+        assm.bind(assm.crashLabel);
+        assm.mc.hlt();
+
+
         auto stackSize = assm.preserveCalleeRegs();
 
         assm.patchStackSize(align(stackSize, X86MilaAssembler::STACK_ALIGNMENT));
@@ -6792,10 +7034,20 @@ int main(int argc, const char** argv) {
         // UNWRAPV(linkRelative(assm.bytes.data(), assm.spaces, assm.labels));
         assm.linkJumps();
 
+        // assm.linkPerf();
+
         ggs.assembler.dumpHints(stringify("hints/{}", comp.funks[i]->data.name));
 
         auto codeSize = assm.bytes.size();
-        auto code = cg::allocateJIT(codeSize);
+        auto code = cg::allocateJIT(codeSize, &PERF_START);
+
+        // auto codeAdr = (uintptr_t)code;
+        // auto perfAdr = (uintptr_t)&PERF_START;
+        // auto mag = std::max(codeAdr, perfAdr);
+        // auto mig = std::min(codeAdr, perfAdr);
+        // auto diff = mag-mig;
+        // std::cout << "ADDR DIFF IS: " << diff << "B" << " - " << diff/4096 << "pages " << diff/(1024*1024ul*1024ul) << "GB" << std::endl;
+        perfs.emplace_back(funk, ((char*)code)+assm.getPerfOffset());
 
         std::memcpy(code, assm.bytes.data(), codeSize);
 
@@ -6812,12 +7064,63 @@ int main(int argc, const char** argv) {
     auto ex1 = std::chrono::high_resolution_clock::now();
 
     auto funk1 = builtin::allocateClosure(globalFunc, nullptr);
+    // auto startTicks = __builtin_ia32_rdtsc();
 
     auto x = funk1.asFunction();
     funk(x);
 
+    // auto endTicks = __builtin_ia32_rdtsc();
+
     auto ex2 = std::chrono::high_resolution_clock::now();
+
+    // auto ticksDur = endTicks-startTicks;
+
+    // std::cout << "execution took: " << std::chrono::duration_cast<std::chrono::milliseconds>(ex2-ex1).count() << std::endl;
 
     if (DEBUG_JIT)
         std::cout << "execution took: " << std::chrono::duration_cast<std::chrono::milliseconds>(ex2-ex1).count() << std::endl;
+
+
+    int total = 0;
+    size_t badStuff = 0;
+    for (auto i = 0; i < 128; i++) {
+        if (PERF_NAMES[i] == nullptr) continue;
+        if (strcmp(PERF_NAMES[i],"doStuff") == 0) total = PERF_COUNTERS[i];
+        if (strcmp(PERF_NAMES[i],"valid") == 0) badStuff = PERF_TIMES[i]/PERF_COUNTERS[i];
+    }
+
+    // PerfEntry perfs[100];
+/*
+    for (auto [funk, perf] : perfs) {
+        PerfEntry* entries = (PerfEntry*)perf;
+        for (auto i = 0; i < 128; i++) {
+            auto idk = PERF_NAMES[i];
+            if (idk == nullptr) continue;
+
+            auto entry = entries[i];
+
+            auto cost = ((entry.counter == 0) ? 0.0 : ((entry.time*1000)/entry.counter)/1000.0);
+            auto fixed_time = entry.time-22*entry.counter;
+            auto fixed_cost = ((entry.counter == 0) ? 0.0 : ((fixed_time*1000)/entry.counter)/1000.0);
+
+            std::cout << idk << " # count=" << entry.counter << ", time=" << entry.time << ", cost=" << cost << ", fixed_cost=" << fixed_cost << std::endl;
+        }
+    }*/
+
+    // badStuff /= 2;
+ /*   std::cout << "TOTOAL: " << ticksDur << " - " << badStuff << std::endl;
+    for (auto i = 0; i < 128; i++) {
+        auto idk = PERF_NAMES[i];
+        if (idk == nullptr) continue;
+
+        auto part = ticksDur/100'000;
+        auto fixup = PERF_COUNTERS[i]*badStuff;
+
+        double percent = ((double)PERF_COUNTERS[i]/(double)total)*100;
+        if (PERF_TIMES[i] < fixup) TODO();
+        auto percent1 = ((PERF_TIMES[i])/part)/1'000.0;
+        auto percent2 = ((PERF_TIMES[i]-fixup)/part)/1'000.0;
+
+        std::cout << idk << " - " << PERF_TIMES[i]/(1000*1000) << "ms" << " - " << PERF_COUNTERS[i] << " - " << percent << "%" << " - " << percent1 << "%" << " - " << percent2 << "%" << " - " << PERF_TIMES[i]-fixup << " - " << PERF_TIMES[i]/PERF_COUNTERS[i] << std::endl;
+    }*/
 }
