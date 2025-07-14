@@ -1,21 +1,21 @@
-#include "../lexing/Token.h"
-#include "../lexing/SourceProvider.h"
-#include "../lexing/lexerExceptions.h"
-#include "../lexing/lexingUnits.h"
-#include "../lexing/tokenize.h"
-#include "../parsing/Parser.h"
-#include "../utils/pdo_utils.h"
-#include "../codegen/SSARegister.h"
-#include "../codegen/IRGen.h"
-#include "../codegen/CodeGen.h"
-#include "../codegen/IRGenCtx.h"
-#include "../codegen/x86/X86Assembler.h"
+#include "lexing/Token.h"
+#include "lexing/SourceProvider.h"
+#include "lexing/lexerExceptions.h"
+#include "lexing/lexingUnits.h"
+#include "lexing/tokenize.h"
+#include "parsing/Parser.h"
+#include "utils/pdo_utils.h"
+#include "codegen/SSARegister.h"
+#include "codegen/IRGen.h"
+#include "codegen/CodeGen.h"
+#include "codegen/IRGenCtx.h"
+#include "codegen/x86/X86Assembler.h"
 #include <filesystem>
 #include <cstring>
 #include <cstdlib>
 #include <unordered_map>
 #include <sanitizer/asan_interface.h>
-#include "../utils/code_gen.h"
+#include "utils/code_gen.h"
 
 #define VERBOSE 0
 bool DEBUG_JIT = false;
@@ -2898,7 +2898,7 @@ struct MilaAssembler: virtual Assembler {
 
     // FIXME TODO THIS JUST WORKS FOR NAN-BOX
     void getPtr(size_t dst, size_t value) {
-        movInt(dst, LoxValue::DATA_MASK);
+        movUnsigned(dst, LoxValue::DATA_MASK);
         andInt(dst, dst, value);
     }
 
@@ -2918,7 +2918,7 @@ struct MilaAssembler: virtual Assembler {
         andInt(dst, val, mask);
         cJmp(extractTag, JumpCondType::EQUALS, dst, mask);
         { // its not nan we are float
-            movInt(dst, LoxValue::ValueType2::FLOAT);
+            movUnsigned(dst, LoxValue::ValueType2::FLOAT);
             cJmp(done);
         }
         { // extract tag
@@ -2959,7 +2959,7 @@ struct MilaAssembler: virtual Assembler {
     virtual void toBool(size_t tgt, size_t src) = 0;
 
     virtual void readGlobal(size_t tgt, size_t id) {
-        movInt(tgt, std::bit_cast<size_t>(&GLOBALS_TABLE));
+        movPtr(tgt, &GLOBALS_TABLE);
         readMem(tgt, tgt, id*sizeof(LoxValue), sizeof(LoxValue));
     }
 
@@ -3032,7 +3032,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         mc.writeRegInst(X64Instruction::Test, alloc.REG(tmp1), alloc.REG(tmp2));
         cJmp1(doneLabel, JumpCondType::NOT_EQUALS);
 
-        movInt(tmp1, LoxValue::TAG_MASK);
+        movUnsigned(tmp1, LoxValue::TAG_MASK);
         mc.writeRegInst(X64Instruction::Test, alloc.REG(subjReg), alloc.REG(tmp1));
         cJmp1(doneLabel, JumpCondType::NOT_EQUALS);
         cJmp(crashLabel);
