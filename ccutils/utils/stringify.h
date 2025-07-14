@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <sstream>
 #include <memory>
+#include <string>
+#include <string_view>
 
 #include "StringLiteral.h"
 
@@ -108,7 +110,7 @@ constexpr string stringify(const T& value, initializer_list<StringifyCtx> ctx, s
         return value.toString();
     }
     else if constexpr (is_pointer_v<T>) {
-        return hexify(value);
+        return hexify((uintptr_t)value);
     }
     else if constexpr (is_integral_v<T>) {
         auto current = getCtx(ctx, depth, VEC_DEFAULT_CTX);

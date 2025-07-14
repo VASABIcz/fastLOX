@@ -22,6 +22,18 @@ namespace cg {
         return ptr;
     }
 
+    inline void* allocateJIT(size_t size, void* adr) {
+#ifdef LINUX
+        auto* ptr = mmap(adr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+#else
+        auto* ptr = VirtualAlloc(adr, size, MEM_COMMIT, PAGE_READWRITE);
+#endif
+
+        // println("ALLOCATED EXECTUABLE PAGE {}", ptr);
+        assert(ptr != nullptr);
+        return ptr;
+    }
+
     inline void* allocateJIT(span<const u8> code) {
         auto* ptr = allocateJIT(code.size());
         std::memcpy(ptr, code.data(), code.size());
@@ -46,6 +58,15 @@ namespace cg {
 #else
         DWORD dummy;
         VirtualProtect(ptr, size, PAGE_EXECUTE_READ, &dummy);
+#endif
+    }
+
+    inline void makeRXW(void* ptr, size_t size) {
+        assert(ptr != nullptr);
+#ifdef LINUX
+        mprotect(ptr, size, PROT_READ | PROT_EXEC | PROT_WRITE);
+#else
+#error TODO
 #endif
     }
 

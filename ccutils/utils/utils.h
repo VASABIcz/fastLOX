@@ -48,6 +48,33 @@ void _fail(T msg) {
 #define ARGS_OR_DEFAULT(DEFAULT, ...) FIRST(__VA_OPT__(__VA_ARGS__,) DEFAULT)
 #define PANIC(msg, ...) {println("[{}] {}:{}\n-> " ARGS_OR_DEFAULT("reached invalid point", msg), __FUNCTION__, __FILE__, __LINE__, ##__VA_ARGS__); std::terminate();}
 
+#define GET_FIRST_HELPER(first, ...) first
+#define DROP_FIRST_HELPER(first, ...) __VA_ARGS__
+#define GET_FIRST(...) GET_FIRST_HELPER(__VA_ARGS__)
+#define DROP_FIRST(...) DROP_FIRST_HELPER(__VA_ARGS__)
+
+#define swap10(a, ...) __VA_ARGS__ __VA_OPT__(,) a
+#define swap9(a, ...) swap10(__VA_ARGS__) __VA_OPT__(,) a
+#define swap8(a, ...) swap9(__VA_ARGS__) __VA_OPT__(,) a
+#define swap7(a, ...) swap8(__VA_ARGS__) __VA_OPT__(,) a
+#define swap6(a, ...) swap7(__VA_ARGS__) __VA_OPT__(,) a
+#define swap5(a, ...) swap6(__VA_ARGS__) __VA_OPT__(,) a
+#define swap4(a, ...) swap5(__VA_ARGS__) __VA_OPT__(,) a
+#define swap3(a, ...) swap4(__VA_ARGS__) __VA_OPT__(,) a
+#define swap2(a, ...) swap3(__VA_ARGS__) __VA_OPT__(,) a
+#define swap1(a, ...) swap2(__VA_ARGS__) __VA_OPT__(,) a
+#define swap0(a, ...) swap1(__VA_ARGS__) __VA_OPT__(,) a
+#define REVERSE(...) swap0(__VA_ARGS__)
+
+#define apply4(funk, ...) __VA_OPT__(funk(GET_FIRST(__VA_ARGS__)))
+#define apply3(funk, ...) __VA_OPT__(funk(GET_FIRST(__VA_ARGS__))) apply4(funk, DROP_FIRST(__VA_ARGS__))
+#define apply2(funk, ...) __VA_OPT__(funk(GET_FIRST(__VA_ARGS__))) apply3(funk, DROP_FIRST(__VA_ARGS__))
+#define apply1(funk, ...) __VA_OPT__(funk(GET_FIRST(__VA_ARGS__))) apply2(funk, DROP_FIRST(__VA_ARGS__))
+#define apply0(funk, ...) __VA_OPT__(funk(GET_FIRST(__VA_ARGS__))) apply1(funk, DROP_FIRST(__VA_ARGS__))
+#define APPLY(...) apply0(__VA_ARGS__)
+
+#define FORMATED(...) (__VA_ARGS__)
+
 consteval auto getMessage() {
     return "reached invalid point";
 }
@@ -76,8 +103,8 @@ namespace std {
 #define TRY_MAP(x, y) ({auto _it = x; if (!_it.has_value()) { auto _err = std::move(_it.error()); return y; }; std::move(*_it); })
 #define TRYV_MAP(x, y) ({auto _it = x; if (!_it.has_value()) { auto _err = std::move(_it.error()); return y; }; })
 
-#define UNWRAPV(...) ({auto _it = __VA_ARGS__; if (!_it.has_value()) PANIC()})
-#define UNWRAP(...) ({auto _it = __VA_ARGS__; if (!_it.has_value()) PANIC(); std::move(*_it); })
+#define UNWRAPV(...) ({auto _it = __VA_ARGS__; auto _ctx = ExceptionContext{}; if (!_it.has_value()) PANIC("{}", _it.error()->message(_ctx))})
+#define UNWRAP(...) ({auto _it1 = __VA_ARGS__; if (!_it1.has_value()) PANIC(); std::move(*_it1); })
 
 #define SHORT(x) ({ if (!x.has_value()) return; *x })
 #define repeat1(n) for (auto it = (size_t)0; it < n; it++)
@@ -677,3 +704,19 @@ constexpr static size_t numberOfOnes(size_t c) {
 }
 
 constexpr size_t SIZE_T_BITS = sizeof(size_t)*8;
+
+constexpr string safeSymbol(string_view in) {
+    string out;
+    for (auto c : in) {
+        if (!isalnum(c) && c != '_') {
+            if (c == '<' or c == '>') {
+                out += '$';
+            }
+            out += '_';
+        }
+        else {
+            out += c;
+        }
+    }
+    return out;
+}

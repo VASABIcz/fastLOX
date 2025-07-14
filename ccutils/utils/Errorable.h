@@ -62,8 +62,10 @@ private:
     string mMessage;
 };
 
-#define FAIL(msg) Err(make_unique<SimpleError>(FAIL_FORMAT+msg))
-#define FAILF(msg, ...) Err(make_unique<SimpleError>(FAIL_FORMAT+stringify(msg, __VA_ARGS__)))
+// #define FAIL(msg) Err(make_unique<SimpleError>(FAIL_FORMAT+msg))
+#define FAIL(msg, ...) Err(make_unique<SimpleError>(FAIL_FORMAT+stringify(msg  __VA_OPT__(, __VA_ARGS__))))
+
+#define MAPE(...) ({auto _it1 = REVERSE(DROP_FIRST(REVERSE(__VA_ARGS__))); if (!_it1.has_value()) return FAIL(GET_FIRST(REVERSE(__VA_ARGS__))); std::move(*_it1); })
 
 
 template<typename T>

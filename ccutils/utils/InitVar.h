@@ -13,7 +13,9 @@ public:
     }
 
     T& value() {
-        assert(inner.has_value());
+        if (not inner.has_value()) {
+            PANIC();
+        }
         return *inner;
     }
 };
