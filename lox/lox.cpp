@@ -3046,7 +3046,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         mc.push(X64Register::Rcx);
 
         // edi:eax = ticks
-        mc.RDTSC();
+      mc.rdtsc();
 
         // rdx = edi:eax
         mc.shiftLImm(X64Register::Rdx, 32);
@@ -3088,7 +3088,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         mc.push(X64Register::Rdx);
 
         // edi:eax = ticks
-        mc.RDTSC();
+        mc.rdtsc();
 
         // rdx = edi:eax
         mc.shiftLImm(X64Register::Rdx, 32);
@@ -3113,7 +3113,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         mc.push(X64Register::Rcx);
 
         // edi:eax = ticks
-        mc.RDTSC();
+        mc.rdtsc();
 
         // rdx = edi:eax
         mc.shiftLImm(X64Register::Rdx, 32);
@@ -3137,7 +3137,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         mc.push(X64Register::Rcx);
 
         // edi:eax = ticks
-        mc.RDTSC();
+        mc.rdtsc();
 
         // rdx = edi:eax
         mc.shiftLImm(X64Register::Rdx, 32);
