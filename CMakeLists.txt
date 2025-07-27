@@ -6,12 +6,16 @@ include(FetchContent)
 
 set(USE_SANITIZER OFF)
 
+set(CMAKE_C_COMPILER clang)
+set(CMAKE_CXX_COMPILER clang++)
+
 
 # set(CMAKE_CXX_FLAGS_DEBUG "-fno-exceptions --time-report -ggdb")
-set(BASE_FLAGS "-fno-exceptions --time-report -Wall -Wextra -Werror -Wno-unused-but-set-variable -Wno-unused-parameter -Wno-unused-function -Wno-nonnull-compare -Wno-missing-field-initializers -Wno-changes-meaning -Wno-invalid-offsetof -m64 -O0")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} ${BASE_FLAGS} -O2 -fno-exceptions -flto=1") # -march=native # -march=native -fsanitize=undefined -fsanitize=address -fsanitize=leak  # -s -ggdb -fsanitize=undefined
+set(BASE_FLAGS "-fno-exceptions -Wall -Wextra -Werror -Wno-unused-but-set-variable -Wno-unused-parameter -Wno-unused-function -m64 -O0")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} ${BASE_FLAGS} -O2 -fno-exceptions") # -march=native # -march=native -fsanitize=undefined -fsanitize=address -fsanitize=leak  # -s -ggdb -fsanitize=undefined
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} ${BASE_FLAGS} -g -ggdb") # -D_GLIBCXX_DEBUG
 # -D_GLIBCXX_ASSERTIONS
+# -flto=1 --time-report -Wno-nonnull-compare
 
 if(NOT APPLE AND NOT WINDOWS AND NOT MINGW AND USE_SANITIZER)
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fsanitize=address,undefined")
