@@ -15,6 +15,9 @@
 #include "codegen/CodeGen.h"
 #include "codegen/IRGenCtx.h"
 #include "codegen/x86/X86Assembler.h"
+#include "codegen/allocators/SimpleAllocator.h"
+#include "codegen/allocators/NewAllocator.h"
+#include "codegen/allocators/BetterAllocator.h"
 #include "utils/code_gen.h"
 #include "utils/BetterArray.h"
 #include "utils/pdo_utils.h"
@@ -1577,6 +1580,7 @@ struct FunctionRef {
 
 constexpr size_t CONSTRUCTOR_ID = 0;
 
+#if 0
 struct __attribute__ ((packed)) EntryPair {
     size_t first;
     size_t second;
@@ -1736,6 +1740,98 @@ bool writeMap(LoxMap* map, size_t id, size_t value) {
 
     return true;
 }
+#else
+
+// TODO sorted + separate key/value arrays better cache locality?
+struct KP {
+    size_t key,value;
+};
+
+struct InlineArray {
+    size_t size;
+    size_t capacity;
+    KP data[];
+};
+
+struct  LoxMapBucket {};
+
+struct LoxMapBucketArray {
+    size_t size;
+    LoxMapBucket** buckets;
+};
+
+struct LoxMap {
+    union {
+        LoxMapBucketArray* bucks;
+        InlineArray* inner;
+    };
+
+    static constexpr size_t INVALID_VALUE = 999999999;
+    static constexpr size_t BBUCKET_SIZE = 64;
+    static constexpr size_t BUCKET_ARRAY_BASE_SIZE = 16;
+};
+
+size_t readMap(LoxMap* map, size_t id, size_t* offset = nullptr) {
+    auto m = map->inner;
+    if (m == nullptr) return LoxMap::INVALID_VALUE;
+
+    for (auto i = 0UL; i < m->size; i++) {
+        auto v = m->data[i];
+        if (v.key == id) {
+            if (offset != nullptr) *offset = offsetof(InlineArray, data[i].value);
+            return v.value;
+        }
+    }
+    return LoxMap::INVALID_VALUE;
+}
+
+bool writeMap(LoxMap* map, size_t id, size_t value, bool* didInvalidate = nullptr, size_t* offset1 = nullptr) {
+    InlineArray*& m = map->inner;
+    if (m == nullptr) {
+        m = (InlineArray*)malloc(sizeof(InlineArray)+8*sizeof(KP));
+        m->size = 0;
+        m->capacity = 8;
+        if (didInvalidate != nullptr) *didInvalidate = true;
+    }
+
+    size_t offset;
+    auto res = readMap(map, id, &offset);
+    if (res != LoxMap::INVALID_VALUE) {
+        *(size_t*)((char*)m+offset) = value;
+        if (offset1 != nullptr) *offset1 = offset;
+        return false;
+    }
+
+    if (m->size == m->capacity) {
+        auto newCap = sizeof(InlineArray)+sizeof(KP)*(m->capacity*3/2);
+        auto newArr = (InlineArray*)malloc(newCap);
+        m->capacity = m->capacity*3/2;
+        std::memcpy(newArr, m, m->size*sizeof(KP)+sizeof(InlineArray));
+        free(m);
+        m = newArr;
+        if (didInvalidate != nullptr) *didInvalidate = true;
+    }
+
+    m->data[m->size++] = {id, value};
+
+    return true;
+}
+
+size_t atOffset(LoxMap* map, size_t offset) {
+    return map->inner->data[offset].value;
+}
+
+template<typename FN>
+void forEachBucketArray(LoxMapBucketArray* map, FN&& fn) {
+
+}
+
+template<typename FN>
+void forEachBucket(LoxMapBucket* bucket, FN&& fn) {
+
+}
+
+#endif
 
 struct ClassRef;
 
@@ -2088,13 +2184,28 @@ std::string_view idToName(u32 id) {
 FunctionRef* createMethod(Function* f1, FunctionRef* parent, ObjectRef* self);
 
 struct ObjectRef {
-    LoxMap* fields;
+    LoxMap fields;
     ClassRef* clazz;
     ObjectRef* proto;
     FunctionRef* construcor;
     LoxValue proto1;
     Shape* shape;
     ObjectRef* inheritor;
+
+    template<typename FN>
+    void forEachFrien(FN&& f) {
+        f(this);
+        auto next = proto;
+        while (next != nullptr) {
+            f(next);
+            next = next->proto;
+        }
+        next = inheritor;
+        while (next != nullptr) {
+            f(next);
+            next = next->inheritor;
+        }
+    }
 
     FunctionRef* getRawMethod(u32 m, bool doCrimes) {
         ObjectRef* me = this;
@@ -2110,8 +2221,10 @@ struct ObjectRef {
         return nullptr;
     }
 
-    size_t readFields(u32 name) {
-        return fields == nullptr ? LoxMap::INVALID_VALUE : readMap(fields, name);
+    size_t readFields(u32 name, size_t* offset = nullptr) {
+        // if (fields == nullptr) return LoxMap::INVALID_VALUE;
+        auto value = readMap(&fields, name, offset);
+        return value;
     }
 
     LoxValue read(u32 name) {
@@ -2124,39 +2237,37 @@ struct ObjectRef {
         shape = shape->addField(v);
     }
 
-    void shapeAddUp(u32 v) {
-        auto next = inheritor;
-        while (next != nullptr) {
-            next->shapeAdd(v);
-            next = next->inheritor;
-        }
-    }
-
-    void shapeAddDown(u32 v) {
-        auto next = proto;
-        while (next != nullptr) {
-            next->shapeAdd(v);
-            next = next->proto;
-        }
-    }
-
     void shapeAddPropagate(u32 v) {
-        shapeAdd(v);
-        shapeAddDown(v);
-        shapeAddUp(v);
+        forEachFrien([&](auto frien) {
+            // println("adding shape to frien {}", frien);
+            frien->shapeAdd(v);
+        });
     }
 
-    void write(u32 name, LoxValue v) {
-        if (fields == nullptr) {
+    void mapPropagate(LoxMap m) {
+        forEachFrien([&](auto frien) {
+            frien->fields = m;
+        });
+    }
+
+    void write(u32 name, LoxValue v, size_t* offset1 = nullptr) {
+/*        if (fields == nullptr) {
             auto map = allocateTypedSimple<LoxMap>(AllocType::HASH_MAP);
             map->bucks = nullptr;
             fields = map;
-        }
+        }*/
 
-        auto didCreate = writeMap(fields, name, std::bit_cast<size_t>(v));
+        bool didInvalidate = false;
+        size_t offset;
+        auto didCreate = writeMap(&fields, name, std::bit_cast<size_t>(v), &didInvalidate, &offset);
+        assert(readMap(&fields, name) == std::bit_cast<size_t>(v));
+        if (didInvalidate) mapPropagate(fields);
         if (didCreate) shapeAddPropagate(name);
+        if (offset1 != nullptr) *offset1 = LoxMap::INVALID_VALUE;
+        if (!didInvalidate && !didCreate && offset1 != nullptr) *offset1 = offset;
     }
 
+    // FIXME this can be optimized a bit, we can just memcpy the cached FunctionRef? + remove recursive search
     LoxValue getMethod2(u32 name) {
         auto m = clazz->clazz->getMethod(name);
         if (m == nullptr && proto != nullptr) {
@@ -2178,6 +2289,15 @@ Shape* getSlowShape() {
 struct MethodCallIC {
     std::pair<Shape*, FunctionRef*> methodEntry; // pointer to fRef bcs its constant with shape
     std::pair<Shape*, std::pair<u32, u32>> functionEntry; // upper - bucket id, lower - index in bucket
+};
+
+struct ReadFieldIC {
+    std::pair<Shape*, size_t> fieldEntry; // offset in loxMap
+    std::pair<Shape*, size_t> methodEntry;
+};
+
+struct WriteFieldIC {
+    std::pair<Shape*, size_t> fieldEntry; // offset in loxMap
 };
 
 size_t toUpvalId(const vector<bool>& locals, size_t id) {
@@ -2740,6 +2860,43 @@ namespace builtin {
         return subj.asObject()->read(id);
     }
 
+    LoxValue getMethodIC2(LoxValue obj, u32 id, ReadFieldIC* ic) {
+        assert(obj.isObject());
+        auto o = obj.asObject();
+
+        if (ic->methodEntry.first == o->shape) {
+            // std::bit_cast<FunctionRef*>(atOffset(&o->clazz->methods, ic->methodEntry.second));
+            TODO("do copy of function here");
+        }
+
+        // TODO("modify getMethod2 to return offset");
+        auto m = o->getMethod2(id);
+        // ic->methodEntry = {o->shape, 33};
+        return m;
+    }
+
+    LoxValue readFieldIC(LoxValue obj, u32 id, ReadFieldIC* ic) {
+        assert(obj.isObject());
+        auto o = obj.asObject();
+        size_t offset;
+        auto r = o->readFields(id, &offset);
+        if (r != LoxMap::INVALID_VALUE) {
+            ic->fieldEntry = {o->shape, offset};
+            return std::bit_cast<LoxValue>(r);
+        }
+        return getMethodIC2(obj, id, ic);
+    }
+
+    void writeFieldIC(LoxValue obj, LoxValue value, u32 id, WriteFieldIC* ic) {
+        assert(obj.isObject());
+        size_t offset;
+        obj.asObject()->write(id, value, &offset);
+        if (offset != LoxMap::INVALID_VALUE) {
+            ic->fieldEntry = {obj.asObject()->shape, offset};
+        }
+    }
+
+
     void writeField(LoxValue obj, LoxValue value, u32 id) {
         assert(obj.isObject());
         obj.asObject()->write(id, value);
@@ -2896,7 +3053,7 @@ namespace builtin {
         me->clazz = clazz;
         me->proto = proto;
         me->proto1 = proto == nullptr ? LoxValue::Nil() : LoxValue::Object(proto);
-        me->fields = data;
+        me->fields = *data;
         me->construcor = nullptr;
         me->shape = clazz->baseShape;
         if (clazz->getConstructor() != nullptr) me->construcor = me->getRawMethod(CONSTRUCTOR_ID, false);
@@ -2918,7 +3075,7 @@ namespace builtin {
         me->clazz = clazz;
         me->proto = proto;
         me->proto1 = proto == nullptr ? LoxValue::Nil() : LoxValue::Object(proto);
-        me->fields = data;
+        me->fields.bucks = nullptr;
         me->construcor = nullptr;
         me->shape = clazz->baseShape;
         if (clazz->getConstructor() != nullptr) me->construcor = me->getRawMethod(CONSTRUCTOR_ID, false);
@@ -3184,6 +3341,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
 #define PERF_START()
 #define PERF_STOP()
 #endif
+#define READ_IC(dst, id, A, B) readIC(dst, id, offsetof(A, B))
 
     std::map<size_t, std::string> hints;
 
@@ -3202,28 +3360,28 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     }
 
     void putPerfStart2(size_t id) {
-        mc.push(X64Register::Rax);
-        mc.push(X64Register::Rdx);
-        mc.push(X64Register::Rcx);
+        mc.push(x86::Rax);
+        mc.push(x86::Rdx);
+        mc.push(x86::Rcx);
 
         // edi:eax = ticks
         mc.rdtsc();
 
         // rdx = edi:eax
-        mc.shiftLImm(X64Register::Rdx, 32);
-        mc.writeRegInst(X64Instruction::Or, X64Register::Rdx, X64Register::Rax);
+        mc.shiftLImm(x86::Rdx, 32);
+        mc.writeRegInst(X64Instruction::Or, x86::Rdx, x86::Rax);
 
         // set start time
-        auto space = mc.writeRipRegInst(X64Instruction::mov, 0, X64Register::Rdx);
+        auto space = mc.writeRipRegInst(X64Instruction::mov, 0, x86::Rdx);
         requestLabelRel4(PERF_LABEL_ID, space, PERF_ID, id*sizeof(PerfEntry)+offsetof(PerfEntry, start));
 
         // increment counter
-        space = mc.writeRegRipInst(X64Instruction::inc, X64Register::Zero, 0);
+        space = mc.writeRegRipInst(X64Instruction::inc, x86::Zero, 0);
         requestLabelRel4(PERF_LABEL_ID, space, PERF_ID, id*sizeof(PerfEntry)+offsetof(PerfEntry, counter));
 
-        mc.pop(X64Register::Rcx);
-        mc.pop(X64Register::Rdx);
-        mc.pop(X64Register::Rax);
+        mc.pop(x86::Rcx);
+        mc.pop(x86::Rdx);
+        mc.pop(x86::Rax);
     }
 
     size_t getPerfOffset() {
@@ -3263,26 +3421,26 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     }
 
     void putPerfEnd2(size_t id) {
-        mc.push(X64Register::Rax);
-        mc.push(X64Register::Rdx);
+        mc.push(x86::Rax);
+        mc.push(x86::Rdx);
 
         // edi:eax = ticks
         mc.rdtsc();
 
         // rdx = edi:eax
-        mc.shiftLImm(X64Register::Rdx, 32);
-        mc.writeRegInst(X64Instruction::Or, X64Register::Rdx, X64Register::Rax);
+        mc.shiftLImm(x86::Rdx, 32);
+        mc.writeRegInst(X64Instruction::Or, x86::Rdx, x86::Rax);
 
         // rdx -= PERF_START[id]
-        auto space = mc.writeRegRipInst(X64Instruction::sub, X64Register::Rdx, 0);
+        auto space = mc.writeRegRipInst(X64Instruction::sub, x86::Rdx, 0);
         requestLabelRel4(PERF_LABEL_ID, space, PERF_ID, id*sizeof(PerfEntry)+offsetof(PerfEntry, start));
 
         // PERF_TIME[id] += rdx
-        space = mc.writeRipRegInst(X64Instruction::add, 0, X64Register::Rdx);
+        space = mc.writeRipRegInst(X64Instruction::add, 0, x86::Rdx);
         requestLabelRel4(PERF_LABEL_ID, space, PERF_ID, id*sizeof(PerfEntry)+offsetof(PerfEntry, time));
 
-        mc.pop(X64Register::Rdx);
-        mc.pop(X64Register::Rax);
+        mc.pop(x86::Rdx);
+        mc.pop(x86::Rax);
     }
 
     // efficient 0 jmp, 0 imm64, 1 tmp guard for non Number values
@@ -3308,56 +3466,56 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     }
 
     void putPerfStart(size_t id) {
-        mc.push(X64Register::Rax);
-        mc.push(X64Register::Rdx);
-        mc.push(X64Register::Rcx);
+        mc.push(x86::Rax);
+        mc.push(x86::Rdx);
+        mc.push(x86::Rcx);
 
         // edi:eax = ticks
         mc.rdtsc();
 
         // rdx = edi:eax
-        mc.shiftLImm(X64Register::Rdx, 32);
-        mc.writeRegInst(X64Instruction::Or, X64Register::Rdx, X64Register::Rax);
+        mc.shiftLImm(x86::Rdx, 32);
+        mc.writeRegInst(X64Instruction::Or, x86::Rdx, x86::Rax);
 
-        mc.mov(X64Register::Rax, (size_t)&PERF_START[id]);
-        mc.writeMem(X64Register::Rax, X64Register::Rdx, 0, 8);
+        mc.mov(x86::Rax, (size_t)&PERF_START[id]);
+        mc.writeMem(x86::Rax, x86::Rdx, 0, 8);
 
         // increment counter
-        mc.mov(X64Register::Rax, (size_t)(&PERF_COUNTERS[id]));
-        mc.writeRegMemInst(X64Instruction::inc, X64Register::Zero, X64Register::Rax, 0);
+        mc.mov(x86::Rax, (size_t)(&PERF_COUNTERS[id]));
+        mc.writeRegMemInst(X64Instruction::inc, x86::Zero, x86::Rax, 0);
 
-        mc.pop(X64Register::Rcx);
-        mc.pop(X64Register::Rdx);
-        mc.pop(X64Register::Rax);
+        mc.pop(x86::Rcx);
+        mc.pop(x86::Rdx);
+        mc.pop(x86::Rax);
     }
 
     void putPerfEnd(size_t id) {
-        mc.push(X64Register::Rax);
-        mc.push(X64Register::Rdx);
-        mc.push(X64Register::Rcx);
+        mc.push(x86::Rax);
+        mc.push(x86::Rdx);
+        mc.push(x86::Rcx);
 
         // edi:eax = ticks
         mc.rdtsc();
 
         // rdx = edi:eax
-        mc.shiftLImm(X64Register::Rdx, 32);
-        mc.writeRegInst(X64Instruction::Or, X64Register::Rdx, X64Register::Rax);
+        mc.shiftLImm(x86::Rdx, 32);
+        mc.writeRegInst(X64Instruction::Or, x86::Rdx, x86::Rax);
 
         // rax = &PERF_START[id]
-        mc.mov(X64Register::Rax, (size_t)&PERF_START[id]);
+        mc.mov(x86::Rax, (size_t)&PERF_START[id]);
 
         // rdx = rdx - *rax
-        mc.writeRegMemInst(X64Instruction::sub, X64Register::Rdx, X64Register::Rax, 0);
+        mc.writeRegMemInst(X64Instruction::sub, x86::Rdx, x86::Rax, 0);
 
         // rax = &PERF_TIMES[id]
-        mc.mov(X64Register::Rax, (size_t)&PERF_TIMES[id]);
+        mc.mov(x86::Rax, (size_t)&PERF_TIMES[id]);
 
         // *rax = rdx
-        mc.writeMemRegInst(X64Instruction::add, X64Register::Rax, 0, X64Register::Rdx);
+        mc.writeMemRegInst(X64Instruction::add, x86::Rax, 0, x86::Rdx);
 
-        mc.pop(X64Register::Rcx);
-        mc.pop(X64Register::Rdx);
-        mc.pop(X64Register::Rax);
+        mc.pop(x86::Rcx);
+        mc.pop(x86::Rdx);
+        mc.pop(x86::Rax);
     }
 
     void beSpetial() {
@@ -3374,7 +3532,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         hints[id] = std::string(h);
     }
 
-    void doStuff() override {
+    void beforeInstruction() override {
         // PERF();
     }
 
@@ -3382,7 +3540,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         std::ofstream idk1{std::string(s)};
 
         idk1 << hints.size() << std::endl;
-        for (auto& hint : hints) {
+        for (auto &hint: hints) {
             idk1 << getBoundLabelById(hint.first).offset << std::endl;
             idk1 << escape(hint.second) << std::endl;
         }
@@ -3392,16 +3550,86 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
 
     void readField(size_t tgt, size_t self, u32 id) override {
         PERF()
-        callBuiltin(builtin::readField, {handleToArg(self), Arg::Imm(id)}, handleToArg(tgt));
+        auto ctx = this->getAllocCtx();
+        tgt = ctx.ensureRegWriteback(tgt);
+        self = ctx.ensureReg(self);
+        auto tmp = ctx.allocReg();
+        readFieldIC(tgt, tmp, self, id);
+        ctx.restore();
+        // callBuiltin(builtin::readField, {handleToArg(self), Arg::Imm(id)}, handleToArg(tgt));
+    }
+
+    void readFieldIC(size_t tgt, size_t tmp, size_t subj, u32 id) {
+        getTagFast(tgt, subj);
+        checkTagFast(tgt, LoxValue::ValueType2::INSTANCE, crashLabel);
+
+        auto fastPath = makeLabel1();
+        auto done = makeLabel1();
+
+        auto icId = allocateIC<ReadFieldIC>();
+
+        getPtr(tmp, subj);
+        READ_IC(allocator.getReg(tgt), icId, ReadFieldIC, fieldEntry.first);
+        mc.writeMemRegInst(X64Instruction::cmp, allocator.getReg(tmp), offsetof(ObjectRef, shape), allocator.getReg(tgt));
+        cJmp2(fastPath, JumpCondType::EQUALS);
+
+        // slow path
+        callBuiltin(builtin::readFieldIC, {handleToArg(subj), Arg::Imm(id), icToArg(icId)}, handleToArg(tgt));
+        cJmp(done);
+
+        bind(fastPath);
+
+        READ_IC(allocator.getReg(tmp), icId, ReadFieldIC, fieldEntry.second); // offset in tmp
+        getPtr(tgt, subj); // objref in tgt
+        mc.writeRegMemInst(X64Instruction::mov, allocator.getReg(tgt), allocator.getReg(tgt), offsetof(ObjectRef, fields)); // deref fields
+        mc.writeRegInst(X64Instruction::add, allocator.getReg(tgt), allocator.getReg(tmp)); // add offset
+        mc.writeRegMemInst(X64Instruction::mov, allocator.getReg(tgt), allocator.getReg(tgt), 0); // read value
+
+        bind(done);
     }
 
     void writeField(size_t self, u32 id, size_t value) override {
         PERF()
-        callBuiltin(builtin::writeField, {handleToArg(self), handleToArg(value), Arg::Imm(id)}, {});
+        // callBuiltin(builtin::writeField, {handleToArg(self), handleToArg(value), Arg::Imm(id)}, {});
+        auto ctx = this->getAllocCtx();
+        self = ctx.ensureReg(self);
+        value = ctx.ensureReg(value);
+        auto tmp = ctx.allocReg();
+        auto tmp1 = ctx.allocReg();
+        writeFieldIC(tmp, tmp1, self, value, id);
+        ctx.restore();
+    }
+
+    void writeFieldIC(size_t tmp, size_t tmp1, size_t subj, size_t value, size_t id) {
+        getTagFast(tmp, subj);
+        checkTagFast(tmp, LoxValue::ValueType2::INSTANCE, crashLabel);
+
+        auto fastPath = makeLabel1();
+        auto done = makeLabel1();
+
+        auto icId = allocateIC<WriteFieldIC>();
+
+        getPtr(tmp, subj);
+        READ_IC(allocator.getReg(tmp1), icId, WriteFieldIC, fieldEntry.first);
+        mc.writeMemRegInst(X64Instruction::cmp, allocator.getReg(tmp), offsetof(ObjectRef, shape), allocator.getReg(tmp1));
+        cJmp2(fastPath, JumpCondType::EQUALS);
+
+        // slow path
+        callBuiltin(builtin::writeFieldIC, {handleToArg(subj), handleToArg(value), Arg::Imm(id), icToArg(icId)}, {});
+        cJmp(done);
+
+        bind(fastPath);
+
+        READ_IC(allocator.getReg(tmp1), icId, WriteFieldIC, fieldEntry.second);
+        mc.writeRegMemInst(X64Instruction::mov, allocator.getReg(tmp), allocator.getReg(tmp), offsetof(ObjectRef, fields)); // deref fields
+        mc.writeRegInst(X64Instruction::add, allocator.getReg(tmp), allocator.getReg(tmp1)); // add offset
+        mc.writeMemRegInst(X64Instruction::mov, allocator.getReg(tmp), 0, allocator.getReg(value)); // read value
+
+        bind(done);
     }
 
     void writeJ(CmpType t, size_t id) {
-        if (id == crashLabel.id && false) { // used for debugging
+        if (false && id == crashLabel.id) { // used for debugging
             auto skip = makeLabel1();
             this->writeJmp(negateCmp(t), skip.id);
 
@@ -3434,7 +3662,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         cJmp2(crashLabel, JumpCondType::GREATER);
     }
 
-    void fastArith(size_t dst, size_t lhs, size_t rhs, ArithmeticOp op, Label crashLabel) {
+    void fastArith(size_t dst, size_t lhs, size_t rhs, BinaryOp op, Label crashLabel) {
         auto ctx = getAllocCtx();
         auto lReg = ctx.ensureReg(lhs);
         auto rReg = ctx.ensureReg(rhs);
@@ -3564,17 +3792,17 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     void doBin(BinaryType type, size_t dst, size_t lhs, size_t rhs) override {
         if (type == BinaryType::SUB) {
             DO_PERF("sub")
-            fastArith(dst, lhs, rhs, ArithmeticOp::SUB, crashLabel);
+            fastArith(dst, lhs, rhs, BinaryOp::SUB, crashLabel);
             return;
         }
         if (type == BinaryType::MUL) {
             DO_PERF("mul")
-            fastArith(dst, lhs, rhs, ArithmeticOp::MUL, crashLabel);
+            fastArith(dst, lhs, rhs, BinaryOp::MUL, crashLabel);
             return;
         }
         if (type == BinaryType::DIV) {
             DO_PERF("div")
-            fastArith(dst, lhs, rhs, ArithmeticOp::DIV, crashLabel);
+            fastArith(dst, lhs, rhs, BinaryOp::DIV, crashLabel);
             return;
         }
         if (type == BinaryType::GT) {
@@ -3727,15 +3955,15 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     }
 
     void putPerf(size_t perfId) {
-        mc.push(X64Register::Rax);
-        mc.push(X64Register::Rcx);
+        mc.push(x86::Rax);
+        mc.push(x86::Rcx);
 
-        mc.mov(X64Register::Rax, (size_t)(&PERF_COUNTERS[perfId]));
-        mc.mov(X64Register::Rcx, 1);
-        mc.writeMemRegInst(X64Instruction::add, X64Register::Rax, 0, X64Register::Rcx);
+        mc.mov(x86::Rax, (size_t)(&PERF_COUNTERS[perfId]));
+        mc.mov(x86::Rcx, 1);
+        mc.writeMemRegInst(X64Instruction::add, x86::Rax, 0, x86::Rcx);
 
-        mc.pop(X64Register::Rcx);
-        mc.pop(X64Register::Rax);
+        mc.pop(x86::Rcx);
+        mc.pop(x86::Rax);
     }
 
     void pushBytes(u8 v, size_t n) {
@@ -3756,25 +3984,18 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         this->simpleLink(IC_ID);
     }
 
-    void dynCall(size_t tgt1, size_t subj1, span<size_t> argz, Label crashLabel) {
+    void dynCall(size_t tgt, size_t subj, size_t tmp, size_t tmp1, span<size_t> argz, Label crashLabel) {
         MAKE_PERF()
         PERF_START()
-        auto ctx = this->getAllocCtx();
-        auto tgt = ctx.ensureRegWriteback(tgt1);
-        auto subj = ctx.ensureReg(subj1);
-        auto tmp = ctx.allocReg();
-        auto tmp1 = ctx.allocReg();
 
         auto handleNotFunctionLabel = makeLabel1();
         auto doneLabel = makeLabel1();
-
-        auto t = ctx.originalTransform(argz);
 
         getTagFast(tmp, subj);
 
         checkTagFast(tmp, LoxValue::ValueType2::FUNCTION_REF, handleNotFunctionLabel);
         PERF_STOP()
-        fasterCall(tgt, subj, t, crashLabel);
+        fasterCall(tgt, subj, argz, crashLabel);
         PERF_START()
         cJmp(doneLabel);
 
@@ -3782,10 +4003,9 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
 
         checkTagFast(tmp, LoxValue::ValueType2::CLASS, crashLabel);
 
-        handleInstantiation(tgt, subj, tmp, tmp1, doneLabel, t);
+        handleInstantiation(tgt, subj, tmp, tmp1, doneLabel, argz);
 
         bind(doneLabel);
-        ctx.restore();
     }
 
     void handleInstantiation(size_t tgt, size_t subj, size_t tmp, size_t tmp1, Label doneLabel, std::span<size_t> argz) {
@@ -3822,7 +4042,7 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
         return label;
     }
 
-    void readIC(X64Register dst, size_t id, size_t offset) {
+    void readIC(x86::X64Register dst, size_t id, size_t offset) {
         auto space = mc.writeRegRipInst(X64Instruction::mov, dst, offset);
         requestLabelRel4(id, space, IC_ID, offset);
     }
@@ -3831,8 +4051,6 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     Arg icToArg(size_t ic) {
         return Arg::Rel32Adr(IC_ID, ic, 0);
     }
-
-#define READ_IC(dst, id, A, B) readIC(dst, id, offsetof(A, B))
 
 
     void callMeth(size_t tgt1, size_t subj1, u32 fieldId, span<size_t> argz, std::optional<size_t> methodFrame) {
@@ -3928,7 +4146,15 @@ struct X86MilaAssembler: virtual MilaAssembler, X86Assembler {
     }
 
     void dynamicCall(size_t tgt, size_t subj, span<size_t> argz) override {
-        dynCall(tgt, subj, argz, crashLabel);
+        auto ctx = this->getAllocCtx();
+        tgt = ctx.ensureRegWriteback(tgt);
+        subj = ctx.ensureReg(subj);
+        auto tmp = ctx.allocReg();
+        auto tmp1 = ctx.allocReg();
+
+        dynCall(tgt, subj, tmp, tmp1, argz, crashLabel);
+
+        ctx.restore();
     }
 
     void allocateObject(size_t tgt, size_t subj, span<size_t> argz) override {
@@ -4031,11 +4257,59 @@ struct MilaCodeGen: CodeGen<MilaGenCtx> {
     using CodeGen::CodeGen;
 };
 
-struct LoxBool: public NamedIrInstruction<"lox_bool", MilaGenCtx> {
+struct MilaIrBase: IRInstruction<MilaGenCtx> {
+    using IRInstruction<MilaGenCtx>::IRInstruction;
+
+    virtual size_t tmpCount() {
+        return 0;
+    }
+
+    virtual bool allowTgtAlias() {
+        return true;
+    }
+};
+
+template<StringLiteral S>
+struct MilaIR: MilaIrBase {
+    explicit MilaIR(SSARegisterHandle target): MilaIrBase(target, std::string(S.asView())) {}
+};
+
+template<StringLiteral S>
+struct MilaIRNoRet: MilaIR<S> {
+    MilaIRNoRet(): MilaIR<S>(SSARegisterHandle::invalid()) {
+
+    }
+};
+
+struct MilaIRX86: MilaIrBase {
+    PUB_VIRTUAL_COPY(MilaIRX86)
+    using GEN_FUNC = std::function<void(MilaCodeGen&, MilaIRX86&)>;
+    std::vector<SSARegisterHandle> argz;
+    size_t paramCount;
+    GEN_FUNC genFunction;
+
+    void visitSrc(function<void (SSARegisterHandle &)> fn) override {
+        for (auto& arg : argz) fn(arg);
+    }
+
+    MilaIRX86(SSARegisterHandle target, std::string name, std::vector<SSARegisterHandle> argz, size_t paramCount, GEN_FUNC gen): MilaIrBase(target, name), argz(argz), paramCount(paramCount), genFunction(gen) {
+
+    }
+
+    void generate(MilaCodeGen& gen) override {
+        genFunction(gen, *this);
+    }
+
+    void print(MilaIrGen&, std::ostream& steam) override {
+        basePrint(steam, "");
+    }
+};
+
+struct LoxBool: public MilaIR<"lox_bool"> {
     PUB_VIRTUAL_COPY(LoxBool)
     bool v;
 
-    LoxBool(SSARegisterHandle target, bool v) : NamedIrInstruction(target), v(v) {}
+    LoxBool(SSARegisterHandle target, bool v) : MilaIR(target), v(v) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
 
@@ -4048,13 +4322,13 @@ struct LoxBool: public NamedIrInstruction<"lox_bool", MilaGenCtx> {
     }
 };
 
-struct LoxBranch: public NamedIrInstruction<"lox_branch", MilaGenCtx> {
+struct LoxBranch: public MilaIRNoRet<"lox_branch"> {
     PUB_VIRTUAL_COPY(LoxBranch)
     size_t tru;
     size_t fals;
     SSARegisterHandle subj;
 
-    LoxBranch(size_t tru, size_t fals, SSARegisterHandle subj) : NamedIrInstruction(SSARegisterHandle::invalid()), tru(tru), fals(fals), subj(subj) {}
+    LoxBranch(size_t tru, size_t fals, SSARegisterHandle subj) : MilaIRNoRet(), tru(tru), fals(fals), subj(subj) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(subj);
@@ -4077,7 +4351,7 @@ struct LoxBranch: public NamedIrInstruction<"lox_branch", MilaGenCtx> {
     }
 };
 
-struct LoxCallMethod: public NamedIrInstruction<"call_method", MilaGenCtx> {
+struct LoxCallMethod: public MilaIR<"call_method"> {
     PUB_VIRTUAL_COPY(LoxCallMethod)
     SSARegisterHandle subj;
     u32 methodId;
@@ -4085,7 +4359,7 @@ struct LoxCallMethod: public NamedIrInstruction<"call_method", MilaGenCtx> {
     std::vector<SSARegisterHandle> argz;
     std::optional<SSARegisterHandle> methodFrame;
 
-    LoxCallMethod(SSARegisterHandle target, SSARegisterHandle subj, u32 methodId, std::string_view methodName, std::vector<SSARegisterHandle> argz, std::optional<SSARegisterHandle> methodFrame) : NamedIrInstruction(target), subj(subj), methodId(methodId), methodName(std::string(methodName)), argz(argz), methodFrame(methodFrame) {}
+    LoxCallMethod(SSARegisterHandle target, SSARegisterHandle subj, u32 methodId, std::string_view methodName, std::vector<SSARegisterHandle> argz, std::optional<SSARegisterHandle> methodFrame) : MilaIR(target), subj(subj), methodId(methodId), methodName(std::string(methodName)), argz(argz), methodFrame(methodFrame) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         for (auto& a : argz) fn(a);
@@ -4120,10 +4394,10 @@ size_t FunctionRef::calculateSize() {
 }
 
 
-struct LoxNil: public NamedIrInstruction<"lox_nil", MilaGenCtx> {
+struct LoxNil: public MilaIR<"lox_nil"> {
     PUB_VIRTUAL_COPY(LoxNil)
 
-    LoxNil(SSARegisterHandle target) : NamedIrInstruction(target) {}
+    LoxNil(SSARegisterHandle target) : MilaIR(target) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
 
@@ -4136,11 +4410,11 @@ struct LoxNil: public NamedIrInstruction<"lox_nil", MilaGenCtx> {
     }
 };
 
-struct LoxNumber: public NamedIrInstruction<"lox_number", MilaGenCtx> {
+struct LoxNumber: public MilaIR<"lox_number"> {
     PUB_VIRTUAL_COPY(LoxNumber)
     double v;
 
-    LoxNumber(SSARegisterHandle target, double v) : NamedIrInstruction(target), v(v) {}
+    LoxNumber(SSARegisterHandle target, double v) : MilaIR(target), v(v) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
 
@@ -4155,11 +4429,11 @@ struct LoxNumber: public NamedIrInstruction<"lox_number", MilaGenCtx> {
 
 std::unordered_set<void*> STATIC_ROOTS;
 
-struct LoxString: public NamedIrInstruction<"lox_string", MilaGenCtx> {
+struct LoxString: public MilaIR<"lox_string"> {
     PUB_VIRTUAL_COPY(LoxString)
     string v;
 
-    LoxString(SSARegisterHandle target, string v) : NamedIrInstruction(target), v(v) {}
+    LoxString(SSARegisterHandle target, string v) : MilaIR(target), v(v) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
 
@@ -4174,11 +4448,11 @@ struct LoxString: public NamedIrInstruction<"lox_string", MilaGenCtx> {
     }
 };
 
-struct LoxNeg: public NamedIrInstruction<"lox_neg", MilaGenCtx> {
+struct LoxNeg: public MilaIR<"lox_neg"> {
     PUB_VIRTUAL_COPY(LoxNeg)
     SSARegisterHandle v;
 
-    LoxNeg(SSARegisterHandle target, SSARegisterHandle v) : NamedIrInstruction(target), v(v) {}
+    LoxNeg(SSARegisterHandle target, SSARegisterHandle v) : MilaIR(target), v(v) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(v);
@@ -4213,13 +4487,13 @@ struct LoxNeg: public NamedIrInstruction<"lox_neg", MilaGenCtx> {
     }
 }*/
 
-struct LoxBin: public NamedIrInstruction<"bin", MilaGenCtx> {
+struct LoxBin: public MilaIR<"bin"> {
     PUB_VIRTUAL_COPY(LoxBin)
     BinaryType type;
     SSARegisterHandle lhs;
     SSARegisterHandle rhs;
 
-    LoxBin(SSARegisterHandle target, BinaryType type, SSARegisterHandle lhs, SSARegisterHandle rhs) : NamedIrInstruction(target), type(type), lhs(lhs), rhs(rhs) {}
+    LoxBin(SSARegisterHandle target, BinaryType type, SSARegisterHandle lhs, SSARegisterHandle rhs) : MilaIR(target), type(type), lhs(lhs), rhs(rhs) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(rhs);
@@ -4235,13 +4509,13 @@ struct LoxBin: public NamedIrInstruction<"bin", MilaGenCtx> {
     }
 };
 
-struct LoxReadField: public NamedIrInstruction<"read_field", MilaGenCtx> {
+struct LoxReadField: public MilaIR<"read_field"> {
     PUB_VIRTUAL_COPY(LoxReadField)
     SSARegisterHandle subj;
     string fieldName;
     u32 fieldId;
 
-    LoxReadField(SSARegisterHandle target, SSARegisterHandle subj, string fieldName, u32 fieldId) : NamedIrInstruction(target), subj(subj), fieldName(fieldName), fieldId(fieldId) {}
+    LoxReadField(SSARegisterHandle target, SSARegisterHandle subj, string fieldName, u32 fieldId) : MilaIR(target), subj(subj), fieldName(fieldName), fieldId(fieldId) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(subj);
@@ -4256,14 +4530,14 @@ struct LoxReadField: public NamedIrInstruction<"read_field", MilaGenCtx> {
     }
 };
 
-struct LoxWriteField: public NamedIrInstruction<"write_field", MilaGenCtx> {
+struct LoxWriteField: public MilaIRNoRet<"write_field"> {
     PUB_VIRTUAL_COPY(LoxWriteField)
     SSARegisterHandle subj;
     string fieldName;
     SSARegisterHandle v;
     u32 fieldId;
 
-    LoxWriteField(SSARegisterHandle subj, string fieldName, SSARegisterHandle v, u32 fieldId) : NamedIrInstruction(SSARegisterHandle::invalid()), subj(subj), fieldName(fieldName), v(v), fieldId(fieldId) {}
+    LoxWriteField(SSARegisterHandle subj, string fieldName, SSARegisterHandle v, u32 fieldId) : MilaIRNoRet(), subj(subj), fieldName(fieldName), v(v), fieldId(fieldId) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(subj);
@@ -4280,12 +4554,12 @@ struct LoxWriteField: public NamedIrInstruction<"write_field", MilaGenCtx> {
 };
 
 
-struct LoxDynamicCall: public NamedIrInstruction<"dynamic_call", MilaGenCtx> {
+struct LoxDynamicCall: public MilaIR<"dynamic_call"> {
     PUB_VIRTUAL_COPY(LoxDynamicCall)
     SSARegisterHandle self;
     vector<SSARegisterHandle> argz;
 
-    LoxDynamicCall(SSARegisterHandle target, SSARegisterHandle self, vector<SSARegisterHandle> argz) : NamedIrInstruction(target), self(self), argz(argz) {}
+    LoxDynamicCall(SSARegisterHandle target, SSARegisterHandle self, vector<SSARegisterHandle> argz) : MilaIR(target), self(self), argz(argz) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(self);
@@ -4302,13 +4576,13 @@ struct LoxDynamicCall: public NamedIrInstruction<"dynamic_call", MilaGenCtx> {
     }
 };
 
-struct LoxFunctionCall: public NamedIrInstruction<"function_call", MilaGenCtx> {
+struct LoxFunctionCall: public MilaIR<"function_call"> {
     PUB_VIRTUAL_COPY(LoxFunctionCall)
     SSARegisterHandle self;
     vector<SSARegisterHandle> argz;
     bool doParamCheck;
 
-    LoxFunctionCall(SSARegisterHandle target, SSARegisterHandle self, vector<SSARegisterHandle> argz, bool doParamCheck) : NamedIrInstruction(target), self(self), argz(argz), doParamCheck(doParamCheck) {}
+    LoxFunctionCall(SSARegisterHandle target, SSARegisterHandle self, vector<SSARegisterHandle> argz, bool doParamCheck) : MilaIR(target), self(self), argz(argz), doParamCheck(doParamCheck) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(self);
@@ -4325,13 +4599,13 @@ struct LoxFunctionCall: public NamedIrInstruction<"function_call", MilaGenCtx> {
     }
 };
 
-struct LoxConstCall: public NamedIrInstruction<"function_call", MilaGenCtx> {
+struct LoxConstCall: public MilaIR<"function_call"> {
     PUB_VIRTUAL_COPY(LoxConstCall)
     SSARegisterHandle self;
     vector<SSARegisterHandle> argz;
     Function* fuk;
 
-    LoxConstCall(SSARegisterHandle target, SSARegisterHandle self, vector<SSARegisterHandle> argz, Function* fuk) : NamedIrInstruction(target), self(self), argz(argz), fuk(fuk) {}
+    LoxConstCall(SSARegisterHandle target, SSARegisterHandle self, vector<SSARegisterHandle> argz, Function* fuk) : MilaIR(target), self(self), argz(argz), fuk(fuk) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(self);
@@ -4348,12 +4622,12 @@ struct LoxConstCall: public NamedIrInstruction<"function_call", MilaGenCtx> {
     }
 };
 
-struct LoxAllocateObject: public NamedIrInstruction<"alloc_object", MilaGenCtx> {
+struct LoxAllocateObject: public MilaIR<"alloc_object"> {
     PUB_VIRTUAL_COPY(LoxAllocateObject)
     SSARegisterHandle self;
     vector<SSARegisterHandle> argz;
 
-    LoxAllocateObject(SSARegisterHandle target, SSARegisterHandle self, vector<SSARegisterHandle> argz) : NamedIrInstruction(target), self(self), argz(argz) {}
+    LoxAllocateObject(SSARegisterHandle target, SSARegisterHandle self, vector<SSARegisterHandle> argz) : MilaIR(target), self(self), argz(argz) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(self);
@@ -4370,13 +4644,13 @@ struct LoxAllocateObject: public NamedIrInstruction<"alloc_object", MilaGenCtx> 
     }
 };
 
-struct LoxAllocateObjectTyped: public NamedIrInstruction<"alloc_object_typed", MilaGenCtx> {
+struct LoxAllocateObjectTyped: public MilaIR<"alloc_object_typed"> {
     PUB_VIRTUAL_COPY(LoxAllocateObjectTyped)
     Class* clazz;
     SSARegisterHandle self;
     vector<SSARegisterHandle> argz;
 
-    LoxAllocateObjectTyped(SSARegisterHandle target, Class* clazz, SSARegisterHandle self, vector<SSARegisterHandle> argz) : NamedIrInstruction(target), clazz(clazz), self(self), argz(argz) {}
+    LoxAllocateObjectTyped(SSARegisterHandle target, Class* clazz, SSARegisterHandle self, vector<SSARegisterHandle> argz) : MilaIR(target), clazz(clazz), self(self), argz(argz) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(self);
@@ -4393,11 +4667,11 @@ struct LoxAllocateObjectTyped: public NamedIrInstruction<"alloc_object_typed", M
     }
 };
 
-struct BuiltinPrint: public NamedIrInstruction<"print", MilaGenCtx> {
+struct BuiltinPrint: public MilaIRNoRet<"print"> {
     PUB_VIRTUAL_COPY(BuiltinPrint)
     SSARegisterHandle arg;
 
-    BuiltinPrint(SSARegisterHandle arg) : NamedIrInstruction(SSARegisterHandle::invalid()), arg(arg) {}
+    BuiltinPrint(SSARegisterHandle arg) : MilaIRNoRet(), arg(arg) {}
 
     void print(MilaIrGen&, std::ostream& stream) override {
         basePrint(stream, "{}", arg);
@@ -4412,11 +4686,11 @@ struct BuiltinPrint: public NamedIrInstruction<"print", MilaGenCtx> {
     }
 };
 
-struct LoxBooling: public NamedIrInstruction<"to_bool", MilaGenCtx> {
+struct LoxBooling: public MilaIR<"to_bool"> {
     PUB_VIRTUAL_COPY(LoxBooling)
     SSARegisterHandle v;
 
-    LoxBooling(SSARegisterHandle target, SSARegisterHandle v) : NamedIrInstruction(target), v(v) {}
+    LoxBooling(SSARegisterHandle target, SSARegisterHandle v) : MilaIR(target), v(v) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(v);
@@ -4431,11 +4705,11 @@ struct LoxBooling: public NamedIrInstruction<"to_bool", MilaGenCtx> {
     }
 };
 
-struct LoxNumberGuard: public NamedIrInstruction<"number_guard", MilaGenCtx> {
+struct LoxNumberGuard: public MilaIR<"number_guard"> {
     PUB_VIRTUAL_COPY(LoxNumberGuard)
     SSARegisterHandle v;
 
-    LoxNumberGuard(SSARegisterHandle target, SSARegisterHandle v) : NamedIrInstruction(target), v(v) {}
+    LoxNumberGuard(SSARegisterHandle target, SSARegisterHandle v) : MilaIR(target), v(v) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(v);
@@ -4450,13 +4724,13 @@ struct LoxNumberGuard: public NamedIrInstruction<"number_guard", MilaGenCtx> {
     }
 };
 
-struct LoxAllocateClass: public NamedIrInstruction<"allocate_class", MilaGenCtx> {
+struct LoxAllocateClass: public MilaIR<"allocate_class"> {
     PUB_VIRTUAL_COPY(LoxAllocateClass)
     Class* clazz;
     std::optional<SSARegisterHandle> super;
     SSARegisterHandle frame;
 
-    LoxAllocateClass(SSARegisterHandle target, Class* clazz, std::optional<SSARegisterHandle> super, SSARegisterHandle frame) : NamedIrInstruction(target), clazz(clazz), super(super), frame(frame) {}
+    LoxAllocateClass(SSARegisterHandle target, Class* clazz, std::optional<SSARegisterHandle> super, SSARegisterHandle frame) : MilaIR(target), clazz(clazz), super(super), frame(frame) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(frame);
@@ -4472,11 +4746,11 @@ struct LoxAllocateClass: public NamedIrInstruction<"allocate_class", MilaGenCtx>
     }
 };
 
-struct LoxReadGlobal: public NamedIrInstruction<"read_global", MilaGenCtx> {
+struct LoxReadGlobal: public MilaIR<"read_global"> {
     PUB_VIRTUAL_COPY(LoxReadGlobal)
     size_t id;
 
-    LoxReadGlobal(SSARegisterHandle target, size_t id) : NamedIrInstruction(target), id(id) {}
+    LoxReadGlobal(SSARegisterHandle target, size_t id) : MilaIR(target), id(id) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {}
 
@@ -4489,12 +4763,12 @@ struct LoxReadGlobal: public NamedIrInstruction<"read_global", MilaGenCtx> {
     }
 };
 
-struct LoxWriteGlobal: public NamedIrInstruction<"write_global", MilaGenCtx> {
+struct LoxWriteGlobal: public MilaIRNoRet<"write_global"> {
     PUB_VIRTUAL_COPY(LoxWriteGlobal)
     size_t id;
     SSARegisterHandle v;
 
-    LoxWriteGlobal(size_t id, SSARegisterHandle v) : NamedIrInstruction(SSARegisterHandle::invalid()), id(id), v(v) {}
+    LoxWriteGlobal(size_t id, SSARegisterHandle v) : MilaIRNoRet(), id(id), v(v) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(v);
@@ -4509,14 +4783,14 @@ struct LoxWriteGlobal: public NamedIrInstruction<"write_global", MilaGenCtx> {
     }
 };
 
-struct LoxReadCaptured: public NamedIrInstruction<"read_captured", MilaGenCtx> {
+struct LoxReadCaptured: public MilaIR<"read_captured"> {
     PUB_VIRTUAL_COPY(LoxReadCaptured)
     SSARegisterHandle closure;
     size_t fId = -1;
     size_t locId = -1;
     bool isConst;
 
-    LoxReadCaptured(SSARegisterHandle target, SSARegisterHandle closure, size_t fId, size_t locId, bool isConst) : NamedIrInstruction(target), closure(closure), fId(fId), locId(locId), isConst(isConst) {}
+    LoxReadCaptured(SSARegisterHandle target, SSARegisterHandle closure, size_t fId, size_t locId, bool isConst) : MilaIR(target), closure(closure), fId(fId), locId(locId), isConst(isConst) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(closure);
@@ -4531,7 +4805,7 @@ struct LoxReadCaptured: public NamedIrInstruction<"read_captured", MilaGenCtx> {
     }
 };
 
-struct LoxWriteCaptured: public NamedIrInstruction<"write_captured", MilaGenCtx> {
+struct LoxWriteCaptured: public MilaIRNoRet<"write_captured"> {
     PUB_VIRTUAL_COPY(LoxWriteCaptured)
     SSARegisterHandle closure;
     size_t fId = -1;
@@ -4539,7 +4813,7 @@ struct LoxWriteCaptured: public NamedIrInstruction<"write_captured", MilaGenCtx>
     SSARegisterHandle v;
     bool isConst;
 
-    LoxWriteCaptured(SSARegisterHandle closure, size_t fId, size_t locId, SSARegisterHandle v, bool isConst) : NamedIrInstruction(SSARegisterHandle::invalid()), closure(closure), fId(fId), locId(locId), v(v), isConst(isConst) {}
+    LoxWriteCaptured(SSARegisterHandle closure, size_t fId, size_t locId, SSARegisterHandle v, bool isConst) : MilaIRNoRet(), closure(closure), fId(fId), locId(locId), v(v), isConst(isConst) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(closure);
@@ -4555,7 +4829,7 @@ struct LoxWriteCaptured: public NamedIrInstruction<"write_captured", MilaGenCtx>
     }
 };
 
-struct LoxAllocCaptured: public NamedIrInstruction<"alloc_captured", MilaGenCtx> {
+struct LoxAllocCaptured: public MilaIRNoRet<"alloc_captured"> {
     PUB_VIRTUAL_COPY(LoxAllocCaptured)
     SSARegisterHandle closure;
     size_t fId = -1;
@@ -4563,7 +4837,7 @@ struct LoxAllocCaptured: public NamedIrInstruction<"alloc_captured", MilaGenCtx>
     SSARegisterHandle v;
     bool isConst;
 
-    LoxAllocCaptured(SSARegisterHandle closure, size_t fId, size_t locId, SSARegisterHandle v, bool isConst) : NamedIrInstruction(SSARegisterHandle::invalid()), closure(closure), fId(fId), locId(locId), v(v), isConst(isConst) {}
+    LoxAllocCaptured(SSARegisterHandle closure, size_t fId, size_t locId, SSARegisterHandle v, bool isConst) : MilaIRNoRet(), closure(closure), fId(fId), locId(locId), v(v), isConst(isConst) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(v);
@@ -4579,13 +4853,13 @@ struct LoxAllocCaptured: public NamedIrInstruction<"alloc_captured", MilaGenCtx>
     }
 };
 
-struct LoxReadLocal: public NamedIrInstruction<"read_local", MilaGenCtx> {
+struct LoxReadLocal: public MilaIR<"read_local"> {
     PUB_VIRTUAL_COPY(LoxReadLocal)
     size_t localId;
     string name;
     SSARegisterHandle frame;
 
-    LoxReadLocal(SSARegisterHandle target, size_t localId, string name, SSARegisterHandle frame) : NamedIrInstruction(target), localId(localId), name(name), frame(frame) {}
+    LoxReadLocal(SSARegisterHandle target, size_t localId, string name, SSARegisterHandle frame) : MilaIR(target), localId(localId), name(name), frame(frame) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(frame);
@@ -4600,14 +4874,14 @@ struct LoxReadLocal: public NamedIrInstruction<"read_local", MilaGenCtx> {
     }
 };
 
-struct LoxWriteLocal: public NamedIrInstruction<"write_local", MilaGenCtx> {
+struct LoxWriteLocal: public MilaIRNoRet<"write_local"> {
     PUB_VIRTUAL_COPY(LoxWriteLocal)
     size_t localId;
     string name;
     SSARegisterHandle v;
     SSARegisterHandle frame;
 
-    LoxWriteLocal(size_t localId, string name, SSARegisterHandle v, SSARegisterHandle frame) : NamedIrInstruction(SSARegisterHandle::invalid()), localId(localId), name(name), v(v), frame(frame) {}
+    LoxWriteLocal(size_t localId, string name, SSARegisterHandle v, SSARegisterHandle frame) : MilaIRNoRet(), localId(localId), name(name), v(v), frame(frame) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(v);
@@ -4623,12 +4897,12 @@ struct LoxWriteLocal: public NamedIrInstruction<"write_local", MilaGenCtx> {
     }
 };
 
-struct LoxAllocateClosure: public NamedIrInstruction<"allocate_closure", MilaGenCtx> {
+struct LoxAllocateClosure: public MilaIR<"allocate_closure"> {
     PUB_VIRTUAL_COPY(LoxAllocateClosure)
     Function* func;
     SSARegisterHandle parent;
 
-    LoxAllocateClosure(SSARegisterHandle target, Function* func, SSARegisterHandle parent) : NamedIrInstruction(target), func(func), parent(parent) {}
+    LoxAllocateClosure(SSARegisterHandle target, Function* func, SSARegisterHandle parent) : MilaIR(target), func(func), parent(parent) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(parent);
@@ -4643,14 +4917,14 @@ struct LoxAllocateClosure: public NamedIrInstruction<"allocate_closure", MilaGen
     }
 };
 
-struct LoxCopyCapture: public NamedIrInstruction<"copy_capture", MilaGenCtx> {
+struct LoxCopyCapture: public MilaIRNoRet<"copy_capture"> {
     PUB_VIRTUAL_COPY(LoxCopyCapture)
     SSARegisterHandle tgt;
     size_t tgtId;
     SSARegisterHandle src;
     size_t srcId;
 
-    LoxCopyCapture(SSARegisterHandle tgt, size_t tgtId, SSARegisterHandle src, size_t srcId) : NamedIrInstruction(SSARegisterHandle::invalid()), tgt(tgt), tgtId(tgtId), src(src), srcId(srcId) {}
+    LoxCopyCapture(SSARegisterHandle tgt, size_t tgtId, SSARegisterHandle src, size_t srcId) : MilaIRNoRet(), tgt(tgt), tgtId(tgtId), src(src), srcId(srcId) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(src);
@@ -4666,11 +4940,11 @@ struct LoxCopyCapture: public NamedIrInstruction<"copy_capture", MilaGenCtx> {
     }
 };
 
-struct LoxGetSuper: public NamedIrInstruction<"get_super", MilaGenCtx> {
+struct LoxGetSuper: public MilaIR<"get_super"> {
     PUB_VIRTUAL_COPY(LoxGetSuper)
     SSARegisterHandle self;
 
-    LoxGetSuper(SSARegisterHandle target, SSARegisterHandle self) : NamedIrInstruction(target), self(self) {}
+    LoxGetSuper(SSARegisterHandle target, SSARegisterHandle self) : MilaIR(target), self(self) {}
 
     void visitSrc(std::function<void(SSARegisterHandle&)> fn) override {
         fn(self);
@@ -5709,6 +5983,29 @@ struct AnalyzeGlobals {
     }
 };
 
+void lower(ControlFlowGraph<MilaGenCtx>& cfg) {
+    std::vector<std::function<void()>> toRewrite;
+
+
+    cfg.forEachInstruction([&](IRInstruction<MilaGenCtx>& instruction, auto& block) mutable {
+        if (auto jmp = instruction.cst<instructions::Jump>(); jmp) {
+            auto toAssign = cfg.getBlock(jmp->value).getPhis(block.id());
+
+            toRewrite.push_back([&block, jmp, toAssign] {
+                auto id = block.getId(jmp);
+                for (auto [value, target] : toAssign) {
+                    block.insert(std::make_unique<instructions::Assign<MilaGenCtx>>(target, value), id);
+                }
+                jmp->shouldAssign = false;
+            });
+        }
+    });
+
+    for (auto toR : toRewrite) {
+        toR();
+    }
+}
+
 struct DeVirtualize {
     struct GlobalData {
         std::set<Function*> observedFuncs;
@@ -5756,14 +6053,15 @@ struct DeVirtualize {
                 processInstruction(cfg, g, g->self, pepa);
                 auto d = data[g];
                 if (not d.isFucked && d.observedClasses.empty() && !d.observedFuncs.empty()) {
-                    size_t commonSize = 9999;
+                    size_t invalid = 9999;
+                    size_t commonSize = invalid;
                     for (auto o : d.observedFuncs) {
                         if (commonSize == o->data.argz.size()) continue;
-                        if (commonSize == 9999) commonSize = o->data.argz.size();
-                        commonSize = 9999;
+                        if (commonSize == invalid) commonSize = o->data.argz.size();
+                        commonSize = invalid;
                         break;
                     }
-                    cfg.patchInst<LoxFunctionCall>(g, g->target, g->self, g->argz, commonSize != 9999);
+                    cfg.patchInst<LoxFunctionCall>(g, g->target, g->self, g->argz, commonSize != invalid);
                 }
                 if (not d.isFucked && !d.observedClasses.empty() && d.observedFuncs.empty()) {
 
@@ -5807,6 +6105,29 @@ struct GenLoxBranch {
     }
 };
 
+using BaseIR = IRInstruction<MilaGenCtx>;
+
+struct PlatformGen {
+
+};
+
+struct X86PlatformGen: PlatformGen {
+
+};
+
+#define CAS(name, type) type* name = instruction.template cst<type>(); name
+#define REF(...) ({auto _it = _VA_ARGS_; _it})
+void rewriteInstructions(ControlFlowGraph<MilaGenCtx>& cfg) {
+    cfg.forEachInstruction([&](BaseIR& instruction) {
+        if (CAS(call, LoxDynamicCall)) {
+            cfg.patchInst<MilaIRX86>(instruction.target, "LoxDynamicCall", call->getSources(), 2, [=](MilaCodeGen& gen, MilaIRX86& self) {
+                auto& assm = dynamic_cast<X86MilaAssembler&>(gen.assembler);
+                assm.dynCall(gen.getReg(call->target), gen.getReg(call->self), gen.getTmp(0), gen.getTmp(1), ({auto _it = gen.getRegs(call->argz); std::span<size_t> xd = _it; xd;}), assm.crashLabel);
+            });
+        }
+    });
+}
+
 std::chrono::time_point CLOCK_START = std::chrono::high_resolution_clock::now();
 
 LoxValue loxClock(FunctionRef* self) {
@@ -5827,8 +6148,9 @@ string LoxValue::toString() const {
         case NIL:
             return "nil";
         case BOOL:
+            return "true";
         case BOOL_FALSE:
-            return asBool() ? "true" : "false";
+            return "false";
         case STRING:
             return string(asString());
         case CLASS:
@@ -6705,7 +7027,7 @@ struct Heap {
 
         collectManagedPtr(self->construcor);
 
-        collectManagedPtr(self->fields);
+        // collectManagedPtr(self->fields);
     }
 
     void collect(LoxMapBucket* self) {
@@ -7220,7 +7542,7 @@ struct SimpleHeap {
 
         collectManagedPtr(self->construcor);
 
-        collectManagedPtr(self->fields);
+        // collectManagedPtr(self->fields);
     }
 
     void assertSafePtr(void* ptr) {
@@ -7370,7 +7692,7 @@ struct EpsilonMallocHeap {
     }
 };
 
-EpsilonMallocHeap heap;
+EpsilonHeap heap;
 size_t allocTime = 0;
 size_t allocCount = 0;
 size_t allocAmount = 0;
@@ -7573,7 +7895,10 @@ int main(int argc, const char** argv) {
         if (funk == globalFunc) {
             assm.beSpetial();
         }
+        SimpleAlloc<MilaGenCtx> sAlloc;
+        BetterAllocator<MilaGenCtx> bAlloc(assm.allocator);
         MilaCodeGen ggs(assm, *comp.irGens[i], funk->data.name);
+        ggs.allocator = &bAlloc; // false ? (Allocator<MilaGenCtx>*)&sAlloc : (Allocator<MilaGenCtx>*)&bAlloc;
         if (DEBUG_JIT) ggs.dumpGraphPNG = true;
 
         if (DEBUG_JIT) {
