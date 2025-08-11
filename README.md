@@ -1,4 +1,4 @@
-# ⚠️ Reader Discretion is Advised This code is DIRTY ⚠️
+<img src="https://sdmntprwestus3.oaiusercontent.com/files/00000000-5b4c-61fd-9c4e-873d0ed222b2/raw?se=2025-08-11T10%3A20%3A09Z&sp=r&sv=2024-08-04&sr=b&scid=e3a263c7-bbb7-5bac-a91d-5ddd8f9d97e6&skoid=24a7dec3-38fc-4904-b888-8abe0855c442&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2025-08-10T16%3A02%3A03Z&ske=2025-08-11T16%3A02%3A03Z&sks=b&skv=2024-08-04&sig=%2BbqDHl067KwfeiT7Vub3f5hhS9dFYiPiLrp%2BZlOhIQg%3D" alt="DIRTY CODE" width="200"/>
 
 # fastLOX
 
