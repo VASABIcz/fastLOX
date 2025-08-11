@@ -6163,38 +6163,6 @@ string LoxValue::toString() const {
     UNREACHABLE();
 }
 
-// TODO FIXME!! print() is also VALID
-// GLOBALS of the same name reference the same slot, undefined identifier defaults to global
-// global block destroys this mechanism
-// global slot can be in undefined state
-// thats how global functions work
-// what about overiding method by assigning function, yes you can it will "shadow" the method
-// methods are closures that capture this + super
-// constructors are just "init" method, call it on instantiation
-// canot use return in init / can only return this, must return this
-// vipl is structuraly typed?
-// the whole inheritace thingy is weird
-// std "clock" returns time since start in seconds
-// raylib binding for lox??????????????
-// ARRAY, BREAK, CONTINUE, CONST keyword, IF isType..., REPL, DEBUGER?
-// only repo requirement, RUN TESTS
-// merge requests for checking stuff...
-// FIXME THIS IS FUCKED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-// cache maps in cache
-// maps have creation order
-// mby just cache orders? statically?
-// map creation depends on order
-// how to handle adding new proepry? we need to realocate the object?
-// js spec "species"
-// around 8 objects inline
-// some fancy magic
-// IF WE KNOW THAT METHOD is not compared we can use differen calling convention
-// FIXME this is REAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALY BAD implementation of JIT
-
-// interpret loop has been replaced with builtin call overhead
-// register allocation is netured with __locals shajze
-// evrything around objects is slow - lookup, methods, EVERYTHING
-
 struct BitsetView {
     char* data;
     size_t bitSize;
