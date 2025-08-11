@@ -1,34 +1,46 @@
-# NI-RUN C++ template repository
+# fastLOX
 
-### differences from the template
-- source in `lox/lox.cpp`
-- custom lexer/parser reused from my other projects
-- NaN boxed LoxValue
-- O(1) locals lookup, no need to traverse environment linked list, storage for locals is determined statically:
-  - global scope - stored in globals table
-  - global scope inside block - acts as local/up val
-  - local variable - standard local variable stored on stack
-  - "up val" - local that is captured by function, allocated on heap
-- closures have:
-  - up value table - utilizing Flexible array member
-  - parent - pointer to enclosing closure
-- "up values" - are accesed by dereferencing parent N times + offset in up value table
+built as part of [NI-RUN CVUT course](https://bilakniha.cvut.cz/en/predmet6114506.html)
 
+implementation of [LOX](https://craftinginterpreters.com/the-lox-language.html)
+
+from scratch implementation C++23/26 + libc/c++
+
+## features:
+### value clasification
+values are clasified in 3 categories `Linerizer`
+- global
+  - stored in static array `GLOBALS_TABLE`
+- local
+  - stored in stack frames
+- caputured
+  - stored in `FunctionRef` objects
+  - linked list of `FunctionRef`
+  - those can be const `LoxValue` / mutable `LoxValue*`
+### value representation
+values are represented with 8B NaN boxing
+- 3bit tag => 8 types `ValueType2`
+- tags are placed so some operations can be more performant
+  - falsy values
+  - callable values
+  - addable values
+  - 1 bit diff between true/false
+- older version used 16B enum taging
+### dynamic code gen
+program is lowered into custom SSA IR `Compiler` which is then compiled into x86_64 `X86MilaAssembler`
+- generated code calls backs into runtime for more complex operation `callBuiltin` & `namespace builtin`
+- most simpler operations are implemented directly in assembly (arithmetics, type guards)
+### more complex runtime operations are sped up using monomorphic ICs
+- readField
+- writeField
+- callMethod
 ### WIP
-- simple JIT
-  - can run fib benchmark 3x speedup
-  - add support for class instantiation
-  - mby better code gen? try to inline native procedures?
-  - make it pass 100% tests
-  - mby function specialization optimization?
-  - some IR optimization data type propagation, constant folding, convert locals table to regs, coalessce/remove type checks?
-
+- bit of static analysis to deduce types, remove guards, speculate globals
 ### TODO
-- ability to check types? `if v is Number { ... }`
-- continue + break statements with support for labeled return `while@a (true) { while@b (true) { break@a } }`
-- symbol table? dont allocate new string all the time
-- arrays?
-- anonymous objects? JS notation? var v = {foo: "stuff", boo: "123"}
-- simple JIT support? no speculative optimizations just 1:1 to machine code?
-  - maybe we could convert it to SSA and do some simple optimizations + register allocation?
-  - some sort of function specialization + caching?
+- proper GC
+- speculative optimizations, use ICs feedback to generate more optimal code
+  - would require deopt into generic code?
+  - tracking of values registers/stack
+
+### usage
+- clone ccutils
