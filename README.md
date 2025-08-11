@@ -1,3 +1,5 @@
+# ⚠️ Reader Discretion is Advised - This code is **DIRTY** ⚠️
+
 # fastLOX
 
 built as part of [NI-RUN CVUT course](https://bilakniha.cvut.cz/en/predmet6114506.html)
