@@ -1,4 +1,4 @@
-# ⚠️ Reader Discretion is Advised - This code is **DIRTY** ⚠️
+# ⚠️ Reader Discretion is Advised This code is DIRTY ⚠️
 
 # fastLOX
 
